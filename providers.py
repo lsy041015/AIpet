@@ -76,18 +76,32 @@ def percent(value):
     return value
 
 
+def reset_moment(value):
+    # Date-only strings carry no exact moment.
+    if not value or (isinstance(value, str) and len(value) == 10):
+        return None
+    try:
+        return (datetime.fromtimestamp(value).astimezone()
+                if isinstance(value, (int, float))
+                else datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone())
+    except (ValueError, OverflowError, OSError, TypeError, AttributeError):
+        return None
+
+
+def reset_at(moment):
+    return moment.timestamp() if moment else None
+
+
 def reset_text(value):
     if not value:
         return "초기화 시각 미제공"
-    try:
-        if isinstance(value, str) and len(value) == 10:
+    if isinstance(value, str) and len(value) == 10:
+        try:
             return datetime.strptime(value, "%Y-%m-%d").strftime("%m/%d") + " 초기화 · 시각 미제공"
-        moment = (datetime.fromtimestamp(value).astimezone()
-                  if isinstance(value, (int, float))
-                  else datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone())
-        return moment.strftime("%m/%d %H:%M") + " 초기화"
-    except (ValueError, OverflowError, OSError, TypeError):
-        return "초기화 시각 미제공"
+        except ValueError:
+            return "초기화 시각 미제공"
+    moment = reset_moment(value)
+    return moment.strftime("%m/%d %H:%M") + " 초기화" if moment else "초기화 시각 미제공"
 
 
 def window_name(minutes):
@@ -110,7 +124,8 @@ def parse_codex(data):
             if window:
                 rows.append({"label": f"{name} · {window_name(window.get('windowDurationMins'))}",
                              "remaining": 100 - percent(window["usedPercent"]),
-                             "reset": reset_text(window.get("resetsAt"))})
+                             "reset": reset_text(window.get("resetsAt")),
+                             "reset_at": reset_at(reset_moment(window.get("resetsAt")))})
     if not rows:
         raise QuotaError("구독 한도 없음 · Codex에서 ChatGPT 로그인 확인")
     return rows
@@ -167,7 +182,8 @@ def parse_antigravity(raw):
         if len(fields) == 4 and fields[2].endswith("%"):
             group, period, remaining, reset = fields
             rows.append({"label": f"{group.replace(' Models', '').replace(' models', '')} · {periods.get(period, period)}",
-                         "remaining": percent(remaining[:-1]), "reset": reset_text(reset)})
+                         "remaining": percent(remaining[:-1]), "reset": reset_text(reset),
+                         "reset_at": reset_at(reset_moment(reset))})
     if not rows:
         raise QuotaError("Antigravity 한도 응답 없음 · agy /usage 확인")
     return rows
@@ -197,8 +213,9 @@ def parse_copilot(data):
         if not unlimited and total is not None and count is not None:
             unit = "크레딧" if quota.get("token_based_billing") else "요청"
             detail = f"{count:g}/{total:g} {unit}" if isinstance(count, (int, float)) and isinstance(total, (int, float)) else ""
-        rows.append({"label": names.get(key, key), "remaining": remaining,
-                     "detail": detail, "reset": reset_text(quota.get("reset_date") or data.get("quota_reset_date"))})
+        reset = quota.get("reset_date") or data.get("quota_reset_date")
+        rows.append({"label": names.get(key, key), "remaining": remaining, "detail": detail,
+                     "reset": reset_text(reset), "reset_at": reset_at(reset_moment(reset))})
     if not rows:
         raise QuotaError("Copilot 한도 없음 · gh 로그인·구독 확인")
     return rows
@@ -213,7 +230,7 @@ def copilot():
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
-def claude_reset(text, now=None):
+def claude_reset_moment(text, now=None):
     # The CLI prints e.g. "Oct 6, 2pm (Asia/Seoul)", or only the time for today.
     # Month names are matched directly: Qt applies the system locale to strptime's %b.
     match = re.fullmatch(r"(?:([A-Z][a-z]{2}) (\d{1,2}), )?(\d{1,2})(?::(\d{2}))?([ap]m) \(([^()\s]+)\)", text)
@@ -227,10 +244,15 @@ def claude_reset(text, now=None):
                           int(hour) % 12 + (12 if half == "pm" else 0), int(minute or 0), tzinfo=zone)
         if moment < now - timedelta(days=1):
             moment = moment.replace(year=now.year + 1)
-        return moment.astimezone().strftime("%m/%d %H:%M") + " 초기화"
+        return moment.astimezone()
     except (AttributeError, KeyError, ValueError, OSError):
-        # Unknown formats stay readable as printed by the CLI.
-        return text + " 초기화"
+        return None
+
+
+def claude_reset(text, now=None):
+    moment = claude_reset_moment(text, now)
+    # Unknown formats stay readable as printed by the CLI.
+    return moment.strftime("%m/%d %H:%M") + " 초기화" if moment else text + " 초기화"
 
 
 def parse_claude(data):
@@ -257,7 +279,8 @@ def parse_claude(data):
             label = name
         reset = detail.partition("resets ")[2].strip()
         rows.append({"label": label, "remaining": remaining,
-                     "reset": claude_reset(reset) if reset else "초기화 시각 미제공"})
+                     "reset": claude_reset(reset) if reset else "초기화 시각 미제공",
+                     "reset_at": reset_at(claude_reset_moment(reset))})
     if not rows:
         raise QuotaError("Claude Code 사용량 응답 없음 · claude /usage 확인")
     return rows
