@@ -1,13 +1,14 @@
 """Desktop integration checks; all network and real settings stay mocked."""
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from PySide6.QtCore import QSettings, Qt, QEvent, QCoreApplication
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
-from widget import Widget
+from widget import Widget, THEMES
 from desktop import DesktopWindow
 
 
@@ -208,3 +209,100 @@ class DesktopTests(unittest.TestCase):
             self.window.set_page("home")
             self.app.processEvents()
             self.assertTrue(self.window.grab().save("/tmp/check-ai-desktop-"+mode+".png"))
+
+    def test_dashboard_lowest_quota_metric_and_risk(self):
+        window = self.window
+        window.set_theme("light")
+        colors = THEMES["light"]
+        self.assertNotIn("accounts", window.metrics)
+        self.assertEqual((window.metrics["lowest"].text(), window.metric_notes["lowest"].text()), ("80%", "GPT / Codex · Codex · 주간"))
+        self.assertEqual(window.metrics["lowest"].property("risk"), "")
+        self.assertEqual(window.metric_notes["events"].text(), "오늘 기준")
+        for remaining, risk, token in ((15, "low", "warning"), (7, "critical", "danger")):
+            window.received("antigravity", {"rows": [{"label": "Gemini · 주간", "remaining": remaining, "reset": "주간 초기화"}], "plan": None}, "")
+            self.app.processEvents()
+            self.assertEqual((window.metrics["lowest"].text(), window.metric_notes["lowest"].text()),
+                             (f"{remaining}%", "Antigravity · Gemini · 주간"))
+            self.assertEqual(window.metrics["lowest"].property("risk"), risk)
+            self.assertEqual(window.metrics["lowest"].palette().color(QPalette.WindowText), QColor(colors[token]))
+            self.assertEqual(window.overview_quotas["antigravity"].property("risk"), risk)
+            self.assertEqual(window.overview_quotas["antigravity"].palette().color(QPalette.WindowText), QColor(colors[token]))
+            bar = window.overview_bars["antigravity"]
+            self.assertEqual((bar.property("risk"), bar.height(), bar.value()), (risk, 4, remaining * 10))
+            self.assertEqual(bar.grab().toImage().pixelColor(2, 2), QColor(colors[token]))
+        codex_bar = window.overview_bars["codex"]
+        self.assertEqual((codex_bar.property("risk"), codex_bar.value()), ("", 800))
+        self.assertEqual(codex_bar.grab().toImage().pixelColor(2, 2), QColor(colors["codex"]))
+        # Unlimited rows have no percentage and stay out of the minimum.
+        window.received("copilot", {"rows": [{"label": "채팅", "remaining": None, "reset": ""}], "plan": None}, "")
+        self.assertEqual(window.metrics["lowest"].text(), "7%")
+        self.assertTrue(window.overview_bars["copilot"].isHidden())
+        for card in window.cards.values():
+            card.data = []
+        window.update_dashboard()
+        self.assertEqual((window.metrics["lowest"].text(), window.metric_notes["lowest"].text()), ("—", "조회 전"))
+        self.assertEqual(window.metrics["lowest"].property("risk"), "")
+
+    def test_dashboard_agents_metric_shows_waiting(self):
+        window = self.window
+        window.set_theme("light")
+        self.assertEqual((window.metrics["agents"].text(), window.metric_notes["agents"].text()), ("0", "실행 중인 작업 없음"))
+        now = datetime.now().timestamp()
+        task = lambda name, status: dict(id=name, agent="claude", label=name, status=status, started=now-60, updated=now, target="/tmp/" + name)
+        with patch.object(Widget, "send_notification"):
+            window.received_activity([task("a", "running")])
+            self.assertEqual((window.metrics["agents"].text(), window.metric_notes["agents"].text()), ("1", "실행 중 1건"))
+            self.assertEqual(window.metric_notes["agents"].property("risk"), "")
+            window.received_activity([task("a", "running"), task("b", "waiting")])
+        self.app.processEvents()
+        self.assertEqual((window.metrics["agents"].text(), window.metric_notes["agents"].text()), ("2", "승인 대기 1건"))
+        self.assertEqual(window.metric_notes["agents"].property("risk"), "low")
+        self.assertEqual(window.metric_notes["agents"].palette().color(QPalette.WindowText), QColor(THEMES["light"]["warning"]))
+        with patch.object(Widget, "send_notification"):
+            window.received_activity([task("a", "running"), task("b", "running")])
+        self.assertEqual((window.metric_notes["agents"].text(), window.metric_notes["agents"].property("risk")), ("실행 중 2건", ""))
+
+    def test_billing_page_summary_and_empty_state(self):
+        window = self.window
+        today = date(2026, 10, 2)
+        guidance = ("각 서비스의 결제일 설정에서 결제 기준일과 주기를 입력하면 다음 결제 예정일과 남은 날짜를 표시합니다. "
+                    "결제일 자동 조회·자동 결제는 하지 않습니다.")
+        window.update_dashboard(today)
+        self.assertEqual(window.billing_summary.text(), guidance)
+        self.assertEqual((window.metrics["billing"].text(), window.metric_notes["billing"].text()), ("미설정", "구독·결제에서 설정"))
+        for key in window.cards:
+            self.assertEqual((window.billing_dates[key].text(), window.billing_buttons[key].text()), ("미설정", "결제일 설정"))
+        window.save_billing("claude_max", {"date": "2026-10-15", "period": "monthly"})
+        window.save_billing("codex", {"date": "2026-10-20", "period": "once"})
+        window.update_dashboard(today)
+        self.assertEqual(window.billing_summary.text(), "설정된 구독 2 / 5 · 다음 결제 10/15 (13일 후) · Claude · Max 5x")
+        self.assertEqual((window.billing_dates["claude_max"].text(), window.billing_notes["claude_max"].text(), window.billing_buttons["claude_max"].text()),
+                         ("10/15", "13일 후 · 매월", "수정"))
+        self.assertEqual((window.billing_dates["codex"].text(), window.billing_notes["codex"].text()), ("10/20", "18일 후 · 반복 없음"))
+        self.assertEqual((window.billing_dates["claude"].text(), window.billing_buttons["claude"].text()), ("미설정", "결제일 설정"))
+        self.assertEqual((window.metrics["billing"].text(), window.metric_notes["billing"].text()), ("10.15", "13일 후"))
+        window.update_dashboard(date(2026, 10, 15))
+        self.assertEqual(window.billing_summary.text(), "설정된 구독 2 / 5 · 다음 결제 10/15 (오늘) · Claude · Max 5x")
+        self.assertEqual(window.billing_notes["claude_max"].text(), "오늘 · 매월")
+        self.assertEqual(window.metric_notes["billing"].text(), "오늘")
+        window.update_dashboard(date(2026, 10, 25))
+        self.assertEqual(window.billing_notes["codex"].text(), "확인 필요 · 반복 없음")
+        self.assertEqual(window.billing_summary.text(), "설정된 구독 2 / 5 · 다음 결제 11/15 (21일 후) · Claude · Max 5x")
+        window.save_billing("claude_max", None)
+        window.update_dashboard(date(2026, 10, 25))
+        self.assertEqual(window.billing_summary.text(), "설정된 구독 1 / 5 · 결제일 확인 필요")
+        self.assertEqual((window.metrics["billing"].text(), window.metric_notes["billing"].text()), ("확인 필요", "지난 결제일 수정 필요"))
+
+    def test_billing_cards_reflow_two_columns(self):
+        window = self.window
+        window.set_page("billing")
+        for width, columns in ((1160, 2), (900, 1), (1060, 2), (1059, 1)):
+            window.resize(width, 800)
+            self.app.processEvents()
+            self.assertEqual(window.billing_columns, columns, width)
+            grid = window.billing_grid
+            cells = [grid.getItemPosition(grid.indexOf(box))[:2] for box in window.billing_cards.values()]
+            self.assertEqual(sorted(cells), [(i // columns, i % columns) for i in range(len(cells))])
+            self.assertEqual(window.billing_page.horizontalScrollBar().maximum(), 0)
+            for box in window.billing_cards.values():
+                self.assertLessEqual(box.geometry().right(), window.billing_page.viewport().width())
