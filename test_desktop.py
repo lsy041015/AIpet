@@ -182,6 +182,19 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("미설정", self.window.cards["claude_max"].billing.text())
         self.assertEqual(self.window.cards["claude"].billing.text(), before)
 
+    def test_desktop_hides_quota_view_switch(self):
+        self.settings.setValue("quota_view", "list")
+        desktop = DesktopWindow()
+        desktop.show()
+        desktop.set_page("quota")
+        self.app.processEvents()
+        self.assertTrue(desktop.quota_view_switch.isHidden())
+        self.assertTrue(desktop.quota_list.isHidden())
+        self.assertTrue(desktop.scroll.isVisible())
+        self.assertEqual(self.settings.value("quota_view"), "list")
+        desktop.close()
+        desktop.deleteLater()
+
     def test_quota_grid_and_themes_fit_small_and_large_windows(self):
         self.window.set_page("quota")
         for width, columns in ((1200, 2), (820, 1)):
