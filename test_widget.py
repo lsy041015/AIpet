@@ -1,13 +1,17 @@
 """Run with QT_QPA_PLATFORM=offscreen. No network or real settings are touched."""
+import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from PySide6.QtCore import QSettings, QPoint, QPointF, Qt
+from PySide6.QtCore import QSettings, QPoint, QPointF, QSize, QEvent, QObject, QAbstractAnimation, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QMenu
 
 from widget import Widget, activate_existing, listen_for_activation
 from pixel_pet import DURATIONS, animation_row, display_row
@@ -20,7 +24,168 @@ ROWS = {
                     {"label": "Claude and GPT · 5시간", "remaining": 100, "reset": "09/11 13:20 초기화"}],
     "copilot": [{"label": "채팅", "remaining": None, "reset": ""},
                 {"label": "프리미엄", "remaining": 100, "detail": "200/200 크레딧", "reset": "10/01 초기화 · 시각 미제공"}],
+    "claude": [{"label": "현재 세션", "remaining": 99, "reset": "Sep 28, 1pm (Asia/Seoul) 초기화"},
+               {"label": "이번 주 · 전체 모델", "remaining": 67, "reset": "Sep 30, 3pm (Asia/Seoul) 초기화"}],
 }
+
+
+class LifecycleTests(unittest.TestCase):
+    def test_close_exits_and_next_launch_starts_all_refreshes(self):
+        code = textwrap.dedent("""
+            import sys
+            from pathlib import Path
+            from unittest.mock import patch
+            from PySide6.QtCore import QSettings, QTimer
+            from PySide6.QtWidgets import QApplication
+            import widget
+            from desktop import DesktopWindow
+            desktop, pet, directory = sys.argv[1:]
+            kind = DesktopWindow if desktop == "1" else widget.Widget
+            original = widget.Widget
+            settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.IniFormat)
+            state = {"closed": False, "timeout": False, "error": ""}
+            def create(*args, **kwargs):
+                window = kind(*args, **kwargs)
+                app = QApplication.instance()
+                app.lastWindowClosed.connect(lambda: state.update(closed=True))
+                def exercise():
+                    try:
+                        window.reduce_motion.setChecked(True)
+                        for _ in range(int(pet)):
+                            window.toggle_collapsed()
+                        assert all(timer.isActive() for timer in (
+                            window.timer, window.clock_timer, window.activity_timer,
+                            window.calendar.timer, window.calendar.day_timer))
+                        window.calendar.job = object()
+                        assert not window.close(), "must protect pending calendar writes"
+                        assert window.isVisible() and window.timer.isActive()
+                        waited = []
+                        window.calendar.job = type("Refresh", (), {"read_only": True, "wait": lambda self: waited.append(1)})()
+                        assert window.close(), "a read-only refresh must not block closing"
+                        assert waited, "closing must wait for the running refresh"
+                    except Exception as error:
+                        state["error"] = repr(error)
+                        app.quit()
+                def timeout():
+                    state["timeout"] = True
+                    app.quit()
+                QTimer.singleShot(20, exercise)
+                QTimer.singleShot(500, timeout)
+                return window
+            sys.argv = ["widget.py"] + (["--desktop"] if desktop == "1" else [])
+            with patch("widget.QSettings", return_value=settings), \
+                 patch.object(original, "refresh"), patch.object(original, "refresh_activity"), \
+                 patch("calendar_panel.CalendarPanel.refresh"), \
+                 patch("desktop.DesktopWindow" if desktop == "1" else "widget.Widget", side_effect=create):
+                result = widget.main()
+            print(state)
+            sys.exit(0 if state["closed"] and not state["timeout"] and not state["error"] and result == 0 else 1)
+        """)
+        with tempfile.TemporaryDirectory() as directory:
+            environment = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_RUNTIME_DIR=directory)
+            for desktop in (False, True):
+                for pet in (0, 1, 2):
+                    with self.subTest(desktop=desktop, pet=pet):
+                        for _ in range(2):
+                            result = subprocess.run(
+                                [sys.executable, "-E", "-c", code, str(int(desktop)), str(int(pet)), directory],
+                                cwd=Path(__file__).parent, env=environment, capture_output=True, text=True, timeout=5)
+                            self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-1800:])
+
+
+INSTANCE = textwrap.dedent("""
+    import sys, time
+    from pathlib import Path
+    from unittest.mock import patch
+    from PySide6.QtCore import QSettings, QTimer
+    import widget
+    role, directory, mode, startup, work, close_on = sys.argv[1:]
+    log = lambda *words: print(role, *words, flush=True)
+    settings = QSettings(str(Path(directory) / (role + ".ini")), QSettings.IniFormat)
+    original_init, original_bring, original_wait = widget.Widget.__init__, widget.Widget.bring_to_front, widget.Fetch.wait
+    activations = []
+    def init(self, *args, **kwargs):
+        log("constructing")
+        time.sleep(float(startup))
+        original_init(self, *args, **kwargs)
+        log("started", type(self).__name__)
+        if close_on == "start":
+            QTimer.singleShot(100, self.close)
+    def bring(self):
+        original_bring(self)
+        activations.append(self)
+        if close_on == "activation" and len(activations) == 2:
+            QTimer.singleShot(0, self.close)
+    def wait(self, *args):
+        log("waiting", self.parent().isVisible())
+        return original_wait(self, *args)
+    def fetch():
+        time.sleep(float(work))
+        return {"rows": [{"label": "주간", "remaining": 50, "reset": ""}], "plan": None}
+    sys.argv = ["widget.py"] + (["--desktop"] if mode == "desktop" else [])
+    with patch("widget.QSettings", return_value=settings), patch.dict(widget.PROVIDERS, {"codex": fetch}, clear=True), \\
+         patch.object(widget.Widget, "refresh_activity"), patch("calendar_panel.CalendarPanel.refresh"), \\
+         patch.object(widget.Widget, "__init__", init), patch.object(widget.Widget, "bring_to_front", bring), \\
+         patch.object(widget.Fetch, "wait", wait), \\
+         patch("widget.QMessageBox.warning", side_effect=lambda *args: log("warning")):
+        result = widget.main()
+    log("exit", result)
+""")
+
+
+class InstanceTests(unittest.TestCase):
+    def launch(self, directory, role, mode="compact", startup=0, work=0, close_on="never"):
+        environment = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_RUNTIME_DIR=directory)
+        return subprocess.Popen([sys.executable, "-E", "-c", INSTANCE, role, directory, mode, str(startup), str(work), close_on],
+                                cwd=Path(__file__).parent, env=environment, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+
+    def read_until(self, process, word):
+        lines = []
+        for line in process.stdout:
+            lines.append(line.strip())
+            if word in line:
+                return lines
+        self.fail(f"{word!r} not printed: {lines}")
+
+    def finish(self, process):
+        output, _ = process.communicate(timeout=40)
+        return [line for line in output.split("\n") if line and " waiting " not in line]
+
+    def test_launch_during_startup_and_shutdown_is_not_lost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = self.launch(directory, "a", startup=1, work=2, close_on="activation")
+            try:
+                self.read_until(first, "constructing")
+                # The first instance holds the lock but is not listening yet.
+                second = self.launch(directory, "b")
+                self.assertEqual(self.finish(second), ["b exit 0"])
+                self.assertEqual(self.read_until(first, "waiting"), ["a started Widget", "a waiting False"])
+                # Relaunch while the closed window still waits for its quota worker.
+                third = self.launch(directory, "c", close_on="start")
+                self.assertEqual(self.finish(first), ["a exit 0"])
+                self.assertEqual(self.finish(third), ["c constructing", "c started Widget", "c exit 0"])
+            finally:
+                for process in (first, locals().get("second"), locals().get("third")):
+                    if process and process.poll() is None:
+                        process.kill()
+                        process.communicate()
+
+    def test_other_mode_replaces_running_instance(self):
+        for running, requested, name in (("compact", "desktop", "DesktopWindow"), ("desktop", "compact", "Widget")):
+            with self.subTest(running=running, requested=requested), tempfile.TemporaryDirectory() as directory:
+                first = self.launch(directory, "a", running)
+                second = None
+                try:
+                    self.read_until(first, "started")
+                    second = self.launch(directory, "b", requested, close_on="start")
+                    self.assertEqual(self.finish(first), ["a exit 0"])
+                    self.assertEqual(self.finish(second), ["b constructing", "b started " + name, "b exit 0"])
+                finally:
+                    for process in (first, second):
+                        if process and process.poll() is None:
+                            process.kill()
+                            process.communicate()
 
 
 class WidgetTests(unittest.TestCase):
@@ -57,6 +222,108 @@ class WidgetTests(unittest.TestCase):
         self.settings_patch.stop()
         self.directory.cleanup()
 
+    def test_claude_usage_card_shows_cli_limits(self):
+        self.assertIn('claude', self.window.cards)
+        card = self.window.cards['claude']
+        self.assertEqual(card.amount.text(), '67%')
+        self.assertTrue(card.bar.isVisible())
+        self.assertTrue(card.details_button.isVisible())
+        self.assertIn('이번 주', card.summary_label.text())
+        self.assertIn('Sep 30', card.reset.text())
+
+    def test_weekly_limits_stay_first_across_services_and_refreshes(self):
+        cases = [
+            ("codex", "Codex · 주간", "GPT-5.3-Codex-Spark · 주간", "Codex · 5시간"),
+            ("claude", "이번 주 · 전체 모델", "이번 주 · Fable", "현재 세션"),
+            ("claude_max", "이번 주 · 전체 모델", "이번 주 · Fable", "현재 세션"),
+            ("antigravity", "Gemini · 주간", "Claude and GPT · 주간", "Gemini · 5시간"),
+        ]
+        with patch.object(self.window.notifications, "quota") as notify:
+            for key, weekly, model_weekly, session in cases:
+                with self.subTest(service=key):
+                    # Overall weekly quota wins even when a model/session has less left.
+                    model_remaining = 90 if key == "antigravity" else 30
+                    rows = [{"label": session, "remaining": 5, "reset": "오늘 초기화"},
+                            {"label": model_weekly, "remaining": model_remaining, "reset": "다음 주 초기화"},
+                            {"label": weekly, "remaining": 80, "reset": "주간 초기화"}]
+                    for incoming in (rows, rows[::-1]):
+                        original = list(incoming)
+                        self.window.received(key, {"rows": incoming}, "")
+                        card = self.window.cards[key]
+                        self.assertEqual(card.amount.text(), "80%")
+                        self.assertEqual(card.bar.value(), 800)
+                        self.assertIn(weekly, card.summary_label.text())
+                        self.assertNotIn("가장 적은", card.summary_label.text())
+                        self.assertEqual(card.reset.text(), "주간 초기화")
+                        titles = [card.rows.itemAt(i).widget().findChild(QLabel, "rowTitle").text()
+                                  for i in range(card.rows.count())]
+                        self.assertEqual(titles, [weekly, model_weekly, session])
+                        self.assertEqual(self.window.pet_quotas[key], "80% 남음")
+                        self.assertTrue(self.window.pet_low[key])
+                        self.assertTrue(card.property("warning"))
+                        self.assertEqual(incoming, original)
+                        notify.assert_called_with(key, unittest.mock.ANY, incoming)
+
+    def test_no_weekly_limit_keeps_remaining_and_unlimited_fallbacks(self):
+        rows = [{"label": "채팅", "remaining": None, "reset": ""},
+                {"label": "프리미엄", "remaining": 25, "reset": "월간 초기화"}]
+        self.window.received("copilot", {"rows": rows}, "")
+        card = self.window.cards["copilot"]
+        self.assertEqual(card.amount.text(), "25%")
+        self.assertEqual(card.reset.text(), "월간 초기화")
+        self.assertEqual(self.window.pet_quotas["copilot"], "25% 남음")
+        self.window.received("copilot", {"rows": rows[:1]}, "")
+        self.assertEqual(card.amount.text(), "무제한")
+        self.assertTrue(card.bar.isHidden())
+
+    def test_two_claude_accounts_keep_independent_limits_and_login(self):
+        self.assertIn('claude_max', self.window.cards)
+        business = self.window.cards['claude']
+        personal = self.window.cards['claude_max']
+        self.window.received('claude', {'rows': ROWS['claude'], 'plan': 'team', 'account': 'work@example.test'}, '')
+        self.window.received('claude_max', {'rows': [{'label': '현재 세션', 'remaining': 25, 'reset': '1pm 초기화'}],
+                                           'plan': 'max', 'account': 'personal@example.test'}, '')
+        self.assertEqual(business.amount.text(), '67%')
+        self.assertEqual(personal.amount.text(), '25%')
+        self.assertIn('work@example.test', business.plan.text())
+        self.assertIn('personal@example.test', personal.plan.text())
+        with patch('widget.claude_max_dir', return_value=Path(self.directory.name) / 'max'), \
+             patch('widget.QProcess') as process:
+            process.return_value.startDetached.return_value = True
+            personal.open_claude_login()
+            process.return_value.startDetached.assert_called_once()
+            self.assertIn("브라우저에서 Max 계정", personal.status.text())
+            args = process.return_value.setArguments.call_args.args[0]
+            self.assertIn('--no-dbus', args)
+            self.assertEqual(args[-2:], ['auth', 'login'])
+            env = process.return_value.setProcessEnvironment.call_args.args[0]
+            self.assertEqual(env.value('CLAUDE_CONFIG_DIR'), str(Path(self.directory.name) / 'max'))
+
+    def test_wayland_uses_positionable_backend_without_overriding_explicit_choice(self):
+        import os
+        import subprocess
+        import sys
+        if not sys.platform.startswith("linux"):
+            self.skipTest("Linux desktop backend selection")
+        for display, wayland, explicit, expected in (
+            (":0", "wayland-0", "", "xcb"),
+            (":0", "wayland-0", "offscreen", "offscreen"),
+            (":0", "", "", ""),
+            ("", "wayland-0", "", ""),
+        ):
+            with self.subTest(display=display, wayland=wayland, explicit=explicit):
+                environment = dict(os.environ)
+                for key, value in (("DISPLAY", display), ("WAYLAND_DISPLAY", wayland), ("QT_QPA_PLATFORM", explicit)):
+                    environment.pop(key, None)
+                    if value:
+                        environment[key] = value
+                result = subprocess.run(
+                    [sys.executable, "-c", "import os, widget; print(os.environ.get('QT_QPA_PLATFORM', ''))"],
+                    cwd=Path(__file__).parent, env=environment, capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
     def test_circle_collapse_and_restore(self):
         self.window.resize(430, 700)
         self.window.set_page("calendar")
@@ -83,11 +350,12 @@ class WidgetTests(unittest.TestCase):
         self.assertTrue(self.window.calendar.isVisible())
         self.assertAlmostEqual(self.window.windowOpacity(), .7, places=2)
         self.window.toggle_collapsed()
-        self.window.close()
-        self.assertEqual(self.settings.value("geometry"), self.window.expanded_geometry)
         self.window.bring_to_front()
         self.assertFalse(self.window.collapsed)
         self.assertEqual(self.window.geometry(), original)
+        self.window.toggle_collapsed()
+        self.window.close()
+        self.assertEqual(self.settings.value("geometry"), self.window.expanded_geometry)
 
     def test_drag_circle_does_not_activate_and_home_restores_feature_size(self):
         self.assertEqual(self.window.timer.interval(), 180_000)
@@ -103,6 +371,17 @@ class WidgetTests(unittest.TestCase):
         QTest.mouseRelease(self.window.restore_button, Qt.LeftButton, pos=QPoint(20, 20))
         self.assertTrue(self.window.collapsed)
         self.assertNotEqual(self.window.pos(), start)
+
+    def test_size_preset_on_home_sets_feature_size_and_stays_on_screen(self):
+        area = self.window.screen().availableGeometry()
+        self.window.set_page("home")
+        self.window.move(area.right() - 200, area.top())
+        sizes = next(menu for menu in self.window.menu.findChildren(QMenu) if menu.title() == "위젯 크기")
+        next(action for action in sizes.actions() if action.text() == "크게").trigger()
+        self.assertEqual(self.window.height(), 440)
+        self.window.set_page("quota")
+        self.assertEqual(self.window.size(), QSize(520, min(900, area.height() - 20)))
+        self.assertTrue(area.contains(self.window.geometry()))
 
     def test_circle_motion_respects_reduced_motion_and_keyboard(self):
         button = self.window.collapse_button
@@ -143,6 +422,22 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(self.window.windowOpacity(), 1)
         QTest.mouseClick(self.window.restore_button, Qt.LeftButton)
         self.assertAlmostEqual(self.window.windowOpacity(), .6, places=2)
+
+    def test_double_click_on_pet_does_not_reach_revealed_window(self):
+        self.window.set_theme("dark")
+        self.window.toggle_collapsed()
+        self.window.fold_transition.finish()
+        center = self.window.restore_button.geometry().center()
+        # Window-level clicks are routed by position like real pointer input.
+        QTest.mouseClick(self.window.windowHandle(), Qt.LeftButton, Qt.NoModifier, center)
+        self.assertFalse(self.window.collapsed)
+        self.assertEqual(self.window.fold_transition.motion.state(), QAbstractAnimation.Running)
+        QTest.mouseClick(self.window.windowHandle(), Qt.LeftButton, Qt.NoModifier, center)
+        self.assertEqual(self.window.theme, "dark")
+        self.window.fold_transition.finish()
+        QTest.mouseClick(self.window.windowHandle(), Qt.LeftButton, Qt.NoModifier,
+                         self.window.theme_buttons["light"].mapTo(self.window, QPoint(5, 5)))
+        self.assertEqual(self.window.theme, "light")
 
     def test_computer_pet_states_and_idle_lifecycle(self):
         pet = self.window.restore_button
@@ -240,7 +535,7 @@ class WidgetTests(unittest.TestCase):
                     self.assertEqual(display_row(pet), row)
                     pet.tick()
                 self.assertEqual(display_row(pet), 0)
-                self.assertEqual(pet.idle.interval(), DURATIONS[0][0] * 6)
+                self.assertEqual(pet.idle.interval(), DURATIONS[0][0] * 12)
                 for _ in range(12):
                     pet.tick()
                     self.assertEqual(display_row(pet), 0)
@@ -253,15 +548,46 @@ class WidgetTests(unittest.TestCase):
             self.assertEqual(display_row(pet), 5)
             self.assertEqual(pet.frame, 0)
 
+    def test_pet_mode_slows_hidden_clock_and_reduced_motion_stops_frames(self):
+        self.window.toggle_collapsed()
+        pet = self.window.restore_button
+        self.assertEqual(self.window.clock_timer.interval(), 60_000)
+        self.assertEqual(self.window.timer.interval(), 180_000)
+        self.assertEqual(self.window.activity_timer.interval(), 5_000)
+        before = self.window.clock.text()
+        with patch("widget.datetime") as clock:
+            clock.now.return_value = datetime(2030, 1, 1, 12, 0, 0)
+            self.window.update_clock()
+        self.assertEqual(self.window.clock.text(), before)
+        self.window.reduce_motion.setChecked(True)
+        self.assertFalse(pet.idle.isActive())
+        pet.play_animation(4)
+        self.assertTrue(pet.idle.isActive())
+        for _ in DURATIONS[4]:
+            pet.tick()
+        self.assertFalse(pet.idle.isActive())
+        self.window.toggle_collapsed()
+        self.assertEqual(self.window.clock_timer.interval(), 1_000)
+
+    def test_transition_images_are_released_after_animation(self):
+        from PySide6.QtGui import QPixmap
+        self.window.page_opacity.snapshot = QPixmap(400, 600)
+        self.window.page_opacity.setOpacity(1.0)
+        self.assertTrue(self.window.page_opacity.snapshot.isNull())
+        self.window.fold_transition.snapshot = QPixmap(400, 600)
+        self.window.fold_transition.finish()
+        self.assertTrue(self.window.fold_transition.snapshot.isNull())
+
     def test_agent_activity_bubble(self):
         self.window.toggle_collapsed()
         pet = self.window.restore_button
         with patch.object(pet, 'underMouse', return_value=False):
             tasks = [dict(id=key, agent=key, label=label, status='waiting' if key == 'copilot' else 'running', started=datetime.now().timestamp()-180, updated=2, target='/tmp/test')
-                     for key, label in [('codex', '파일 수정 중'), ('antigravity', '<회의>'), ('copilot', '승인·입력 대기')]]
+                     for key, label in [('codex', '파일 수정 중'), ('antigravity', '<회의>'), ('copilot', '승인·입력 대기'), ('claude', '명령 실행 중')]]
             self.window.received_activity(tasks)
             self.assertTrue(pet.bubble.isVisible())
-            self.assertEqual(pet.bubble.text.text().count('<img '), 3)
+            self.assertEqual(pet.bubble.text.text().count('<img '), 4)
+            self.assertIn('claude-white.svg', pet.bubble.text.text())
             self.assertIn('&lt;회의&gt;', pet.bubble.text.text())
             self.assertTrue(pet.bubble.waiting)
             self.assertIn('경과', pet.bubble.text.text())
@@ -271,6 +597,11 @@ class WidgetTests(unittest.TestCase):
                 windows.return_value.candidates.assert_called_once_with('antigravity', '/tmp/test')
                 windows.return_value.activate.assert_called_once_with(123)
                 windows.return_value.close.assert_called_once()
+            with patch('widget.XWindows') as windows:
+                windows.return_value.candidates.return_value = [(456, 'Claude terminal')]
+                pet.bubble.text.linkActivated.emit('3')
+                windows.return_value.candidates.assert_called_once_with('claude', '/tmp/test')
+                windows.return_value.activate.assert_called_once_with(456)
             for theme in ('light', 'dark'):
                 self.window.set_theme(theme)
                 pet.bubble.grab().save('/tmp/agent-bubble-' + theme + '.png')
@@ -278,6 +609,65 @@ class WidgetTests(unittest.TestCase):
             self.assertTrue(pet.bubble.isVisible())
             self.window.received_activity([dict(task, status='cancelled') for task in tasks])
             self.assertFalse(pet.bubble.isVisible())
+
+    def test_activity_bubble_reanchors_after_each_pet_restore(self):
+        self.window.move(50, 50)
+        pet = self.window.restore_button
+        self.window.agent_activity = [dict(agent="codex", status="running", label="작업 중", elapsed=120, estimated=False)]
+        with patch.object(pet, "underMouse", return_value=False):
+            for _ in range(3):
+                self.window.toggle_collapsed()
+                self.app.processEvents()
+                self.assertTrue(pet.bubble.isVisible())
+                anchor = pet.mapToGlobal(pet.rect().center())
+                self.assertEqual(pet.bubble.placement_anchor, anchor)
+                self.assertEqual(pet.bubble.x(), anchor.x() + 54)
+                self.window.toggle_collapsed()
+                self.app.processEvents()
+
+    def test_bubble_uses_screen_at_pet_center_with_offset_monitors(self):
+        from PySide6.QtCore import QRect
+        from unittest.mock import Mock
+        self.window.toggle_collapsed()
+        pet = self.window.restore_button
+        stale_screen = Mock()
+        stale_screen.availableGeometry.return_value = QRect(0, 280, 1920, 1200)
+        for bounds, point in ((QRect(1920, 0, 1920, 1080), QPoint(2053, 73)),
+                              (QRect(-1280, -240, 1280, 1024), QPoint(-1150, -170))):
+            actual_screen = Mock()
+            actual_screen.availableGeometry.return_value = bounds
+            with self.subTest(bounds=bounds), patch.object(pet, "screen", return_value=stale_screen), \
+                    patch.object(pet, "mapToGlobal", return_value=point), \
+                    patch("widget.QApplication.screenAt", return_value=actual_screen):
+                pet.bubble.present(pet)
+                self.assertTrue(bounds.contains(pet.bubble.geometry()))
+                self.assertEqual(pet.bubble.x(), point.x() + 54)
+                self.assertEqual(pet.bubble.y(), point.y() - 40)
+
+    def test_bubble_recovers_after_external_reposition(self):
+        self.window.move(50, 50)
+        self.window.toggle_collapsed()
+        pet = self.window.restore_button
+        pet.bubble.present(pet)
+        expected = pet.bubble.pos()
+        pet.bubble.move(expected + QPoint(0, 280))
+        pet.bubble.present(pet)
+        self.assertEqual(pet.bubble.pos(), expected)
+
+    def test_visible_summary_bubble_follows_window_move(self):
+        self.window.move(50, 50)
+        self.window.toggle_collapsed()
+        pet = self.window.restore_button
+        with patch.object(pet, "underMouse", return_value=True):
+            self.app.processEvents()
+            pet.bubble.present(pet)
+            summary = pet.bubble.text.text()
+            self.window.move(100, 100)
+            self.app.processEvents()
+            point = pet.mapToGlobal(pet.rect().center())
+            self.assertTrue(pet.bubble.isVisible())
+            self.assertEqual(pet.bubble.text.text(), summary)
+            self.assertEqual(pet.bubble.pos(), QPoint(point.x() + 54, point.y() - 40))
 
     def test_bubble_position_stable_when_content_changes(self):
         self.window.move(50, 50)
@@ -292,6 +682,28 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(pet.bubble.pos(), position)
         self.assertEqual(pet.bubble.on_right, side)
 
+    def test_bubble_is_placed_before_it_becomes_visible(self):
+        self.window.toggle_collapsed()
+        bubble = self.window.restore_button.bubble
+        shown = []
+
+        class ShowPosition(QObject):
+            def eventFilter(self, watched, event):
+                if event.type() == QEvent.Show:
+                    shown.append(watched.pos())
+                return False
+
+        spy = ShowPosition()
+        bubble.installEventFilter(spy)
+        for position in (QPoint(100, 100), QPoint(300, 260)):
+            bubble.hide()
+            self.window.move(position)
+            self.app.processEvents()
+            bubble.present(self.window.restore_button)
+            self.assertEqual(shown[-1], bubble.pos())
+            self.assertEqual(bubble.placement_anchor, self.window.restore_button.mapToGlobal(
+                self.window.restore_button.rect().center()))
+
     def test_agent_notification_is_sent_once(self):
         task = dict(id='x', agent='codex', status='running', label='작업 중', started=1, updated=2, target='x')
         with patch.object(self.window, 'send_notification') as notify:
@@ -300,6 +712,14 @@ class WidgetTests(unittest.TestCase):
             self.window.received_activity([task])
             self.window.received_activity([task])
             notify.assert_called_once()
+
+    def test_smoke_render_does_not_store_notification_state(self):
+        before = self.settings.value("notification_state")
+        smoke = Widget(smoke=True)
+        smoke.received("codex", {"rows": [{"label": "Smoke · 주간", "remaining": 5, "reset": "10/06 14:00 초기화"}]}, "")
+        self.assertEqual(self.settings.value("notification_state"), before)
+        smoke.close()
+        smoke.deleteLater()
 
     def test_theme_click_persists_and_preserves_quota(self):
         QTest.mouseClick(self.window.theme_buttons["light"], Qt.LeftButton)
@@ -475,6 +895,20 @@ class WidgetTests(unittest.TestCase):
         restored.close()
         restored.deleteLater()
 
+    def test_geometry_is_saved_after_move_without_close(self):
+        self.window.move(40, 50)
+        self.window.resize(500, 640)
+        QTest.qWait(1100)
+        restored = Widget()
+        restored.set_page("quota")
+        self.assertEqual(restored.geometry(), self.window.geometry())
+        restored.deleteLater()
+        self.window.toggle_collapsed()
+        self.window.move(300, 300)
+        QTest.qWait(1100)
+        self.assertEqual(self.settings.value("geometry"), self.window.expanded_geometry)
+        self.assertEqual(self.settings.value("feature_size"), QSize(500, 640))
+
     def test_small_window_and_expanded_details_remain_scrollable(self):
         self.window.resize(360, 580)
         for card in self.window.cards.values():
@@ -512,17 +946,32 @@ class WidgetTests(unittest.TestCase):
         self.window.set_transparency(-1)
         self.assertEqual(self.window.windowOpacity(), 1)
 
+    def activate_from_process(self, socket_path, mode="compact"):
+        # The client blocks for the reply, so it must run outside this event loop.
+        code = "import sys, widget; print(widget.activate_existing(sys.argv[1], sys.argv[2]))"
+        process = subprocess.Popen([sys.executable, "-E", "-c", code, str(socket_path), mode], cwd=Path(__file__).parent,
+                                   env=dict(os.environ, QT_QPA_PLATFORM="offscreen"), stdout=subprocess.PIPE, text=True)
+        while process.poll() is None:
+            QTest.qWait(10)
+        return process.communicate()[0].strip()
+
     def test_second_launch_shows_existing_hidden_window_and_recovers_position(self):
         socket_path = Path(self.directory.name) / "widget.sock"
         server = listen_for_activation(self.window, socket_path)
         try:
             self.window.move(-10000, -10000)
             self.window.hide()
-            self.assertTrue(activate_existing(socket_path))
+            self.assertEqual(self.activate_from_process(socket_path), "ok")
             QTest.qWait(50)
             self.assertTrue(self.window.isVisible())
             self.assertTrue(self.app.primaryScreen().availableGeometry().contains(self.window.geometry()))
-            self.assertFalse(activate_existing(Path(self.directory.name) / "missing.sock"))
+            self.assertEqual(activate_existing(Path(self.directory.name) / "missing.sock"), "")
+            with patch.object(self.window, "close") as close:
+                self.assertEqual(self.activate_from_process(socket_path, "desktop"), "switch")
+                QTest.qWait(50)
+                close.assert_called_once()
+            server.close()
+            self.assertEqual(self.activate_from_process(socket_path), "")
         finally:
             server.close()
 

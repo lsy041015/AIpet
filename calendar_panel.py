@@ -2,7 +2,7 @@
 from datetime import date, datetime, timedelta
 from uuid import uuid4
 
-from PySide6.QtCore import QDateTime, Qt, QThread, QTimer, QUrl, QLocale, QSettings, Signal
+from PySide6.QtCore import QDate, QDateTime, QTime, Qt, QThread, QTimer, QUrl, QLocale, QSettings, Signal
 from PySide6.QtGui import QDesktopServices, QIcon, QColor, QTextCharFormat
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QDialog, QFormLayout, QLineEdit, QDateTimeEdit,
@@ -13,6 +13,7 @@ from quick_event import parse_quick_event
 
 TITLE_KEYWORDS = ("학사일정", "출장", "연차", "조기퇴근", "반차", "회의",
                   "교육", "시험", "과제 마감", "월세 날", "급여일")
+BUSY_TEXT = "진행 중인 일정 조회·연결이 끝나면 다시 눌러 주세요."
 
 
 def text_label(text=""):
@@ -50,6 +51,8 @@ class EventDialog(QDialog):
         self.saving = False
         self.keyword_settings = QSettings(str(panel.client.directory / "keywords.ini"), QSettings.IniFormat)
         saved_keywords = self.keyword_settings.value("titles", list(TITLE_KEYWORDS))
+        # Qt INI reads a saved one-item list back as a string and an empty list as None.
+        saved_keywords = [] if saved_keywords is None else [saved_keywords] if isinstance(saved_keywords, str) else saved_keywords
         self.title_keywords = list(dict.fromkeys(saved_keywords)) if isinstance(saved_keywords, list) and all(
             isinstance(word, str) and 0 < len(word) <= 20 and not any(c in word for c in "[]\n\r")
             for word in saved_keywords) else list(TITLE_KEYWORDS)
@@ -91,10 +94,13 @@ class EventDialog(QDialog):
         self.title_input.setPlaceholderText("예: [출장] 대전 고객사 방문")
         self.title_input.textChanged.connect(self.sync_keywords)
         self.rebuild_keywords()
-        self.start = QDateTimeEdit(QDateTime.currentDateTime().addSecs(3600))
+        start = QDateTime.currentDateTime().addSecs(3600)
+        start.setTime(QTime(start.time().hour(), start.time().minute()))  # fields hide seconds
+        self.start = QDateTimeEdit(start)
         self.end = QDateTimeEdit(self.start.dateTime().addSecs(3600))
         for field in (self.start, self.end):
             field.setCalendarPopup(True)
+            field.setMaximumDate(QDate(9999, 12, 30))  # an all-day end + 1 day must fit in datetime
             field.setDisplayFormat("yyyy-MM-dd  HH:mm")
             field.setMinimumHeight(40)
             calendar = QCalendarWidget(field)
@@ -135,6 +141,8 @@ class EventDialog(QDialog):
         self.delete_button.clicked.connect(self.delete_event)
         form.addRow(self.delete_button)
         if event:
+            # Never truncate an existing title; the 300-character limit applies to new text.
+            self.title_input.setMaxLength(max(300, len(event.get("summary", ""))))
             self.title_input.setText(event.get("summary", ""))
             all_day = "date" in event["start"]
             self.all_day.setChecked(all_day)
@@ -221,7 +229,10 @@ class EventDialog(QDialog):
             field.setDisplayFormat("yyyy-MM-dd" if enabled else "yyyy-MM-dd HH:mm")
 
     def save(self):
-        if self.saving or self.panel.job:
+        if self.saving:
+            return
+        if self.panel.job:
+            self.status.setText(BUSY_TEXT)
             return
         try:
             all_day = self.all_day.isChecked()
@@ -229,9 +240,13 @@ class EventDialog(QDialog):
                 start = self.start.date().toPython()
                 end = self.end.date().toPython() + timedelta(days=1)
             else:
-                start = datetime.fromtimestamp(self.start.dateTime().toSecsSinceEpoch()).astimezone()
-                end = datetime.fromtimestamp(self.end.dateTime().toSecsSinceEpoch()).astimezone()
-            body = event_body(self.title_input.text(), start, end, all_day)
+                # The fields hide seconds, so a typed 15:00 must not keep hidden ones.
+                start = datetime.fromtimestamp(self.start.dateTime().toSecsSinceEpoch()).astimezone().replace(second=0)
+                end = datetime.fromtimestamp(self.end.dateTime().toSecsSinceEpoch()).astimezone().replace(second=0)
+            # An event that was already untitled may be saved after changing only its time.
+            required = not self.edit_target or bool(self.edit_target.get("summary", "").strip())
+            body = event_body(self.title_input.text(), start, end, all_day,
+                              self.title_input.maxLength(), required)
         except CalendarError as error:
             self.status.setText(str(error))
             return
@@ -246,7 +261,10 @@ class EventDialog(QDialog):
                        else self.panel.client.add(self.pending), self.saved)
 
     def delete_event(self):
-        if self.saving or self.panel.job or not self.edit_target:
+        if self.saving or not self.edit_target:
+            return
+        if self.panel.job:
+            self.status.setText(BUSY_TEXT)
             return
         message = "이 일정을 Google Calendar에서 삭제할까요?"
         if self.edit_target.get("recurringEventId"):
@@ -383,10 +401,12 @@ class CalendarPanel(QWidget):
         for button in (self.add_button, self.refresh_button):
             button.setEnabled(connected and self.job is None)
 
-    def run(self, action, callback):
+    def run(self, action, callback, read_only=False):
         if self.job:
             return
         self.job = CalendarJob(action, self)
+        # Closing waits for read-only jobs; login and writes block closing instead.
+        self.job.read_only = read_only
         self.activity.emit(7)
         self.update_controls()
 
@@ -405,7 +425,7 @@ class CalendarPanel(QWidget):
         if self.job or not self.client.connected():
             return
         self.status.setText("주간 일정 조회 중…")
-        self.run(lambda: self.client.today(days=7), self.received)
+        self.run(lambda: self.client.today(days=7), self.received, read_only=True)
 
     def received(self, snapshot, error):
         if error:
@@ -416,22 +436,10 @@ class CalendarPanel(QWidget):
         self.status.setText(datetime.now().strftime("%H:%M 갱신") + " · 기본 캘린더 · 5분 간격")
         self.render()
 
-    def render(self):
-        key = (self.view, self.loaded_day, repr(self.events), datetime.now().strftime("%Y-%m-%d %H:%M"))
-        if key == self.render_key:
-            return
-        self.render_key = key
-        while self.event_layout.count():
-            old = self.event_layout.takeAt(0).widget()
-            old.hide()
-            old.deleteLater()
-        if self.loaded_day != datetime.now().astimezone().date():
-            self.listing.setText("오늘 일정 갱신 필요")
-            self.listing.show()
-            return
-        now = datetime.now().astimezone()
-        first = now.date() + timedelta(days=1 if self.view == "tomorrow" else 0)
-        last = first + timedelta(days=7 if self.view == "week" else 1)
+    def events_in(self, view, now):
+        """Loaded events overlapping the view's local days; the dashboard reuses "today"."""
+        first = now.date() + timedelta(days=1 if view == "tomorrow" else 0)
+        last = first + timedelta(days=7 if view == "week" else 1)
         visible = []
         for event in self.events:
             start, end = event["start"], event["end"]
@@ -444,6 +452,23 @@ class CalendarPanel(QWidget):
                 matches = a.date() < last and (b - timedelta(microseconds=1)).date() >= first
             if matches:
                 visible.append(event)
+        return visible
+
+    def render(self):
+        key =(self.view, self.loaded_day, repr(self.events), datetime.now().strftime("%Y-%m-%d %H:%M"))
+        if key == self.render_key:
+            return
+        self.render_key = key
+        while self.event_layout.count():
+            old = self.event_layout.takeAt(0).widget()
+            old.hide()
+            old.deleteLater()
+        if self.loaded_day != datetime.now().astimezone().date():
+            self.listing.setText("오늘 일정 갱신 필요")
+            self.listing.show()
+            return
+        now = datetime.now().astimezone()
+        visible = self.events_in(self.view, now)
         future = [e for e in visible if "dateTime" in e["start"]
                   and datetime.fromisoformat(e["start"]["dateTime"].replace("Z", "+00:00")) > now]
         next_event = min(future, key=lambda e: datetime.fromisoformat(e["start"]["dateTime"].replace("Z", "+00:00"))) if future else None
@@ -486,14 +511,18 @@ class CalendarPanel(QWidget):
 
     def edit_event(self, event):
         if not self.job:
-            EventDialog(self, event).exec()
+            dialog = EventDialog(self, event)
+            dialog.exec()
+            dialog.deleteLater()
 
     def tick(self):
         today = datetime.now().astimezone().date()
         if today != self.checked_day:
-            self.checked_day = today
             self.render()
-            self.refresh()
+            # A running job may hold the previous day; keep retrying until refresh can start.
+            if not self.job:
+                self.checked_day = today
+                self.refresh()
         elif self.loaded_day:
             self.render()
         owner = self.window()
@@ -534,6 +563,7 @@ class CalendarPanel(QWidget):
         choose.clicked.connect(selected)
         layout.addWidget(choose)
         dialog.exec()
+        dialog.deleteLater()
 
     def begin_connect(self, path):
         self.status.setText("브라우저에서 Google 로그인·권한 허용. 대기 제한 3분.")
@@ -546,7 +576,9 @@ class CalendarPanel(QWidget):
             self.refresh()
 
     def add_event(self):
-        EventDialog(self).exec()
+        dialog = EventDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
 
     def quick_event(self):
         if self.job or not self.client.connected():
@@ -567,6 +599,7 @@ class CalendarPanel(QWidget):
         dialog.status.setText("날짜·시간을 확인한 뒤 일정 추가를 눌러 주세요. 길이 생략 시 1시간입니다.")
         if dialog.exec() == QDialog.Accepted:
             self.quick_input.clear()
+        dialog.deleteLater()
 
     def disconnect(self):
         try:

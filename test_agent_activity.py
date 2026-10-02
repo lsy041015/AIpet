@@ -4,12 +4,102 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from datetime import datetime, timezone
-from agent_activity import read_activity, session_state, ActivityTracker
+from agent_activity import read_activity, session_state, ActivityTracker, timestamp, live_agent_files, claude_project
+from agent_windows import agent_pids
 
 
 class ActivityTests(unittest.TestCase):
+    def test_live_sessions_survive_the_recent_history_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for agent, folder, filename, event in (
+                ("codex", ".codex/sessions", "session.jsonl", {"type": "event_msg", "payload": {"type": "task_started"}}),
+                ("copilot", ".copilot/session-state", "events.jsonl", {"type": "assistant.turn_start"}),
+                ("claude", ".claude/projects", "session.jsonl", {"type": "user", "message": {"content": "start"}}),
+            ):
+                with self.subTest(agent=agent):
+                    active = root / folder / "active" / filename
+                    active.parent.mkdir(parents=True)
+                    active.write_text(json.dumps(event) + "\n")
+                    os.utime(active, (100, 100))
+                    for index in range(40):
+                        path = root / folder / str(index) / filename
+                        path.parent.mkdir()
+                        path.write_text("{}\n")
+                        os.utime(path, (200 + index, 200 + index))
+                    with patch("agent_activity.live_agent_files", return_value={str(active)}):
+                        rows = [item for item in read_activity(root, now=250, detailed=True) if item["agent"] == agent]
+                    self.assertEqual(len(rows), 33)
+                    self.assertEqual(sum(item["id"] == str(active) for item in rows), 1)
+                    self.assertEqual(next(item for item in rows if item["id"] == str(active))["status"], "running")
+                    os.utime(active, (249, 249))
+                    with patch("agent_activity.live_agent_files", return_value={str(active)}):
+                        rows = [item for item in read_activity(root, now=250, detailed=True) if item["agent"] == agent]
+                    self.assertEqual(sum(item["id"] == str(active) for item in rows), 1)
+                    all_paths = {str(path) for path in (root / folder).rglob(filename)}
+                    with patch("agent_activity.live_agent_files", return_value=all_paths):
+                        rows = [item for item in read_activity(root, now=250, detailed=True) if item["agent"] == agent]
+                    self.assertEqual({item["id"] for item in rows}, all_paths)
+
+    def test_unavailable_process_list_does_not_interrupt_activity_scan(self):
+        for error in (FileNotFoundError, PermissionError):
+            with self.subTest(error=error), patch("agent_activity.os.scandir", side_effect=error):
+                self.assertEqual(live_agent_files(), set())
+
+    def test_unchanged_logs_are_cached_but_append_and_replace_are_detected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            start = json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n"
+            finish = json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}) + "\n"
+            path.write_text(start)
+            with patch("agent_activity.json.loads", wraps=json.loads) as decode:
+                first = session_state(path, "codex")
+                self.assertEqual(first["status"], "running")
+                parsed = decode.call_count
+                first["status"] = "changed by caller"
+                self.assertEqual(session_state(path, "codex")["status"], "running")
+                self.assertEqual(decode.call_count, parsed)
+                with path.open("a") as stream:
+                    stream.write(finish)
+                self.assertEqual(session_state(path, "codex")["status"], "done")
+                self.assertGreater(decode.call_count, parsed)
+                metadata = path.stat()
+                replacement = Path(directory) / "replacement"
+                replacement.write_text(start.ljust(metadata.st_size))
+                os.utime(replacement, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                replacement.replace(path)
+                self.assertEqual(session_state(path, "codex")["status"], "running")
+
+    def test_claude_tool_turn_and_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / '.claude/projects/-tmp/demo.jsonl'
+            path.parent.mkdir(parents=True)
+            events = [
+                {'type': 'user', 'timestamp': '2026-09-28T00:00:00Z',
+                 'message': {'role': 'user', 'content': 'start'}},
+                {'type': 'assistant', 'timestamp': '2026-09-28T00:00:01Z',
+                 'message': {'role': 'assistant', 'content': [{'type': 'tool_use', 'name': 'Bash', 'id': 'x'}],
+                             'stop_reason': 'tool_use'}},
+            ]
+            path.write_text('\n'.join(json.dumps(event) for event in events) + '\n')
+            state = session_state(path, 'claude')
+            self.assertEqual((state['status'], state['label']), ('running', '명령 실행 중'))
+            self.assertEqual(state['started'], timestamp('2026-09-28T00:00:00Z'))
+            self.assertEqual(read_activity(directory), [('claude', '명령 실행 중')])
+            events.extend([
+                {'type': 'user', 'timestamp': '2026-09-28T00:00:02Z',
+                 'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'x'}]}},
+                {'type': 'assistant', 'timestamp': '2026-09-28T00:00:03Z',
+                 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': 'done'}],
+                             'stop_reason': 'end_turn'}},
+            ])
+            path.write_text('\n'.join(json.dumps(event) for event in events) + '\n')
+            self.assertEqual(session_state(path, 'claude')['status'], 'done')
+            self.assertEqual(read_activity(directory), [])
+
     def test_missing_grace_stable_order_and_explicit_end(self):
         tracker = ActivityTracker()
         a = dict(id='a', agent='codex', status='running', label='작업 중', started=0, updated=100, target='a')
@@ -88,6 +178,23 @@ class ActivityTests(unittest.TestCase):
                 path.write_text(json.dumps(start) + '\n' + json.dumps(end))
                 self.assertEqual(read_activity(root), [])
 
+    def test_live_antigravity_conversation_survives_history_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / ".gemini/antigravity-cli/conversation_summaries.db"
+            database.parent.mkdir(parents=True)
+            active = database.parent / "conversations/active.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE conversation_summaries(title,last_modified_time,not_fully_idle,killed,status,conversation_id,last_user_input_time)")
+                for index in range(21):
+                    moment = datetime.fromtimestamp(100 + index, timezone.utc).isoformat()
+                    connection.execute("INSERT INTO conversation_summaries VALUES(?,?,?,?,?,?,?)",
+                        ("test", moment, 1, 0, "CASCADE_RUN_STATUS_RUNNING", "active" if index == 0 else str(index), moment))
+            with patch("agent_activity.live_agent_files", return_value={str(active)}):
+                rows = read_activity(root, now=230, detailed=True)
+            self.assertEqual(sum(item["id"] == str(active) for item in rows), 1)
+            self.assertLessEqual(len(rows), 17)
+
     def test_antigravity_read_only_status(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -115,3 +222,106 @@ class ActivityTests(unittest.TestCase):
             with sqlite3.connect(path) as connection:
                 connection.execute("UPDATE conversation_summaries SET status='CASCADE_RUN_STATUS_IDLE'")
             self.assertEqual(read_activity(root), [])
+
+    def write_claude(self, path, events, moment=None):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(''.join(json.dumps(event) + '\n' for event in events))
+        if moment is not None:
+            os.utime(path, (moment, moment))
+
+    def test_claude_commands_and_interrupts_do_not_start_turns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / '.claude/projects/-tmp/demo.jsonl'
+            user = lambda content, **extra: dict(type='user', timestamp='2026-09-28T00:00:10Z', message={'role': 'user', 'content': content}, **extra)
+            events = [user('start'), {'type': 'assistant', 'timestamp': '2026-09-28T00:00:01Z',
+                      'message': {'content': [{'type': 'text', 'text': 'ok'}], 'stop_reason': 'end_turn'}},
+                      user('<local-command-caveat>x</local-command-caveat>', isMeta=True),
+                      user('<command-name>/model</command-name>\n<command-message>model</command-message>'),
+                      user('<local-command-stdout>Set model</local-command-stdout>'),
+                      user('<bash-input>ls</bash-input>'), user('summary', isCompactSummary=True)]
+            self.write_claude(path, events)
+            self.assertEqual(session_state(path, 'claude')['status'], 'done')
+            self.write_claude(path, events[3:5])
+            self.assertEqual(session_state(path, 'claude')['status'], 'unknown')
+            self.assertEqual(read_activity(directory), [])
+            self.write_claude(path, [user('start'), user([{'type': 'text', 'text': '[Request interrupted by user]'}])])
+            self.assertEqual(session_state(path, 'claude')['status'], 'cancelled')
+            command = user('<command-message>review</command-message>\n<command-name>/review</command-name>')
+            self.write_claude(path, events[:2] + [command])
+            self.assertEqual(session_state(path, 'claude')['status'], 'running')
+            peer = {'type': 'assistant', 'timestamp': '2026-09-28T00:00:20Z',
+                    'message': {'content': [{'type': 'tool_use', 'name': 'Read', 'id': 'r'}], 'stop_reason': 'tool_use'}}
+            self.write_claude(path, events[:3] + [peer])
+            self.assertEqual(session_state(path, 'claude')['started'], timestamp('2026-09-28T00:00:20Z'))
+
+    def test_subagent_logs_belong_to_parent_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            start = {'type': 'user', 'message': {'content': 'start'}}
+            main = root / '.claude/projects/-tmp/s.jsonl'
+            self.write_claude(main, [start])
+            self.write_claude(root / '.claude/projects/-tmp/s/subagents/agent-a.jsonl', [start])
+            rollout = root / '.codex/sessions/rollout.jsonl'
+            rollout.parent.mkdir(parents=True)
+            meta = {'type': 'session_meta', 'payload': {'source': {'subagent': {'other': 'guardian'}}, 'padding': 'x' * 300000}}
+            rollout.write_text(json.dumps(meta) + '\n' + json.dumps({'type': 'event_msg', 'payload': {'type': 'task_started'}}) + '\n')
+            self.assertEqual([item['id'] for item in read_activity(root, detailed=True)], [str(main)])
+        tracker = ActivityTracker()
+        tracker.update([], 100)
+        old = dict(id='old', agent='claude', status='done', label='완료', started=50, updated=101, target='x')
+        self.assertEqual(tracker.update([old], 105)[1], [])
+
+    def test_running_claude_cli_keeps_silent_pending_tool_visible(self):
+        self.assertEqual(claude_project('/home/a_b/.config/x y'), '-home-a-b--config-x-y')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / 'proc/42'
+            process.mkdir(parents=True)
+            (process / 'cwd').symlink_to('/work/my_proj')
+            (process / 'stat').write_text('42 (claude) ' + ' '.join(['S', '1'] + ['0'] * 18))
+            def live(claude=None):
+                claude.append(str(process))
+                return set()
+            path = root / '.claude/projects/-work-my-proj/s.jsonl'
+            now = time.time()
+            self.write_claude(path, [{'type': 'user', 'message': {'content': 'start'}},
+                                     {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Bash', 'id': 'b'}]}}], now - 200)
+            self.assertEqual(read_activity(root, now=now), [])
+            with patch('agent_activity.live_agent_files', side_effect=live):
+                self.assertEqual(read_activity(root, now=now), [('claude', '승인 대기 또는 실행 중')])
+                self.assertEqual(read_activity(root, detailed=True, now=now)[0]['status'], 'waiting')
+                os.utime(path, (now - 10, now - 10))
+                self.assertEqual(read_activity(root, now=now), [('claude', '명령 실행 중')])
+                os.utime(path, (now - 200, now - 200))
+                subagent = root / '.claude/projects/-work-my-proj/s/subagents/agent-a.jsonl'
+                self.write_claude(subagent, [], now - 5)
+                self.assertEqual(read_activity(root, now=now), [('claude', '명령 실행 중')])
+                os.utime(path, (1000, 1000))
+                self.assertEqual(read_activity(root, now=now), [])
+
+    def test_window_fallback_matches_claude_cwd_and_skips_own_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory)
+            for pid, parent, cwd in ((100, 1, '/work/w'), (101, 100, '/work/my_proj'), (102, 50, '/work/my_proj'), (103, 50, '/work/other')):
+                process = fake / str(pid)
+                (process / 'fd').mkdir(parents=True)
+                (process / 'cwd').symlink_to(cwd)
+                (process / 'stat').write_text(f'{pid} (claude) S {parent} 0')
+                (process / 'comm').write_text('claude\n')
+                (process / 'cmdline').write_bytes(b'claude\0')
+            real = Path
+            with patch('agent_windows.Path', side_effect=lambda value: real(fake) if value == '/proc' else real(value)), \
+                    patch('agent_windows.os.getpid', return_value=100):
+                self.assertEqual(agent_pids('claude', '/home/u/.claude/projects/-work-my-proj/s.jsonl'), {102, 50})
+
+    def test_max_profile_huge_newest_line_and_short_timestamp_fraction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'max/projects/-tmp/s.jsonl'
+            self.write_claude(path, [{'type': 'assistant', 'message': {'content': [{'type': 'text'}], 'stop_reason': 'end_turn'}},
+                                     {'type': 'user', 'timestamp': '2026-09-28T00:00:00Z', 'message': {'content': 'x' * 400000}}])
+            with patch('agent_activity.claude_max_dir', return_value=root / 'max'):
+                rows = read_activity(root, detailed=True)
+            self.assertEqual([(item['status'], item['started']) for item in rows], [('running', timestamp('2026-09-28T00:00:00Z'))])
+        self.assertEqual(timestamp('2026-10-02T10:00:28.21802+00:00'), timestamp('2026-10-02T10:00:28.218020+00:00'))
+        self.assertEqual(timestamp('2026-10-02T10:00:28.2Z') % 1, timestamp('2026-10-02T10:00:28.200Z') % 1)

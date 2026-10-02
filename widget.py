@@ -6,9 +6,17 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings, QUrl, QSize, QRectF, QPointF, QVariantAnimation, QEasingCurve, QProcess
+# This widget does no parallel numerical work; avoid NumPy/BLAS helper pools.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+# Wayland cannot position top-level windows; the pet and its bubble need global coordinates.
+if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSettings, QUrl, QSize, QRectF, QPointF, QVariantAnimation, QEasingCurve, QProcess, QProcessEnvironment
 from PySide6.QtGui import QDesktopServices, QFont, QIcon, QColor, QPainter, QPen, QPalette, QPixmap, QLinearGradient, QPainterPath
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -17,8 +25,9 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                                QGraphicsDropShadowEffect, QSlider, QWidgetAction,
                                QInputDialog, QMessageBox, QStackedWidget, QSizePolicy, QGridLayout)
 
-from providers import PROVIDERS, QuotaError
+from providers import PROVIDERS, QuotaError, executable, claude_max_dir, claude_environment
 from calendar_panel import CalendarPanel
+from billing import BillingDialog, payment_summary, next_payment
 from notifications import Notifications
 from agent_activity import read_activity, ActivityTracker
 from agent_windows import XWindows
@@ -34,6 +43,8 @@ WEB_APPS = {
 
 SERVICES = {
     "codex": ("GPT / Codex", "ChatGPT 구독 · Codex 한도", "#74d9b3", "https://chatgpt.com/codex/settings/usage"),
+    "claude": ("Claude Code", "기본 CLI 계정 · 세션·주간 잔여량", "#d97757", "https://claude.ai/settings/usage"),
+    "claude_max": ("Claude · Max 5x", "개인 구독 · 별도 계정", "#d97757", "https://claude.ai/settings/usage"),
     "antigravity": ("Antigravity", "모델 그룹별 사용한도", "#94b8ff", "https://antigravity.google/"),
     "copilot": ("GitHub Copilot", "크레딧·요청 잔여량", "#cfacff", "https://github.com/settings/copilot"),
 }
@@ -42,14 +53,15 @@ THEMES = {
     "dark": {"background": "#171b24", "card": "#252c38", "text": "#f5f5f7",
              "muted": "#aeaeb8", "track": "#414146", "control": "#363639",
              "selected": "#485364", "border": "#384353", "warning": "#ffb970",
-             "codex": "#66dfb5", "antigravity": "#91bcff", "copilot": "#d4b3ff"},
+             "codex": "#66dfb5", "antigravity": "#91bcff", "copilot": "#d4b3ff", "claude": "#f29c7b", "claude_max": "#f29c7b"},
     "light": {"background": "#f2f2f7", "card": "#ffffff", "text": "#1c1c1e",
               "muted": "#62626c", "track": "#e6e6ec", "control": "#e4e4eb",
               "selected": "#ffffff", "border": "#d3d3dd", "warning": "#a04a00",
-              "codex": "#087e61", "antigravity": "#185ec7", "copilot": "#7b3bb4"},
+              "codex": "#087e61", "antigravity": "#185ec7", "copilot": "#7b3bb4", "claude": "#a34224", "claude_max": "#a34224"},
 }
 
 PLAN_NAMES = {
+    "claude": {"pro": "Pro", "max": "Max", "team": "Business / Team", "enterprise": "Enterprise"},
     "codex": {"free": "Free", "plus": "Plus", "pro": "Pro", "team": "Team",
               "business": "Business", "enterprise": "Enterprise", "edu": "Edu"},
     "copilot": {"free": "Copilot Free", "individual": "Copilot Pro",
@@ -88,6 +100,8 @@ class PageFade(QWidget):
     def setOpacity(self, value):
         self.progress = float(value)
         self.setVisible(self.progress < 1.0)
+        if self.progress >= 1.0:
+            self.snapshot = QPixmap()
         self.update()
 
     def paintEvent(self, event):
@@ -117,6 +131,9 @@ class FoldTransition(QWidget):
         self.expanding = expanding
         self.setGeometry(large_rect.united(small_rect))
         self.owner.setWindowOpacity(0)
+        if expanding:
+            # The revealed window stays invisible until finish(); a double-click must not reach it.
+            self.owner.windowHandle().installEventFilter(self)
         self.motion.setStartValue(0.0)
         self.motion.setEndValue(1.0)
         self.progress = 0.0
@@ -129,8 +146,15 @@ class FoldTransition(QWidget):
 
     def finish(self):
         self.motion.stop()
+        if self.owner.windowHandle():
+            self.owner.windowHandle().removeEventFilter(self)
         self.hide()
+        self.snapshot = QPixmap()
         self.owner.setWindowOpacity(1.0 if self.owner.collapsed else 1 - self.owner.opacity_slider.value() / 100)
+
+    def eventFilter(self, watched, event):
+        return event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.MouseButtonDblClick,
+                                QEvent.MouseMove, QEvent.Wheel)
 
     def paintEvent(self, event):
         amount = self.progress if self.expanding else 1 - self.progress
@@ -377,24 +401,32 @@ class PetBubble(QWidget):
         colors = THEMES[pet.owner.theme]
         compact = content is not None
         self.waiting = compact and any(t['status'] == 'waiting' for t in pet.owner.agent_activity)
-        self.layout().setContentsMargins(22, 12 if compact else 16, 22, 12 if compact else 16)
-        self.text.setFixedWidth(208)
-        self.text.setStyleSheet(f"background: transparent; color: {colors['text']}; font-size: 11px;")
-        self.text.setText(pet.owner.pet_summary() if content is None else content)
-        self.adjustSize()
+        style = (pet.owner.theme, compact)
+        changed_style = getattr(self, "presentation_style", None) != style
+        if changed_style:
+            self.presentation_style = style
+            self.layout().setContentsMargins(22, 12 if compact else 16, 22, 12 if compact else 16)
+            self.text.setFixedWidth(208)
+            self.text.setStyleSheet(f"background: transparent; color: {colors['text']}; font-size: 11px;")
+        text = pet.owner.pet_summary() if content is None else content
+        if changed_style or self.text.text() != text:
+            self.text.setText(text)
+            self.adjustSize()
+        # Place it while hidden: showing first would flash the previous position.
+        self.reposition()
+        self.show()
+
+    def reposition(self):
+        pet = self.parentWidget()
         anchor = pet.mapToGlobal(pet.rect().center())
-        area = pet.screen().availableGeometry().adjusted(8, 8, -8, -8)
-        if anchor != self.placement_anchor or area != self.placement_area:
-            self.on_right = anchor.x() + 54 + self.width() <= area.right()
-            x = anchor.x() + 54 if self.on_right else anchor.x() - 54 - self.width()
-            y = anchor.y() - 40
-            self.placement_anchor, self.placement_area = anchor, area
-        else:
-            x, y = self.x(), self.y()
-        y = max(area.top(), min(y, area.bottom() - self.height() + 1))
+        screen = QApplication.screenAt(anchor) or pet.screen()
+        area = screen.availableGeometry().adjusted(8, 8, -8, -8)
+        self.on_right = anchor.x() + 54 + self.width() <= area.right()
+        x = anchor.x() + 54 if self.on_right else anchor.x() - 54 - self.width()
+        y = max(area.top(), min(anchor.y() - 40, area.bottom() - self.height() + 1))
+        self.placement_anchor, self.placement_area = anchor, area
         self.tail_y = max(28, min(anchor.y() - y, self.height() - 28))
         self.move(max(area.left(), min(x, area.right() - self.width() + 1)), y)
-        self.show()
         self.update()
 
     def paintEvent(self, event):
@@ -518,8 +550,11 @@ class ComputerPet(CircleButton):
             self.sync_animation()
 
     def set_frame_interval(self):
+        if self.owner.reduce_motion.isChecked() and self.preview_row is None:
+            self.idle.stop()
+            return
         row = display_row(self)
-        self.idle.setInterval(DURATIONS[row][self.frame] * (6 if row == 0 and self.preview_row is None else 1))
+        self.idle.setInterval(DURATIONS[row][self.frame] * (12 if row == 0 and self.preview_row is None else 1))
         if self.isVisible():
             self.idle.start()
 
@@ -550,7 +585,8 @@ class ComputerPet(CircleButton):
     def showEvent(self, event):
         super().showEvent(event)
         self.sync_animation()
-        self.show_activity()
+        # Folding changes the parent size after this event; anchor to the final layout.
+        QTimer.singleShot(0, self.show_activity)
 
     def hideEvent(self, event):
         self.idle.stop()
@@ -608,16 +644,22 @@ class HomeButton(AppIconButton):
         self.icon().paint(p, -11, -11, 22, 22)
 
 
-def activate_existing(socket_path):
+def activate_existing(socket_path, mode="compact"):
+    # Reply "ok": the running widget is shown. "switch": it closes so this mode can start.
     client = QLocalSocket()
     client.connectToServer(str(socket_path))
     if not client.waitForConnected(1500):
-        return False
-    client.disconnectFromServer()
-    return True
+        return ""
+    client.write(mode.encode() + b"\n")
+    client.flush()
+    while not client.canReadLine() and client.waitForReadyRead(1500):
+        pass
+    reply = client.readLine().data().decode(errors="replace").strip()
+    client.abort()
+    return reply
 
 
-def listen_for_activation(widget, socket_path):
+def listen_for_activation(widget, socket_path, mode="compact"):
     # Called only by the process holding the instance lock; stale removal is safe.
     QLocalServer.removeServer(str(socket_path))
     server = QLocalServer(widget)
@@ -625,14 +667,32 @@ def listen_for_activation(widget, socket_path):
     if not server.listen(str(socket_path)):
         raise RuntimeError("위젯 창 활성화 연결을 열지 못했습니다: " + server.errorString())
 
+    def answer(client):
+        if not client.canReadLine():
+            return
+        request = client.readLine().data().decode(errors="replace").strip()
+        if not server.isListening():
+            # Closing: no reply, so the new launch keeps waiting for the lock.
+            client.abort()
+            return
+        switch = request in ("compact", "desktop") and request != mode
+        client.write(b"switch\n" if switch else b"ok\n")
+        client.flush()
+        client.disconnectFromServer()
+        if switch:
+            QTimer.singleShot(0, widget.close)
+        else:
+            widget.bring_to_front()
+
     def activate():
         while server.hasPendingConnections():
             client = server.nextPendingConnection()
-            client.close()
-            client.deleteLater()
-        widget.bring_to_front()
+            client.disconnected.connect(client.deleteLater)
+            client.readyRead.connect(lambda client=client: answer(client))
+            answer(client)
 
     server.newConnection.connect(activate)
+    widget.activation_server = server
     return server
 
 
@@ -665,6 +725,8 @@ class ResizeGrip(QSizeGrip):
 
 
 class Card(QWidget):
+    billing_requested = Signal(str)
+
     def __init__(self, key):
         super().__init__()
         title, subtitle, _, url = SERVICES[key]
@@ -680,7 +742,8 @@ class Card(QWidget):
         badge = QPushButton() if key == "codex" else label("", "badge")
         badge.setObjectName("badge")
         badge.setFixedSize(34, 34)
-        asset = Path(__file__).parent / "assets" / (key + (".png" if key == "antigravity" else ".svg"))
+        asset_key = "claude" if key == "claude_max" else key
+        asset = Path(__file__).parent / "assets" / (asset_key + (".png" if key == "antigravity" else ".svg"))
         if key == "codex":
             badge.setIcon(QIcon(str(asset)))
             badge.setIconSize(QSize(26, 26))
@@ -724,12 +787,27 @@ class Card(QWidget):
         foot = QHBoxLayout()
         self.reset = label("로그인된 계정에서 조회 중", "caption")
         foot.addWidget(self.reset, 1)
+        if key == "claude_max":
+            self.login_button = QPushButton("계정 로그인")
+            self.login_button.setAccessibleName("Claude Max 5x 계정 별도 로그인")
+            self.login_button.setToolTip("브라우저에서 개인 Max 계정으로 로그인한 뒤 새로고침하세요")
+            self.login_button.clicked.connect(self.open_claude_login)
+            foot.addWidget(self.login_button)
         self.details_button = QPushButton("상세")
         self.details_button.setObjectName("detailsButton")
         self.details_button.setCheckable(True)
         self.details_button.setAccessibleName(title + " 기간별 한도 펼치기")
         foot.addWidget(self.details_button)
         layout.addLayout(foot)
+        billing_row = QHBoxLayout()
+        self.billing = label("다음 결제일 미설정", "caption")
+        billing_row.addWidget(self.billing, 1)
+        self.billing_button = QPushButton("결제일 설정")
+        self.billing_button.setObjectName("detailsButton")
+        self.billing_button.setAccessibleName(title + " 결제일 설정")
+        self.billing_button.clicked.connect(lambda: self.billing_requested.emit(self.key))
+        billing_row.addWidget(self.billing_button)
+        layout.addLayout(billing_row)
         self.details = QWidget()
         self.rows = QVBoxLayout(self.details)
         self.rows.setContentsMargins(0, 2, 0, 0)
@@ -742,6 +820,30 @@ class Card(QWidget):
         layout.addWidget(self.status)
         self.last_success = None
         self.data = []
+
+    def open_claude_login(self):
+        try:
+            profile = claude_max_dir()
+            profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+            profile.chmod(0o700)
+            env = QProcessEnvironment()
+            for name, value in claude_environment(profile).items():
+                env.insert(name, value)
+            process = QProcess(self)
+            process.setProcessEnvironment(env)
+            process.setWorkingDirectory(str(profile))
+            process.setProgram(executable("terminator"))
+            process.setArguments(["--no-dbus", "--title", "Claude Max 5x 로그인", "-x",
+                                  executable("rtk"), "proxy", executable("claude"), "auth", "login"])
+            result = process.startDetached()
+            started = result[0] if isinstance(result, tuple) else result
+            process.deleteLater()
+            if not started:
+                raise OSError("terminal launch failed")
+            self.status.setText("브라우저에서 Max 계정 로그인 후 새로고침해 주세요")
+            self.status.show()
+        except (OSError, QuotaError):
+            QMessageBox.warning(self, "Claude Max 로그인", "로그인 터미널을 열지 못했습니다. Claude Code와 Terminator 설치를 확인해 주세요.")
 
     def open_chatgpt(self):
         started, _ = QProcess.startDetached("chatgpt", [])
@@ -761,25 +863,34 @@ class Card(QWidget):
 
     def update_result(self, rows, error):
         if error:
+            if not self.last_success:
+                self.reset.setText("아직 조회된 한도가 없습니다")
             previous = f" · 마지막 성공 {self.last_success}" if self.last_success else ""
             self.status.setText(error + previous)
             self.status.show()
             self.set_warning(True)
             self.setToolTip("표시된 값은 마지막 성공 당시 값입니다." if self.last_success else error)
             return
+        def priority(row):
+            weekly = "주간" in row["label"] or row["label"].startswith("이번 주")
+            overall = "전체 모델" in row["label"] or row["label"] == "Codex · 주간"
+            remaining = row["remaining"]
+            return (not weekly, not (weekly and overall),
+                    remaining if remaining is not None else float("inf"))
+
+        rows = sorted(rows, key=priority)
         self.data = rows
-        limited = [row for row in rows if row["remaining"] is not None]
-        tightest = min(limited, key=lambda row: row["remaining"]) if limited else rows[0]
-        remaining = tightest["remaining"]
+        primary = rows[0]
+        remaining = primary["remaining"]
         self.amount.setText("무제한" if remaining is None else f"{remaining:g}%")
         self.amount.setAccessibleName("남은 한도 " + self.amount.text())
-        self.summary_label.setText(tightest["label"] + "\n" + ("제한 없음" if remaining is None else "남은 한도 · 가장 적은 항목"))
+        self.summary_label.setText(primary["label"] + "\n" + ("제한 없음" if remaining is None else "남은 한도"))
         self.bar.setVisible(remaining is not None)
         self.bar.setValue(round(remaining * 10) if remaining is not None else 1000)
-        self.bar.setAccessibleName(tightest["label"] + " 남은 한도")
-        self.reset.setText(" · ".join(v for v in (tightest.get("detail"), tightest["reset"]) if v)
+        self.bar.setAccessibleName(primary["label"] + " 남은 한도")
+        self.reset.setText(" · ".join(v for v in (primary.get("detail"), primary["reset"]) if v)
                           if remaining is not None else "사용량 제한 없음")
-        self.set_warning(remaining is not None and remaining <= 20)
+        self.set_warning(any(row["remaining"] is not None and row["remaining"] <= 20 for row in rows))
         while self.rows.count():
             self.rows.takeAt(0).widget().deleteLater()
         for row in rows:
@@ -824,8 +935,15 @@ class Widget(QWidget):
     def __init__(self, smoke=False):
         super().__init__()
         self.smoke = smoke
+        # Logout or kill skips closeEvent; save the window shortly after it settles.
+        self.geometry_timer = QTimer(self)
+        self.geometry_timer.setSingleShot(True)
+        self.geometry_timer.setInterval(1000)
+        self.geometry_timer.timeout.connect(self.save_geometry)
+        self.activation_server = None
+        self.settings_prefix = getattr(self, "settings_prefix", "")
         self.settings = QSettings("wego", "ai-quota-widget")
-        self.notifications = Notifications(self.settings, self.send_notification)
+        self.notifications = Notifications(self.settings, self.send_notification, persist=not smoke)
         self.jobs = []
         self.pet_low = {}
         self.pet_quotas = {}
@@ -835,9 +953,11 @@ class Widget(QWidget):
         self.collapsed = False
         self.fold_transition = FoldTransition(self)
         self.api_plans = {}
+        self.account_names = {}
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon.fromTheme("utilities-system-monitor"))
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_QuitOnClose, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
         self.setObjectName("window")
@@ -887,6 +1007,8 @@ class Widget(QWidget):
             action.triggered.connect(lambda checked=False, m=minutes: self.set_reminder(m))
             self.reminder_actions.append((minutes, action))
         for key, service in SERVICES.items():
+            if key not in PROVIDERS:
+                continue
             group = alerts.addMenu(service[0])
             for threshold in (20, 10):
                 action = group.addAction(f"잔여 {threshold}% 이하")
@@ -922,7 +1044,7 @@ class Widget(QWidget):
         sizes = self.menu.addMenu("위젯 크기")
         for name, width, height in (("작게", 360, 580), ("기본", 430, 780), ("크게", 520, 900)):
             action = sizes.addAction(name)
-            action.triggered.connect(lambda checked=False, w=width, h=height: self.resize(w, h))
+            action.triggered.connect(lambda checked=False, size=QSize(width, height): self.set_feature_size(size))
         menu_button.setMenu(self.menu)
         self.collapse_button = CircleButton(self, compact=True)
         self.collapse_button.setAccessibleName("미니 컴퓨터 캐릭터로 접기")
@@ -989,6 +1111,8 @@ class Widget(QWidget):
         self.show_plan("antigravity")
         for card in self.cards.values():
             cards.addWidget(card)
+            card.billing_requested.connect(self.edit_billing)
+        self.update_billing()
         cards.addStretch()
         self.scroll.setWidget(content)
         quota_layout.addWidget(self.scroll, 1)
@@ -1071,7 +1195,7 @@ class Widget(QWidget):
         self.set_page("home")
         self.theme = self.settings.value("theme", "dark")
         self.set_theme(self.theme if self.theme in THEMES else "dark")
-        geometry = None if smoke else self.settings.value("geometry")
+        geometry = None if smoke else self.settings.value(self.settings_prefix + "geometry")
         if geometry:
             self.restoreGeometry(geometry)
         else:
@@ -1079,7 +1203,7 @@ class Widget(QWidget):
             self.move(area.right() - self.width() - 20, area.top() + 30)
         if not any(screen.availableGeometry().intersects(self.frameGeometry()) for screen in QApplication.screens()):
             self.move(QApplication.primaryScreen().availableGeometry().topLeft())
-        self.feature_size = self.settings.value("feature_size", self.size())
+        self.feature_size = self.settings.value(self.settings_prefix + "feature_size", self.size())
         if not isinstance(self.feature_size, QSize):
             self.feature_size = QSize(430, 780)
         self.resize(self.width(), 440)
@@ -1112,6 +1236,10 @@ class Widget(QWidget):
         for item in notices:
             self.send_notification(SERVICES[item['agent']][0] + (' · 작업 실패' if item['status'] == 'failed' else ' · 작업 완료'), item['label'])
             self.restore_button.set_status(5 if item['status'] == 'failed' else 8)
+        if self.restore_button.isVisible():
+            if animation_row(self.restore_button) != self.restore_button.animation_state:
+                self.restore_button.sync_animation()
+            self.restore_button.update()
         self.restore_button.show_activity()
 
     def open_activity(self, link):
@@ -1158,9 +1286,26 @@ class Widget(QWidget):
         self.activity_job = None
 
     def update_clock(self):
-        self.clock.setText(datetime.now().astimezone().strftime("%Y.%m.%d %H:%M:%S"))
-        if hasattr(self, "page_buttons"):
+        now = datetime.now().astimezone()
+        quiet = self.collapsed or self.isMinimized()
+        if not quiet:
+            self.clock.setText(now.strftime("%Y.%m.%d %H:%M:%S"))
+        if hasattr(self, "clock_timer"):
+            interval = 60_000 if quiet else 1_000
+            if self.clock_timer.interval() != interval:
+                self.clock_timer.setInterval(interval)
+        if hasattr(self, "page_buttons") and getattr(self, "clock_day", None) != now.date():
             self.page_buttons["calendar"].update()
+            self.clock_day = now.date()
+        if hasattr(self, "cards") and getattr(self, "billing_day", None) != now.date():
+            self.update_billing()
+        if quiet and self.reduce_motion.isChecked():
+            self.restore_button.update()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange and hasattr(self, "clock"):
+            self.update_clock()
 
     def send_notification(self, title, body):
         if self.smoke:
@@ -1233,12 +1378,10 @@ class Widget(QWidget):
         if changed and hasattr(self, "feature_size"):
             if page == "home":
                 self.feature_size = self.size()
-                self.settings.setValue("feature_size", self.feature_size)
+                self.settings.setValue(self.settings_prefix + "feature_size", self.feature_size)
                 self.resize(self.width(), 440)
             elif self.pages.currentIndex() == 2:
-                area = self.screen().availableGeometry()
-                self.resize(self.feature_size.width(), min(self.feature_size.height(), area.height() - 20))
-                self.move(self.x(), max(area.top(), min(self.y(), area.bottom() - self.height() + 1)))
+                self.restore_feature_size()
         if changed and animate and not self.reduce_motion.isChecked():
             self.page_opacity.snapshot = self.pages.grab()
             self.page_opacity.setGeometry(self.pages.rect())
@@ -1263,6 +1406,20 @@ class Widget(QWidget):
             self.home_button.setFocus(Qt.OtherFocusReason)
         if hasattr(self, "theme"):
             self.update_page_icons()
+
+    def restore_feature_size(self):
+        area = self.screen().availableGeometry()
+        self.resize(self.feature_size.width(), min(self.feature_size.height(), area.height() - 20))
+        self.move(max(area.left(), min(self.x(), area.right() - self.width() + 1)),
+                  max(area.top(), min(self.y(), area.bottom() - self.height() + 1)))
+
+    def set_feature_size(self, size):
+        # Size presets apply to the AI 한도·일정 pages; the home page stays 440 tall.
+        self.feature_size = size
+        if self.pages.currentIndex() == 2:
+            self.settings.setValue(self.settings_prefix + "feature_size", size)
+        else:
+            self.restore_feature_size()
 
     def update_page_icons(self):
         colors = THEMES[self.theme]
@@ -1347,8 +1504,8 @@ class Widget(QWidget):
             QCalendarWidget QToolButton:hover {{background:{colors['selected']};}}
             QCalendarWidget QAbstractItemView {{background:{colors['card']}; alternate-background-color:{colors['control']}; color:{colors['text']}; selection-background-color:{colors['antigravity']}; selection-color:{colors['card']}; font-size:14px; border:0; outline:0;}}
             QCalendarWidget QSpinBox {{background:{colors['control']}; color:{colors['text']}; font-size:14px; border:1px solid {colors['border']}; padding:4px;}}
-            QLineEdit, QDateTimeEdit {{background:{colors['control']}; border:1px solid {colors['border']}; border-radius:10px; padding:8px;}}
-            QLineEdit:focus, QDateTimeEdit:focus {{border-color:{colors['antigravity']};}}
+            QLineEdit, QDateTimeEdit, QDateEdit {{background:{colors['control']}; border:1px solid {colors['border']}; border-radius:10px; padding:8px;}}
+            QLineEdit:focus, QDateTimeEdit:focus, QDateEdit:focus {{border-color:{colors['antigravity']};}}
             QCheckBox::indicator {{width:14px; height:14px; border:1px solid {colors['muted']}; border-radius:3px; background:{colors['control']};}}
             QCheckBox::indicator:checked {{background:{colors['antigravity']};}}
             QMenu::item {{padding:8px 20px; border-radius:6px;}}
@@ -1376,16 +1533,45 @@ class Widget(QWidget):
         if not self.smoke:
             self.settings.setValue("transparency", value)
 
+    def billing_record(self, key):
+        try:
+            record = json.loads(self.settings.value("billing/" + key, "null"))
+        except (TypeError, ValueError):
+            return None
+        return record if next_payment(record) else None
+
+    def update_billing(self):
+        self.billing_day = datetime.now().date()
+        for key, card in self.cards.items():
+            record = self.billing_record(key)
+            card.billing.setText(payment_summary(record, self.billing_day))
+            card.billing.setToolTip("이 카드에 직접 설정한 결제 예정일" if record else "서비스에서 확인한 결제일을 직접 설정하세요")
+            card.billing_button.setText("수정" if record else "결제일 설정")
+
+    def edit_billing(self, key):
+        dialog = BillingDialog(self, SERVICES[key][0], self.billing_record(key))
+        if dialog.exec() == BillingDialog.Accepted:
+            self.save_billing(key, dialog.selection())
+        dialog.deleteLater()
+
+    def save_billing(self, key, record):
+        if record is None:
+            self.settings.remove("billing/" + key)
+        else:
+            self.settings.setValue("billing/" + key, json.dumps(record))
+        self.update_billing()
+
     def show_plan(self, key):
         manual = self.settings.value("antigravity_plan", "") if key == "antigravity" else ""
         raw = self.api_plans.get(key)
         if manual:
             text = f"플랜 · {manual} (직접 설정)"
         elif isinstance(raw, str) and raw.strip():
-            text = "플랜 · " + PLAN_NAMES.get(key, {}).get(raw, raw)
+            text = "플랜 · " + PLAN_NAMES.get("claude" if key == "claude_max" else key, {}).get(raw, raw)
         else:
             text = "플랜 정보 미제공" if key == "antigravity" else "플랜 확인 안 됨"
-        self.cards[key].plan.setText(text)
+        account = self.account_names.get(key, "")
+        self.cards[key].plan.setText(text + ("\n" + account if account else ""))
         self.cards[key].plan.setToolTip("사용자가 입력한 플랜" if manual else
                                        f"서비스 응답: {raw}" if raw else "한도만으로 플랜을 추정하지 않습니다.")
 
@@ -1435,6 +1621,7 @@ class Widget(QWidget):
             self.setFixedSize(108, 108)
             self.collapsed = True
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            self.setAttribute(Qt.WA_QuitOnClose, True)
             self.setWindowOpacity(1)
             self.move(self.expanded_rect.topLeft())
         else:
@@ -1458,6 +1645,7 @@ class Widget(QWidget):
             self.layout().activate()
             self.fold_transition.begin(snapshot if self.collapsed else self.grab(), large_rect,
                                        self.geometry() if self.collapsed else small_rect, not self.collapsed)
+        self.update_clock()
 
     def bring_to_front(self):
         if self.collapsed:
@@ -1477,7 +1665,7 @@ class Widget(QWidget):
         self.restore_button.set_status(7)
         self.quota_failed = False
         self.refresh_button.setEnabled(False)
-        for key in SERVICES:
+        for key in PROVIDERS:
             job = Fetch(key, self)
             job.result.connect(self.received)
             job.finished.connect(self.finished)
@@ -1486,13 +1674,15 @@ class Widget(QWidget):
 
     def received(self, key, snapshot, error):
         self.quota_failed = getattr(self, "quota_failed", False) or bool(error)
-        values = [r["remaining"] for r in snapshot["rows"] if isinstance(r.get("remaining"), (int, float))] if snapshot and not error else []
-        self.pet_quotas[key] = "조회 실패" if error else f"{min(values):g}% 남음" if values else "수치 없음"
-        self.cards[key].update_result(snapshot["rows"] if snapshot else None, error)
+        card = self.cards[key]
+        card.update_result(snapshot["rows"] if snapshot else None, error)
+        remaining = card.data[0]["remaining"] if card.data else None
+        self.pet_quotas[key] = "조회 실패" if error else f"{remaining:g}% 남음" if remaining is not None else "무제한"
         if not error:
             self.pet_low[key] = any(isinstance(row.get("remaining"), (int, float)) and row["remaining"] <= 20
                                     for row in snapshot["rows"])
             self.api_plans[key] = snapshot.get("plan")
+            self.account_names[key] = snapshot.get("account", "")
             self.updated.setText(datetime.now().strftime("%H:%M 갱신") + " · 3분 간격")
             self.notifications.quota(key, SERVICES[key][0], snapshot["rows"])
         self.show_plan(key)
@@ -1513,6 +1703,24 @@ class Widget(QWidget):
             elif event.position().y() < 78:
                 self.windowHandle().startSystemMove()
         super().mousePressEvent(event)
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.geometry_timer.start()
+        if getattr(self, "collapsed", False) and self.restore_button.bubble.isVisible():
+            self.restore_button.bubble.reposition()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.geometry_timer.start()
+
+    def save_geometry(self):
+        # Collapsing and expanding are synchronous, so the debounced save never sees the pet's interim size.
+        if self.smoke:
+            return
+        if self.pages.currentIndex() != 2:
+            self.settings.setValue(self.settings_prefix + "feature_size", self.expanded_rect.size() if self.collapsed else self.size())
+        self.settings.setValue(self.settings_prefix + "geometry", self.expanded_geometry if self.collapsed else self.saveGeometry())
 
     def resize_edges(self, point):
         edges = Qt.Edges()
@@ -1544,24 +1752,32 @@ class Widget(QWidget):
         super().mouseMoveEvent(event)
 
     def closeEvent(self, event):
-        if self.calendar.job:
-            self.calendar.status.setText("Google 작업 완료 후 닫아 주세요. 로그인 대기는 최대 3분입니다.")
+        if self.calendar.job and not getattr(self.calendar.job, "read_only", False):
+            message = "Google 작업 완료 후 닫아 주세요. 로그인 대기는 최대 3분입니다."
+            self.calendar.status.setText(message)
+            # The calendar status is only visible on its page.
+            self.note.setText(message)
+            self.note.show()
             event.ignore()
             return
         self.calendar.timer.stop()
         self.fold_transition.finish()
         self.fold_transition.close()
         self.calendar.day_timer.stop()
-        if not self.smoke:
-            if self.pages.currentIndex() != 2:
-                self.settings.setValue("feature_size", self.expanded_rect.size() if self.collapsed else self.size())
-            self.settings.setValue("geometry", self.expanded_geometry if self.collapsed else self.saveGeometry())
+        self.geometry_timer.stop()
+        self.save_geometry()
         self.timer.stop()
         self.clock_timer.stop()
         self.activity_timer.stop()
+        # Hide and stop answering activations before waiting: a relaunch then waits for the lock.
+        # Qt still emits lastWindowClosed once the close is accepted.
+        self.hide()
+        if self.activation_server is not None:
+            self.activation_server.close()
         if self.activity_job is not None:
             self.activity_job.wait()
-        self.hide()
+        if self.calendar.job is not None:
+            self.calendar.job.wait()
         # Workers have a 30-second deadline; retain their QObjects until they finish.
         for job in self.jobs:
             job.wait()
@@ -1570,6 +1786,9 @@ class Widget(QWidget):
 
 def main():
     parser = argparse.ArgumentParser()
+    appearance = parser.add_mutually_exclusive_group()
+    appearance.add_argument("--compact", action="store_true", help="Open the compact widget (default)")
+    appearance.add_argument("--desktop", action="store_true", help="Open the optional desktop dashboard")
     parser.add_argument("--check", action="store_true", help="Read live quotas without opening a window")
     parser.add_argument("--smoke", metavar="PNG", help="Render the real widget offscreen, then exit")
     parser.add_argument("--theme", choices=THEMES, help="Initial appearance")
@@ -1581,7 +1800,8 @@ def main():
                 print(json.dumps({"service": key, **provider()}, ensure_ascii=False))
             except Exception as error:
                 failed = True
-                print(json.dumps({"service": key, "error": str(error) if isinstance(error, QuotaError) else "Invalid response"}))
+                print(json.dumps({"service": key, "error": str(error) if isinstance(error, QuotaError) else "Invalid response"},
+                                 ensure_ascii=False))
         return int(failed)
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
@@ -1591,23 +1811,34 @@ def main():
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", Path.home() / ".cache"))
     runtime.mkdir(parents=True, exist_ok=True)
     socket_path = runtime / "ai-quota-widget.sock"
+    mode = "desktop" if args.desktop else "compact"
     with (runtime / ("ai-quota-widget-smoke.lock" if args.smoke else "ai-quota-widget.lock")).open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            if not args.smoke and not activate_existing(socket_path):
-                QMessageBox.warning(None, APP_NAME, "기존 위젯에 연결하지 못했습니다.\n기존 위젯을 종료한 뒤 다시 실행해 주세요.")
-                return 1
-            return 0
-        widget = Widget(smoke=bool(args.smoke))
+        # A starting, closing or mode-switching instance holds the lock without answering "ok".
+        deadline = time.monotonic() + 35
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if args.smoke or activate_existing(socket_path, mode) == "ok":
+                    return 0
+                if time.monotonic() > deadline:
+                    QMessageBox.warning(None, APP_NAME, "기존 위젯에 연결하지 못했습니다.\n기존 위젯을 종료한 뒤 다시 실행해 주세요.")
+                    return 1
+                time.sleep(0.2)
+        if args.desktop:
+            from desktop import DesktopWindow
+            widget = DesktopWindow(smoke=bool(args.smoke))
+        else:
+            widget = Widget(smoke=bool(args.smoke))
         if args.theme:
             widget.set_theme(args.theme)
         widget.show()
         if not args.smoke:
-            server = listen_for_activation(widget, socket_path)
+            server = listen_for_activation(widget, socket_path, mode)
             widget.bring_to_front()
         if args.smoke:
-            widget.resize(430, 780)
+            widget.resize(1160, 800) if args.desktop else widget.resize(430, 780)
             def capture():
                 if widget.jobs:
                     QTimer.singleShot(100, capture)

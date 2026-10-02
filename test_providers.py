@@ -1,5 +1,13 @@
 import unittest
-from providers import parse_codex, parse_antigravity, parse_copilot, percent, reset_text, QuotaError
+import json
+import os
+import tempfile
+from pathlib import Path
+from datetime import datetime
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
+import providers
+from providers import parse_codex, parse_antigravity, parse_copilot, parse_claude, claude_reset, percent, reset_text, QuotaError
 
 
 class QuotaTests(unittest.TestCase):
@@ -25,6 +33,91 @@ class QuotaTests(unittest.TestCase):
         self.assertIsNone(rows[0]["remaining"])
         self.assertEqual(rows[1]["remaining"], 0)
         self.assertEqual(rows[1]["detail"], "0/200 크레딧")
+
+    def test_claude_cli_usage_rows_and_errors(self):
+        data = {'is_error': False, 'local_command': 'usage', 'result':
+                'Current session: 1% used · resets Sep 28, 1pm (Asia/Seoul)\n'
+                'Current week (all models): 33% used · resets Sep 30, 3pm (Asia/Seoul)\n'
+                'Current week (Fable): 0% used · resets Sep 30, 3pm (Asia/Seoul)\n'
+                'Top MCP servers: tool 3%'}
+        rows = parse_claude(data)
+        self.assertEqual([row['remaining'] for row in rows], [99, 67, 100])
+        self.assertEqual([row['label'] for row in rows], ['현재 세션', '이번 주 · 전체 모델', '이번 주 · Fable'])
+        self.assertEqual(rows[0]['reset'], datetime(2026, 9, 28, 13, tzinfo=ZoneInfo('Asia/Seoul')).astimezone().strftime('%m/%d %H:%M 초기화'))
+        for invalid in ({'is_error': True, 'result': data['result']},
+                        {'is_error': False, 'result': 'not a usage response'},
+                        {'is_error': False, 'result': 'Current session: 120% used · resets tomorrow'}):
+            with self.assertRaises(QuotaError):
+                parse_claude(invalid)
+
+    def test_claude_reset_is_local_time_like_other_services(self):
+        now = datetime(2026, 10, 2, 19, 0, tzinfo=ZoneInfo('Asia/Seoul'))
+
+        def local(*moment, zone='Asia/Seoul'):
+            return datetime(*moment, tzinfo=ZoneInfo(zone)).astimezone().strftime('%m/%d %H:%M 초기화')
+
+        cases = {'Oct 6, 2pm (Asia/Seoul)': local(2026, 10, 6, 14),
+                 'Oct 6, 1:59pm (Asia/Seoul)': local(2026, 10, 6, 13, 59),
+                 'Oct 3, 12am (Asia/Seoul)': local(2026, 10, 3, 0),
+                 'Oct 2, 12pm (Asia/Seoul)': local(2026, 10, 2, 12),
+                 '11pm (Asia/Seoul)': local(2026, 10, 2, 23),
+                 # Past dates are next year's: 2027-03-10 is still EST in New York.
+                 'Mar 10, 9am (America/New_York)': local(2027, 3, 10, 9, zone='America/New_York')}
+        for text, expected in cases.items():
+            self.assertEqual(claude_reset(text, now), expected, text)
+        for unknown in ('tomorrow', '1pm', 'Oct 6, 13pm (Asia/Seoul)', 'Oct 6, 2pm (No/Zone)', 'Okt 6, 2pm (UTC)'):
+            self.assertEqual(claude_reset(unknown, now), unknown + ' 초기화')
+
+    def test_default_claude_ignores_inherited_profile(self):
+        auth = {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'team', 'email': 'work@example.test'}
+        usage = {'is_error': False, 'result': 'Current session: 20% used · resets 1pm'}
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/max'}), \
+             patch('providers.output', side_effect=[json.dumps(auth), json.dumps(usage)]) as output:
+            self.assertEqual(providers.claude()['plan'], 'team')
+            for call in output.call_args_list:
+                self.assertNotIn('CLAUDE_CONFIG_DIR', call.kwargs['env'])
+
+    def test_claude_max_uses_separate_login_and_reports_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / 'max'
+            profile.mkdir()
+            auth = {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'max',
+                    'configDirectory': str(profile), 'email': 'personal@example.test'}
+            usage = {'is_error': False, 'result': 'Current session: 20% used · resets 1pm'}
+            with patch('providers.claude_max_dir', return_value=profile), \
+                 patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/business', 'CLAUDE_CODE_OAUTH_TOKEN': 'other-account'}), \
+                 patch('providers.output', side_effect=[json.dumps(auth), json.dumps(usage)]) as output:
+                snapshot = providers.claude_max()
+                self.assertEqual(snapshot['account'], 'personal@example.test')
+                self.assertEqual(snapshot['plan'], 'max')
+                self.assertEqual(snapshot['rows'][0]['remaining'], 80)
+                for call in output.call_args_list:
+                    env = call.kwargs['env']
+                    self.assertEqual(env['CLAUDE_CONFIG_DIR'], str(profile))
+                    self.assertNotIn('CLAUDE_CODE_OAUTH_TOKEN', env)
+                self.assertEqual(os.environ['CLAUDE_CONFIG_DIR'], '/business')
+
+    def test_claude_max_requires_explicit_profile_setup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / 'not-created'
+            with patch('providers.claude_max_dir', return_value=profile), patch('providers.output') as output:
+                with self.assertRaises(providers.QuotaError):
+                    providers.claude_max()
+                output.assert_not_called()
+                self.assertFalse(profile.exists())
+
+    def test_claude_max_never_falls_back_to_business_account(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / 'max'
+            profile.mkdir()
+            for auth in ({'loggedIn': False},
+                         {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'team', 'configDirectory': str(profile)},
+                         {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'max', 'configDirectory': '/business'}):
+                with self.subTest(auth=auth), patch('providers.claude_max_dir', return_value=profile), \
+                     patch('providers.output', return_value=json.dumps(auth)) as output:
+                    with self.assertRaises(providers.QuotaError):
+                        providers.claude_max()
+                    self.assertEqual(output.call_count, 1)
 
     def test_invalid_data_is_never_full_quota(self):
         for invalid in (float("nan"), float("inf"), -1, 101, True):
