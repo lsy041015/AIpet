@@ -159,6 +159,29 @@ class ActivityTests(unittest.TestCase):
         tracker.update([], 115)
         self.assertEqual(tracker.update([done], 120)[1], [])
 
+    def test_waiting_state_notifies_once_per_episode(self):
+        tracker = ActivityTracker()
+        record = lambda status: dict(id='s', agent='codex', status=status, label='x', started=50, updated=60, target='x')
+        self.assertEqual(tracker.update([record('waiting')], 100)[1], [])
+        self.assertEqual(tracker.update([record('running')], 105)[1], [])
+        notices = tracker.update([record('waiting')], 110)[1]
+        self.assertEqual([n['status'] for n in notices], ['waiting'])
+        self.assertEqual(tracker.update([record('waiting')], 115)[1], [])
+        tracker.update([record('running')], 120)
+        self.assertEqual(len(tracker.update([record('waiting')], 125)[1]), 1)
+        # The 15 second grace re-append of the old waiting record is not a new episode.
+        self.assertEqual(tracker.update([], 130)[1], [])
+        self.assertEqual(tracker.update([record('waiting')], 135)[1], [])
+
+    def test_done_notices_unchanged_with_waiting(self):
+        tracker = ActivityTracker()
+        record = lambda status: dict(id='s', agent='codex', status=status, label='x', started=50, updated=60, target='x')
+        tracker.update([record('running')], 100)
+        self.assertEqual([n['status'] for n in tracker.update([record('waiting')], 105)[1]], ['waiting'])
+        self.assertEqual([n['status'] for n in tracker.update([record('done')], 110)[1]], ['done'])
+        tracker.update([record('running')], 115)
+        self.assertEqual([n['status'] for n in tracker.update([record('failed')], 120)[1]], ['failed'])
+
     def test_events_completion_and_stale_sessions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
