@@ -112,6 +112,11 @@ def set_risk(item, level):
         item.style().polish(item)
 
 
+def logo_asset(key):
+    asset_key = "claude" if key == "claude_max" else key
+    return Path(__file__).parent / "assets" / (asset_key + (".png" if key == "antigravity" else ".svg"))
+
+
 def motion_curve():
     curve = QEasingCurve(QEasingCurve.BezierSpline)
     curve.addCubicBezierSegment(QPointF(0.23, 1), QPointF(0.32, 1), QPointF(1, 1))
@@ -775,8 +780,7 @@ class Card(QWidget):
         badge = QPushButton() if key == "codex" else label("", "badge")
         badge.setObjectName("badge")
         badge.setFixedSize(34, 34)
-        asset_key = "claude" if key == "claude_max" else key
-        asset = Path(__file__).parent / "assets" / (asset_key + (".png" if key == "antigravity" else ".svg"))
+        asset = logo_asset(key)
         if key == "codex":
             badge.setIcon(QIcon(str(asset)))
             badge.setIconSize(QSize(26, 26))
@@ -854,6 +858,7 @@ class Card(QWidget):
         self.last_success = None
         self.data = []
         self.captions = []
+        self.error = ""
 
     def open_claude_login(self):
         try:
@@ -896,6 +901,7 @@ class Card(QWidget):
         self.update()
 
     def update_result(self, rows, error):
+        self.error = error or ""
         if error:
             if not self.last_success:
                 self.reset.setText("아직 조회된 한도가 없습니다")
@@ -967,6 +973,76 @@ class Card(QWidget):
             self.reset.setText(reset_line(self.data[0], now))
         for caption, row in self.captions:
             caption.setText(reset_line(row, now))
+
+
+class QuotaRow(QFrame):
+    activated = Signal(str)
+
+    def __init__(self, key):
+        super().__init__()
+        self.key = key
+        self.setProperty("service", key)
+        self.setObjectName("quotaRow")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(Qt.PointingHandCursor)
+        stack = QVBoxLayout(self)
+        stack.setContentsMargins(12, 9, 12, 9)
+        stack.setSpacing(4)
+        line = QHBoxLayout()
+        line.setSpacing(10)
+        logo = label("", "badge")
+        logo.setFixedSize(26, 26)
+        logo.setAlignment(Qt.AlignCenter)
+        logo.setPixmap(QIcon(str(logo_asset(key))).pixmap(QSize(20, 20), self.devicePixelRatioF()))
+        line.addWidget(logo)
+        line.addWidget(label(SERVICES[key][0], "serviceTitle"), 1)
+        self.amount = label("—", "quotaAmount")
+        self.amount.setWordWrap(False)
+        line.addWidget(self.amount)
+        stack.addLayout(line)
+        self.caption = label("", "caption")
+        stack.addWidget(self.caption)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(4)
+        policy = self.bar.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self.bar.setSizePolicy(policy)
+        stack.addWidget(self.bar)
+
+    def update_card(self, card):
+        rows, remaining = card.data, None
+        if rows:
+            primary = rows[0]
+            remaining = primary["remaining"]
+            amount = "무제한" if remaining is None else f"{remaining:g}%"
+            when = "제한 없음" if remaining is None else time_left(primary.get("reset_at")) or primary["reset"]
+            caption = " · ".join(v for v in (primary["label"], when) if v)
+            tip = [" · ".join(v for v in (f"{row['label']}: " + ("무제한" if row["remaining"] is None else f"{row['remaining']:g}% 남음"),
+                                           reset_line(row)) if v) for row in rows]
+        else:
+            amount, caption, tip = ("조회 실패" if card.error else "—"), card.reset.text(), []
+        self.amount.setText(amount)
+        self.caption.setText(caption)
+        self.bar.setVisible(remaining is not None)
+        self.bar.setValue(round(remaining * 10) if remaining is not None else 0)
+        for item in (self.amount, self.bar):
+            set_risk(item, risk_level(remaining))
+        self.setToolTip("\n".join(([card.error] if card.error and rows else []) + tip))
+        self.setAccessibleName(f"{SERVICES[self.key][0]} {amount} · 카드로 자세히 보기")
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.activated.emit(self.key)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.activated.emit(self.key)
+        else:
+            super().keyPressEvent(event)
 
 
 class ActivityFetch(QThread):
@@ -1145,6 +1221,23 @@ class Widget(QWidget):
         quota_layout = QVBoxLayout(self.quota_page)
         quota_layout.setContentsMargins(0, 0, 0, 0)
         quota_layout.setSpacing(12)
+        self.quota_view_switch = QFrame()
+        self.quota_view_switch.setObjectName("segment")
+        switch_layout = QHBoxLayout(self.quota_view_switch)
+        switch_layout.setContentsMargins(3, 3, 3, 3)
+        switch_layout.setSpacing(2)
+        self.quota_view_group = QButtonGroup(self)
+        self.quota_view_buttons = {}
+        for view, text in (("cards", "카드"), ("list", "목록")):
+            button = QPushButton(text)
+            button.setObjectName("themeButton")
+            button.setCheckable(True)
+            button.setAccessibleName(text + " 보기")
+            button.clicked.connect(lambda checked=False, v=view: self.set_quota_view(v))
+            self.quota_view_group.addButton(button)
+            self.quota_view_buttons[view] = button
+            switch_layout.addWidget(button)
+        quota_layout.addWidget(self.quota_view_switch, 0, Qt.AlignLeft)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -1165,6 +1258,17 @@ class Widget(QWidget):
         cards.addStretch()
         self.scroll.setWidget(content)
         quota_layout.addWidget(self.scroll, 1)
+        self.quota_list = QWidget()
+        list_layout = QVBoxLayout(self.quota_list)
+        list_layout.setContentsMargins(0, 0, 2, 0)
+        list_layout.setSpacing(8)
+        self.quota_rows = {key: QuotaRow(key) for key in SERVICES}
+        for key, row in self.quota_rows.items():
+            row.activated.connect(self.show_card)
+            row.update_card(self.cards[key])
+            list_layout.addWidget(row)
+        list_layout.addStretch()
+        quota_layout.addWidget(self.quota_list, 1)
         footer = QHBoxLayout()
         self.refresh_button = QPushButton("새로고침")
         self.refresh_button.clicked.connect(self.refresh)
@@ -1244,6 +1348,7 @@ class Widget(QWidget):
         self.set_page("home")
         self.theme = self.settings.value("theme", "dark")
         self.set_theme(self.theme if self.theme in THEMES else "dark")
+        self.set_quota_view(self.settings.value("quota_view", "cards"), persist=False)
         geometry = None if smoke else self.settings.value(self.settings_prefix + "geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -1362,6 +1467,25 @@ class Widget(QWidget):
     def update_countdowns(self):
         for card in self.cards.values():
             card.refresh_countdown()
+        self.update_quota_list()
+
+    def update_quota_list(self):
+        for key, row in self.quota_rows.items():
+            row.update_card(self.cards[key])
+
+    def set_quota_view(self, view, persist=True):
+        view = view if view in ("cards", "list") else "cards"
+        self.scroll.setVisible(view == "cards")
+        self.quota_list.setVisible(view == "list")
+        self.quota_view_buttons[view].setChecked(True)
+        if persist and not self.smoke:
+            self.settings.setValue("quota_view", view)
+
+    def show_card(self, key):
+        self.set_quota_view("cards")
+        card = self.cards[key]
+        # The cards were laid out while hidden; scroll once the page has been re-laid out.
+        QTimer.singleShot(0, lambda: self.scroll.ensureWidgetVisible(card, 0, 12))
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -1529,6 +1653,9 @@ class Widget(QWidget):
             QComboBox {{background:{colors['control']}; border:1px solid {colors['border']}; border-radius:8px; padding:8px;}}
             QComboBox QAbstractItemView {{background:{colors['card']}; color:{colors['text']}; selection-background-color:{colors['selected']};}}
             QLabel#amount {{font-family:'DejaVu Sans'; font-size:26px; font-weight:600; letter-spacing:-2px;}}
+            QLabel#quotaAmount {{font-family:'DejaVu Sans'; font-size:18px; font-weight:600;}}
+            QFrame#quotaRow {{background:{colors['card']}; border:1px solid {colors['border']}; border-radius:14px;}}
+            QFrame#quotaRow:hover, QFrame#quotaRow:focus {{border-color:{colors['antigravity']};}}
             QLabel#rowTitle {{font-size:11px;}}
             QLabel#rowValue {{font-size:10px; font-weight:600;}}
             QLabel#badge {{border-radius:11px; background:#ffffff;}}
@@ -1742,6 +1869,7 @@ class Widget(QWidget):
         self.quota_failed = getattr(self, "quota_failed", False) or bool(error)
         card = self.cards[key]
         card.update_result(snapshot["rows"] if snapshot else None, error)
+        self.update_quota_list()
         remaining = card.data[0]["remaining"] if card.data else None
         self.pet_quotas[key] = "조회 실패" if error else f"{remaining:g}% 남음" if remaining is not None else "무제한"
         if not error:

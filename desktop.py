@@ -77,6 +77,8 @@ class DesktopWindow(Widget):
         self.settings_prefix = "desktop/"
         self.desktop_ready = False
         super().__init__(smoke)
+        self.quota_view_switch.hide()
+        self.set_quota_view("cards", persist=False)
         self.setWindowTitle("check AI · 나의 작업 공간")
         self.setWindowIcon(QIcon(self.restore_button.grab()))
         self.setWindowFlags(Qt.Window)

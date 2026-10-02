@@ -15,7 +15,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QMenu, QProgressBar
 
-from widget import THEMES, Card, Widget, activate_existing, listen_for_activation, risk_level, time_left
+from widget import SERVICES, THEMES, Card, Widget, activate_existing, listen_for_activation, risk_level, time_left
 from pixel_pet import DURATIONS, animation_row, display_row
 
 
@@ -956,6 +956,93 @@ class WidgetTests(unittest.TestCase):
         with patch.object(Card, "refresh_countdown") as refresh:
             self.window.update_countdowns()
             self.assertEqual(refresh.call_count, len(self.window.cards))
+
+    def test_quota_list_view_rows_and_persistence(self):
+        window = self.window
+        self.assertTrue(window.quota_list.isHidden())
+        self.assertFalse(window.scroll.isHidden())
+        self.assertEqual([b.accessibleName() for b in window.quota_view_switch.findChildren(QPushButton)],
+                         ["카드 보기", "목록 보기"])
+        window.received("antigravity", {"rows": [{"label": "Gemini · 주간", "remaining": 7, "reset": "09/11 09:02 초기화",
+                                                  "reset_at": time.time() + 2 * 3600}]}, "")
+        QTest.mouseClick(window.quota_view_buttons["list"], Qt.LeftButton)
+        self.app.processEvents()
+        self.assertFalse(window.quota_list.isHidden())
+        self.assertTrue(window.scroll.isHidden())
+        self.assertTrue(window.quota_view_buttons["list"].isChecked())
+        self.assertEqual(self.settings.value("quota_view"), "list")
+        self.assertEqual(list(window.quota_rows), list(SERVICES))
+        codex = window.quota_rows["codex"]
+        self.assertEqual(codex.amount.text(), "43%")
+        self.assertEqual(codex.amount.property("risk"), "")
+        self.assertTrue(codex.caption.text().startswith("Codex · 주간 · "))
+        self.assertIn("GPT-5.3-Codex-Spark · 5시간: 100% 남음", codex.toolTip())
+        anti = window.quota_rows["antigravity"]
+        self.assertEqual((anti.amount.text(), anti.amount.property("risk"), anti.bar.property("risk")), ("7%", "critical", "critical"))
+        self.assertEqual(anti.caption.text(), "Gemini · 주간 · 2시간 후")
+        self.assertEqual(anti.bar.height(), 4)
+        window.received("copilot", {"rows": [{"label": "채팅", "remaining": None, "reset": "", "reset_at": None}]}, "")
+        self.assertEqual(window.quota_rows["copilot"].amount.text(), "무제한")
+        self.assertEqual(window.quota_rows["copilot"].amount.property("risk"), "")
+        with patch("widget.time.time", return_value=time.time() + 61 * 60):
+            window.update_countdowns()
+        self.assertEqual(anti.caption.text(), "Gemini · 주간 · 59분 후")
+        restored = Widget()
+        self.assertFalse(restored.quota_list.isHidden())
+        self.assertTrue(restored.scroll.isHidden())
+        self.assertTrue(restored.quota_view_buttons["list"].isChecked())
+        self.assertEqual(restored.quota_rows["codex"].amount.text(), "—")
+        restored.received("claude", None, "로그인 필요")
+        self.assertEqual(restored.quota_rows["claude"].amount.text(), "조회 실패")
+        self.assertEqual(restored.settings.value("quota_view"), "list")
+        restored.close()
+        restored.deleteLater()
+        smoke = Widget(smoke=True)
+        smoke.set_quota_view("cards")
+        self.assertEqual(self.settings.value("quota_view"), "list")
+        smoke.close()
+        smoke.deleteLater()
+
+    def test_quota_list_row_click_opens_card(self):
+        window = self.window
+        window.set_quota_view("list")
+        self.app.processEvents()
+        row = window.quota_rows["copilot"]
+        self.assertNotEqual(row.focusPolicy(), Qt.NoFocus)
+        QTest.mouseClick(row, Qt.LeftButton)
+        QTest.qWait(30)
+        self.assertEqual(self.settings.value("quota_view"), "cards")
+        self.assertTrue(window.quota_list.isHidden())
+        self.assertFalse(window.scroll.isHidden())
+        self.assertTrue(window.quota_view_buttons["cards"].isChecked())
+        self.assertGreater(window.scroll.verticalScrollBar().value(), 0)
+        card = window.cards["copilot"]
+        self.assertTrue(window.scroll.viewport().rect().contains(card.mapTo(window.scroll.viewport(), card.rect().center())))
+        for key in (Qt.Key_Return, Qt.Key_Space):
+            window.set_quota_view("list")
+            self.app.processEvents()
+            window.quota_rows["codex"].setFocus()
+            QTest.keyClick(window.quota_rows["codex"], key)
+            QTest.qWait(30)
+            self.assertTrue(window.quota_list.isHidden(), key)
+            self.assertTrue(window.scroll.viewport().rect().contains(
+                window.cards["codex"].mapTo(window.scroll.viewport(), window.cards["codex"].rect().center())))
+
+    def test_list_fits_default_size(self):
+        window = self.window
+        for key in SERVICES:
+            window.received(key, {"rows": [{"label": "이번 주 · 전체 모델 · 아주 긴 한도 이름", "remaining": 9, "detail": "자세한 한도 안내 문구",
+                                             "reset": "Oct 7, 3pm (Asia/Seoul) 초기화", "reset_at": None}]}, "")
+        window.resize(430, 780)
+        window.set_quota_view("list")
+        self.app.processEvents()
+        self.assertTrue(window.quota_list.isVisible())
+        area = window.quota_list.rect()
+        for key, row in window.quota_rows.items():
+            self.assertTrue(row.isVisible(), key)
+            bottom = row.mapTo(window.quota_list, row.rect().bottomLeft()).y()
+            self.assertLessEqual(bottom, area.bottom(), key)
+        self.assertEqual(window.scroll.verticalScrollBar().maximum() if window.scroll.isVisible() else 0, 0)
 
     def test_resize_and_geometry_restore(self):
         self.window.move(0, 0)
