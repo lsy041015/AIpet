@@ -1,14 +1,35 @@
 # check AI
 
-설치된 Codex의 v1 펫 재생 규칙을 적용했습니다. 상태가 바뀌면 해당 동작을 3회 재생하고, 이후 6배 느린 기본 대기를 반복합니다. 마우스를 올리면 점프하며, 드래그 중 수평 이동이 4px 이상이면 좌우 방향을 전환합니다. 1분 랜덤 동작은 제거했습니다.
+바탕화면의 **check AI**를 실행하면 기존 작은 위젯과 앱 아이콘 메뉴가 열립니다. 상단의 흰색 원으로 펫 모드를 전환합니다. 기존 로그인과 Google Calendar 연결, 사용자 키워드, 알림 설정을 그대로 사용합니다.
+
+## 선택형 데스크톱 앱
+
+`widget.py --desktop`으로 넓은 데스크톱 화면을 열 수 있습니다. 사이드바로 이동하며 최소화·최대화·창 크기 조절을 지원합니다.
+
+- **대시보드**: AI 한도 요약, 현재 작업 수, 조회된 오늘 일정, 가장 가까운 결제 예정일.
+- **AI 한도**: 주간 한도를 먼저 표시. 넓은 창에서는 2열, 작은 창에서는 1열 카드 배치. Claude 두 계정은 따로 표시합니다.
+- **캘린더**: 기존 조회·빠른 입력·키워드·수정·삭제 기능. 상단 **+ 일정 추가**로 이동할 수 있습니다.
+- **에이전트**: Codex·Claude Code·Antigravity·Copilot의 현재 작업과 경과 시간, 승인 대기 강조. 작업을 누르면 해당 터미널이나 앱으로 이동합니다.
+- **구독·결제**: 각 계정의 결제 기준일과 월간·연간·반복 없음 주기를 직접 설정합니다. 다음 결제 예정일과 남은 날짜를 카드에도 표시합니다. 월말·윤년을 처리하며 한도 초기화 시각을 결제일로 추정하지 않습니다. 결제일 자동 조회·자동 결제 기능은 없습니다.
+- **펫 모드**: 상단 버튼으로 작은 펫으로 접습니다. 클릭하면 같은 페이지와 창 크기로 돌아옵니다. 펫의 기존 말풍선·애니메이션·알림을 유지합니다.
+- **단축키**: Ctrl+1~5로 화면 이동, Ctrl+R로 AI 한도 새로고침.
+- 라이트·다크 테마와 동작 줄이기 지원. 앱의 창 위치·크기는 기존 작은 위젯 모드와 별도로 저장합니다.
+
+`widget.py`의 기본 실행은 작은 위젯이며, 기존 `--compact` 옵션도 지원합니다. 현재 설치·검증 환경은 Ubuntu GNOME입니다. Wayland 세션에서는 X11 호환 디스플레이(`DISPLAY`)가 있으면 위젯만 `xcb`로 실행합니다. 펫 드래그와 말풍선의 전역 위치 지정에 필요하며, PC 로그인 환경은 변경하지 않습니다. 사용자가 명시한 `QT_QPA_PLATFORM` 값은 유지합니다.
+
+## 작은 위젯과 펫
+
+설치된 Codex의 v1 펫 재생 규칙을 적용했습니다. 상태가 바뀌면 해당 동작을 3회 재생하고, 이후 원본 프레임 시간의 12배로 기본 대기를 반복합니다. 자동 대기 간격을 종전의 두 배로 늘려 빈도를 50% 낮췄으며, 마우스·드래그 반응과 수동 미리보기 속도는 유지합니다. 마우스를 올리면 점프하며, 드래그 중 수평 이동이 4px 이상이면 좌우 방향을 전환합니다. 1분 랜덤 동작은 제거했습니다.
 
 펫 우클릭 → **애니메이션 미리보기**는 원본 9개 동작을 한 번씩 재생합니다. 자동 상태는 첫 인사, 조회 중 작업, 실패, 완료 후 결과 확인, 한도 부족 시 확인 대기, 임박 일정 확인으로 연결됩니다. Codex 작업 자체를 구독하는 기능은 아니며 위젯 작업을 대응시켰습니다. 동작 줄이기는 해당 상태의 첫 프레임을 표시하고, 수동 미리보기는 허용합니다.
 
 펫은 현재 Codex에서 선택된 `custom:tiny-crt`의 원본 스프라이트를 사용합니다. `assets/tiny-crt-source.webp`는 원본 복사본이며 파일 자체는 수정하지 않았습니다. 표시 시 베이지색을 흰색으로, 초록색을 하늘색으로 바꾸고 크로마키 배경 잔여물을 숨깁니다. 192×208 프레임과 원본 애니메이션 행·프레임별 시간을 사용합니다. Codex의 원본 파일과 선택 설정은 변경하지 않습니다.
 
+말풍선은 펫 중심이 실제로 놓인 모니터의 좌표를 기준으로 표시합니다. 모니터의 높이 차이·음수 좌표를 처리하며, 펫 창이 이동하면 즉시 따라갑니다. 이전 말풍선 위치는 재사용하지 않습니다.
+
 도트 미니 컴퓨터 위에 마우스를 올리면 다음 시간 지정 일정과 마지막 AI 한도 조회 결과를 말풍선으로 보여 줍니다. 우클릭 → 빠른 일정 입력으로 이동할 수 있습니다. 펫은 눈 깜빡임·좌우 보기·반짝임·클릭·드래그 반응을 표시하며 동작 줄이기를 지원합니다.
 
-일정 화면의 빠른 입력 예: `내일 오후 3시 회의`, `오늘 18:30 30분 동안 운동`, `모레 종일 출장`, `2026-10-01 09:00 회의`. 날짜는 오늘·내일·모레·YYYY-MM-DD를 지원합니다. 길이 생략 시 1시간이며, 미리보기에서 날짜·시간을 확인하고 **일정 추가**를 눌러야 저장됩니다. 지원하지 않는 표현은 상세 입력을 이용하세요.
+일정 화면의 빠른 입력 예: `내일 오후 3시 회의`, `오늘 18:30 30분 동안 운동`, `오늘 15:00 1시간 30분 동안 회의`, `모레 종일 출장`, `2026-10-01 09:00 회의`. 날짜는 오늘·내일·모레·YYYY-MM-DD를 지원합니다. 길이 생략 시 1시간이며, 미리보기에서 날짜·시간을 확인하고 **일정 추가**를 눌러야 저장됩니다. 지원하지 않는 표현은 상세 입력을 이용하세요.
 
 접힌 위젯은 흰색 미니 컴퓨터 캐릭터로 표시됩니다. 클릭하면 기존 화면이 열리고 드래그하면 이동합니다. 눈 깜빡임은 동작 줄이기 설정을 따르며 숨겨진 동안에는 멈춥니다. 10분 안에 시작하는 일정은 파란 시계, 마지막 조회에서 잔여 한도 20% 이하인 서비스가 있으면 주황 배지와 표정으로 표시합니다. 일정 배지가 우선합니다.
 
@@ -18,24 +39,33 @@
 
 시작하면 둥근 사각형 앱 아이콘만 있는 메뉴 화면을 표시합니다. **AI 한도**는 파란 그래프 아이콘, **캘린더**는 오늘 날짜가 표시되는 흰색 아이콘입니다. 아이콘을 누르면 메뉴가 사라지고 선택한 기능만 표시됩니다. 오른쪽 하단 **메뉴**를 누르면 앱 아이콘 화면으로 돌아갑니다. 각 기능은 독립적으로 스크롤되며 조회 결과·일정·사용자 키워드는 화면 전환 후에도 유지됩니다. 마우스로 누르면 160ms의 작은 축소 효과와 화면 페이드가 적용됩니다. 키보드 조작은 즉시 반영되며, **설정 → 동작 줄이기**로 애니메이션을 끌 수 있습니다.
 
-위젯이 이미 실행 중이면 바로가기를 다시 눌러 기존 창을 앞으로 표시합니다. 숨겨진 창이나 화면 밖 위치도 복구합니다. 같은 사용자에게만 허용되는 로컬 소켓으로 창 활성화 요청을 전달하며, 추가 위젯 프로세스는 유지하지 않습니다.
+위젯이 이미 실행 중이면 바로가기를 다시 눌러 기존 창을 앞으로 표시합니다. 숨겨진 창이나 화면 밖 위치도 복구합니다. 다른 모드(`--desktop` / 작은 위젯)로 실행하면 기존 창을 닫고 요청한 모드로 엽니다. 기존 위젯이 시작·종료 중이면 최대 35초 기다린 뒤 실행합니다. 같은 사용자에게만 허용되는 로컬 소켓으로 창 활성화 요청을 전달하며, 추가 위젯 프로세스는 유지하지 않습니다. 종료하면 갱신 작업 정리 후 프로세스도 끝납니다. 다음 실행은 모든 자동 갱신을 새로 시작합니다. Google 로그인·일정 저장 작업이 진행 중이면 종료를 막아 작업을 보호합니다. 일정 조회 중에는 조회가 끝난 뒤 종료합니다.
 
-- Codex, Antigravity, GitHub Copilot 로그인 계정의 실제 한도를 3분마다 조회합니다.
-- 상단에 현재 날짜와 시간을 `YYYY.MM.DD HH:MM:SS`로 표시합니다. PC 현지 시간을 매초 갱신하며 한도 조회와 독립적으로 동작합니다.
+- Codex, Claude Code, Antigravity, GitHub Copilot 로그인 계정의 실제 한도를 3분마다 조회합니다.
+- 상단에 현재 날짜와 시간을 `YYYY.MM.DD HH:MM:SS`로 표시합니다. 화면이 열린 동안 PC 현지 시간을 매초 갱신하며 한도 조회와 독립적으로 동작합니다. 펫 모드·최소화 중에는 숨겨진 시계 갱신을 분당 한 번으로 줄입니다.
 - 잔여 비율과 초기화 시각(PC 현지 시간)을 표시합니다. 실패하면 마지막 값을 유지하고 마지막 성공 시각과 오류를 표시합니다.
 - 상단 **라이트 / 다크** 버튼으로 테마를 전환합니다. 테마는 다음 실행에도 유지됩니다.
 - **설정 → 투명도** 슬라이더로 위젯 전체 투명도를 0–70% 조절합니다. 0%는 완전 불투명이며 값은 즉시 저장됩니다. 설정 메뉴는 선명하게 유지됩니다.
 - 서비스 이름 아래 현재 플랜을 표시합니다. Codex는 `planType`, Copilot은 `copilot_plan` 응답을 사용합니다. 알려진 명칭만 변환하며 `prolite` 등 나머지는 서버 표기 그대로 보여줍니다.
 - Antigravity의 `/usage` 응답에는 플랜 정보가 없습니다. **설정 → Antigravity 플랜 직접 설정…**에서 입력하면 `(직접 설정)`으로 구분합니다. 빈 값으로 저장하면 직접 설정을 해제합니다. 잔여 한도로 플랜을 추정하지 않습니다.
-- 상단을 드래그해 이동. 오른쪽 아래 사선 손잡이 또는 바깥 가장자리를 드래그해 크기를 조절합니다. **설정 → 위젯 크기**에서 프리셋도 선택할 수 있습니다. 위치와 크기는 종료 시 저장됩니다.
+- 상단을 드래그해 이동. 오른쪽 아래 사선 손잡이 또는 바깥 가장자리를 드래그해 크기를 조절합니다. **설정 → 위젯 크기**에서 프리셋도 선택할 수 있습니다. 위치와 크기는 이동·크기 조절 1초 뒤와 종료 시 저장합니다.
 - 상단 흰색 원을 누르면 항상 위에 표시되는 작은 원으로 접힙니다. 다시 누르면 기존 화면·위치·크기로 복원되며, 계속 위에 표시됩니다.
 - **설정 → 로그인 시 자동 시작**으로 자동 시작을 설정합니다. 기본 꺼짐.
-- 서비스별 가장 적게 남은 항목을 큰 숫자로 표시합니다. **상세**를 누르면 전체 모델·기간별 한도를 확인할 수 있습니다. 작은 창에서는 카드를 스크롤합니다.
+- 서비스별 주간 한도를 우선 큰 숫자로 표시합니다. 주간 한도가 없으면 가장 적게 남은 항목을 표시합니다. **상세**를 누르면 전체 모델·기간별 한도를 확인할 수 있습니다. 작은 창에서는 카드를 스크롤합니다.
 - 둥근 외곽은 실제 투명 처리되며 카드·배경·컨트롤에 라이트와 다크 전용 색상을 적용합니다.
 - 각 서비스의 로고는 공식 출처에서 내려받아 로컬에 보관합니다. [로고 출처](assets/SOURCES.md).
 - GPT 카드는 **ChatGPT 구독에 포함된 Codex 한도**입니다. ChatGPT 웹 채팅의 메시지 한도나 OpenAI API 비용을 뜻하지 않습니다.
 - Codex의 기간은 서버가 제공한 값을 사용합니다. 첫 번째 기간이 항상 5시간인 것은 아닙니다.
 - AI 한도는 조회만 수행하며 기존 CLI 로그인 정보를 각 CLI가 사용합니다. 한도 초기화 크레딧을 소비하지 않습니다. Google Calendar는 별도로 로그인하며 일정 추가가 가능합니다.
+
+## 리소스 사용
+
+- 같은 작업 로그는 파일이 바뀔 때만 다시 해석합니다. 작은 상태 결과만 최대 64개 보관하며, 전체 대화 내용이나 로그인 정보는 캐시하지 않습니다. 로그 추가·교체 시 즉시 다음 조회에 반영합니다.
+- 작업 목록은 전체 정렬 대신 최근 로그 32개와 실행 중인 프로세스가 열고 있는 로그를 함께 선택합니다. Claude Code는 실행 중인 `claude` 프로세스의 작업 폴더로 세션을 찾습니다. Antigravity도 최근 16개 기록과 열린 작업을 함께 확인해 오래 걸리는 작업이 누락되지 않도록 합니다. 작업 감지 간격은 5초, AI 한도 조회는 3분으로 유지합니다.
+- 일정 추가·수정·빠른 입력·최초 연결 창은 닫으면 해제해 반복 사용 시 누적되지 않습니다.
+- 화면 전환이 끝나면 전환용 이미지를 해제합니다. 펫 색상은 원본과 같은 결과를 유지하면서 이미지 버퍼를 직접 수정해 중간 복사를 줄입니다.
+- 펫 말풍선의 색·크기·문구는 바뀌었을 때만 다시 설정합니다. 동작 줄이기를 켜면 자동 프레임 타이머를 멈추고, 수동 미리보기는 계속 지원합니다.
+- 병렬 수치 계산을 사용하지 않으므로 앱 시작 시 `OPENBLAS_NUM_THREADS`가 없는 경우에만 `1`로 설정해 불필요한 보조 스레드를 줄입니다. PC 전체 설정은 바꾸지 않습니다.
 
 ## Google Calendar
 
@@ -51,7 +81,7 @@
 
 공식 안내: [Python Calendar 설정](https://developers.google.com/workspace/calendar/api/quickstart/python?hl=ko).
 
-추가 라이브러리 `google-auth-oauthlib==1.4.1`, `requests-oauthlib==2.0.0`은 위젯의 `vendor/`에 설치했습니다. 기존 환경의 `google-auth`, `requests`, `oauthlib`을 사용합니다.
+Google 인증 라이브러리까지 앱 전용 `.venv`에 설치합니다. 기존 `vendor/`에는 동일 버전의 `google-auth-oauthlib==1.4.1`, `requests-oauthlib==2.0.0`이 남아 있습니다.
 
 ## 연동
 
@@ -60,21 +90,39 @@
 | Codex | `codex app-server` → `account/rateLimits/read` | `codex login` |
 | Antigravity | `agy --print /usage --print-timeout 20s` | `agy`에서 로그인 |
 | Copilot | `gh api /copilot_internal/user` | `gh auth login` |
+| Claude Code | `claude --print /usage --output-format json --no-session-persistence` | `claude`에서 로그인 |
+
+한도 카드의 대표값과 상세 목록은 항상 **주간 한도 우선**입니다. 전체 모델 주간 한도가 있으면 먼저 표시하고, 펫 말풍선도 같은 잔여율을 표시합니다. 주간 한도가 없는 서비스는 기존처럼 가장 적게 남은 항목을 표시하며, 세션·단기 한도 부족 경고는 계속 동작합니다.
+
+Claude 계정 두 개는 독립된 카드로 표시합니다. **Claude Code**는 기본 CLI 로그인(현재 Business 계정), **Claude · Max 5x**는 별도 로그인입니다. Max 카드의 **계정 로그인**을 누르면 Terminator와 브라우저가 열립니다. 개인 Max 구독 계정을 선택하고 인증을 완료한 뒤 **새로고침**을 누르세요. 로그인 이메일과 실제 CLI 플랜을 카드에 표시하며, 두 계정의 알림·잔여율·초기화 시각을 각각 관리합니다. Max 5x 카드 이름은 사용자가 알려준 구독명을 사용하며, CLI가 배율·Premium 좌석 등급을 별도로 검증하는 것은 아닙니다.
+
+Max 로그인은 `~/.config/wego/check-ai-claude/max`에 Claude Code가 직접 저장합니다(`XDG_CONFIG_HOME` 설정 시 해당 경로 사용). `CLAUDE_CONFIG_DIR`로 계정을 분리하고, 조회 자식 프로세스에서 다른 계정의 OAuth/API 환경 변수를 제외합니다. 위젯은 토큰을 읽거나 복사하지 않습니다. 브라우저에 회사 계정이 선택돼 있으면 로그인 화면에서 개인 계정으로 전환하세요. 잘못 연결된 Team/Business 계정을 Max 수치로 표시하지 않습니다. 공식 [다중 계정 환경 변수 안내](https://code.claude.com/docs/ko/env-vars).
+
+Claude Code는 이 PC의 로컬 세션을 작업 말풍선에 표시합니다. 한도 카드는 CLI의 `/usage` 결과에서 현재 세션·주간 사용률을 읽고 남은 비율을 표시합니다. 조회는 모델 호출 없이 실행되고 세션 기록을 남기지 않습니다. 카드의 화살표로 웹 사용량 화면도 열 수 있습니다. CLI 출력 형식이 바뀌면 마지막 성공 값을 유지하고 오류를 표시합니다.
 
 Copilot은 설치된 공식 Copilot 확장이 사용하는 **내부 API**입니다. 공개적으로 안정성이 보장된 API가 아니므로 응답 변경·권한 제한 시 수정이 필요할 수 있습니다. 크레딧 방식과 요청 방식은 서버 응답에 따라 구분하며 무제한을 0으로 표시하지 않습니다.
 
-출처: [Codex App Server](https://learn.chatgpt.com/docs/app-server), [Antigravity /usage](https://antigravity.google/docs/cli/commands/usage), [Copilot 사용량 확인](https://docs.github.com/en/copilot/reference/copilot-billing/request-based-billing-legacy/monitor-premium-requests).
+출처: [Codex App Server](https://learn.chatgpt.com/docs/app-server), [Claude Code /usage](https://code.claude.com/docs/en/commands), [Antigravity /usage](https://antigravity.google/docs/cli/commands/usage), [Copilot 사용량 확인](https://docs.github.com/en/copilot/reference/copilot-billing/request-based-billing-legacy/monitor-premium-requests).
 
 ## 실행 및 검증
 
+바로가기와 자동 시작은 `/home/wego/ai-quota-widget/.venv/bin/python`을 사용합니다. 앱 전용 환경은 공용 Python 패키지를 읽지 않으며, 실행 시 `-E`로 외부 `PYTHONPATH`·`PYTHONHOME` 설정도 무시합니다. 현재 검증한 버전은 `requirements.txt`에 고정했습니다. 필요한 Qt 모듈만 포함한 `PySide6-Essentials==6.6.3`을 사용합니다. 위젯에 필요 없는 NumPy는 설치하지 않아 공용 NumPy와의 호환 경고를 피합니다. PC의 기존 Python·NumPy는 변경하지 않습니다.
+
+환경을 다시 만들 때:
+
 ```bash
-rtk proxy python3 /home/wego/ai-quota-widget/widget.py
-rtk proxy python3 /home/wego/ai-quota-widget/widget.py --check
-rtk proxy env QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s /home/wego/ai-quota-widget -v
-rtk proxy env QT_QPA_PLATFORM=offscreen python3 /home/wego/ai-quota-widget/widget.py --smoke /tmp/ai-quota-widget.png --theme light
+rtk proxy /usr/bin/python3 -m venv /home/wego/ai-quota-widget/.venv
+rtk proxy /home/wego/ai-quota-widget/.venv/bin/python -E -m pip install -r /home/wego/ai-quota-widget/requirements.txt
 ```
 
-필요한 기존 설치: Python 3, PySide6, rtk, codex, agy, gh. 네트워크 조회는 별도 작업 스레드에서 실행하며 각 호출의 제한 시간은 30초입니다. 종료 중 진행 중인 조회가 있으면 완료까지 최대 약 32초 기다립니다.
+```bash
+rtk proxy /home/wego/ai-quota-widget/.venv/bin/python -E /home/wego/ai-quota-widget/widget.py
+rtk proxy /home/wego/ai-quota-widget/.venv/bin/python -E /home/wego/ai-quota-widget/widget.py --check
+rtk proxy env QT_QPA_PLATFORM=offscreen /home/wego/ai-quota-widget/.venv/bin/python -E -m unittest discover -s /home/wego/ai-quota-widget -v
+rtk proxy env QT_QPA_PLATFORM=offscreen /home/wego/ai-quota-widget/.venv/bin/python -E /home/wego/ai-quota-widget/widget.py --smoke /tmp/ai-quota-widget.png --theme light
+```
+
+필요한 기존 설치: Python 3.10 이상, rtk, codex, claude, agy, gh. 앱의 Python 라이브러리는 위 전용 환경에 설치합니다. 네트워크 조회는 별도 작업 스레드에서 실행하며 각 호출의 제한 시간은 30초입니다. 종료 중 진행 중인 조회가 있으면 완료까지 기다립니다. Claude는 로그인 상태 확인 5초, 사용량 조회 25초 제한입니다.
 
 설정: `~/.config/wego/ai-quota-widget.conf`. 자동 시작: `~/.config/autostart/ai-quota-widget.desktop`. 프로그램 경로를 옮기면 `.desktop` 파일의 `Exec`와 `Path`도 수정하세요.
 

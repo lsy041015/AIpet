@@ -25,15 +25,16 @@ def parse_quick_event(text, now=None):
         if period:
             hour = hour % 12 + (12 if period == "오후" else 0)
         duration = 60
-        length = re.match(r"(\d+)\s*(분|시간)\s*동안\s+(.+)", title)
-        if length:
-            number, unit, title = length.groups()
-            duration = int(number) * (60 if unit == "시간" else 1)
+        length = re.fullmatch(r"(?:(\d+)\s*시간)?\s*(?:(\d+)\s*분)?\s*동안(?:\s+(.+))?", title)
+        if length and (length[1] or length[2]):
+            hours, minutes, title = length.groups()
+            title = title or ""  # event_body rejects a duration without a title.
+            duration = int(hours or 0) * 60 + int(minutes or 0)
             if not 1 <= duration <= 1440:
                 raise CalendarError("일정 길이는 1분–24시간으로 입력하세요.")
         if re.match(r"(?:반(?:\s|$)|부터|까지|[~–]|\d{1,2}(?:시|:))", title):
             raise CalendarError("시간 범위 대신 ‘30분 동안’처럼 입력하거나 상세 화면에서 수정하세요.")
         start = datetime.combine(day, datetime.min.time()).replace(hour=hour, minute=minute).astimezone()
         return event_body(title, start, start + timedelta(minutes=duration))
-    except ValueError:
+    except (ValueError, OverflowError):  # e.g. 9999-12-31 종일 has no next day.
         raise CalendarError("날짜 또는 시간 값이 올바르지 않습니다.") from None

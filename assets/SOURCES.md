@@ -9,6 +9,7 @@
 | `codex.svg` | OpenAI 공식 브랜드 배포본의 `OpenAI-logos(new)/SVGs/OpenAI-black-monoblossom.svg`. GPT / Codex 카드 식별용. | https://cdn.openai.com/brand/OpenAI-Logos-2025.zip |
 | `antigravity.png` | Google Antigravity 공식 Press Assets, Icon – Full Color | https://antigravity.google/assets/image/brand/antigravity-icon__full-color.png |
 | `copilot.svg` | GitHub 공식 Primer Octicons의 Copilot 서비스 아이콘 | https://raw.githubusercontent.com/primer/octicons/main/icons/copilot-24.svg |
+| `claude.svg`, `claude-white.svg` | 이 위젯에서 직접 그린 별 모양의 Claude Code 식별 아이콘. 공식 로고 파일은 아님. | 해당 없음 |
 
 [OpenAI 브랜드 안내](https://openai.com/brand/), [Antigravity Press Assets](https://antigravity.google/press), [GitHub Primer Octicons](https://github.com/primer/octicons), [Octicons MIT 라이선스](https://github.com/primer/octicons/blob/main/LICENSE).
 

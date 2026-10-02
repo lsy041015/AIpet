@@ -1,16 +1,23 @@
 """Read-only agent states. Local event formats may change between CLI versions."""
 import json
+import heapq
+from functools import lru_cache
 import os
 import re
 import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
+from providers import claude_max_dir
+
+# Slash-command, `!` shell and injected context records never start a model turn.
+CLAUDE_LOCAL = ('<command-name>', '<local-command-', '<bash-input>', '<bash-stdout>', '<bash-stderr>')
 
 
 def timestamp(value):
     try:
-        return datetime.fromisoformat(re.sub(r'(\.\d{6})\d+', r'\1', value).replace('Z', '+00:00')).timestamp()
+        # Python 3.10 accepts only 3 or 6 fraction digits; Antigravity trims trailing zeros.
+        return datetime.fromisoformat(re.sub(r'\.(\d+)', lambda m: '.' + m[1][:6].ljust(6, '0'), value).replace('Z', '+00:00')).timestamp()
     except (ValueError, TypeError):
         return 0
 
@@ -25,12 +32,70 @@ def tool_label(name):
     return '도구 실행 중'
 
 
+def claude_event(state, event, moment, pending):
+    kind = event.get('type')
+    message = event.get('message')
+    if not isinstance(message, dict):
+        message = {}
+    content = message.get('content')
+    blocks = content if isinstance(content, list) else []
+    if kind == 'user':
+        results = {str(block.get('tool_use_id')) for block in blocks if isinstance(block, dict) and block.get('type') == 'tool_result'}
+        text = (content if isinstance(content, str) else ''.join(
+            str(block.get('text', '')) for block in blocks if isinstance(block, dict) and block.get('type') == 'text')).lstrip()
+        if text.startswith('[Request interrupted by user'):
+            state.update(status='cancelled', label='작업 중단')
+            pending.clear()
+        elif event.get('isMeta') or event.get('isCompactSummary') or text.startswith(CLAUDE_LOCAL):
+            pass
+        elif not results:
+            state.update(status='running', label='작업 중', started=moment)
+            pending.clear()
+        else:
+            state.update(status='running', label='응답 준비 중')
+            pending.difference_update(results)
+    elif kind == 'assistant':
+        tools = [block for block in blocks if isinstance(block, dict) and block.get('type') == 'tool_use']
+        if state['status'] in ('done', 'cancelled'):
+            state['started'] = moment  # turn started by a command or injected message
+        if tools:
+            state.update(status='running', label=tool_label(tools[-1].get('name', '')))
+            pending.update(str(block.get('id')) for block in tools)
+        elif message.get('stop_reason') == 'end_turn':
+            state.update(status='done', label='작업 완료')
+            pending.clear()
+        elif message.get('stop_reason'):
+            state.update(status='running', label='응답 준비 중')
+    elif kind == 'system' and event.get('subtype') == 'turn_duration':
+        state.update(status='done', label='작업 완료')
+        pending.clear()
+    if moment:
+        state['updated'] = moment
+
+
 def session_state(path, agent):
+    stat = path.stat()
+    version = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    return _session_state(path, agent, version).copy()
+
+
+@lru_cache(maxsize=64)
+def _session_state(path, agent, version, span=262144):
+    # Cache only the small parsed state, never the session text or credentials.
     with path.open('rb') as stream:
-        stream.seek(max(0, path.stat().st_size - 262144))
+        head = stream.readline(1 << 20) if agent == 'codex' else b''
+        stream.seek(max(0, path.stat().st_size - span))
         lines = stream.read().decode('utf-8', errors='replace').splitlines()
     state = dict(id=str(path), agent=agent, status='unknown', label='작업 중',
                  started=0, updated=path.stat().st_mtime, target=str(path))
+    try:
+        # Codex sub-agent and guardian rollouts belong to the parent session.
+        source = json.loads(head)['payload']['source'] if head else None
+    except (ValueError, TypeError, KeyError):
+        source = None
+    if isinstance(source, dict) and 'subagent' in source:
+        state['subagent'] = True
+        return state
     waiting = set()
     async_requests = set()
     requested_tools = False
@@ -42,6 +107,10 @@ def session_state(path, agent):
         if not isinstance(event, dict):
             continue
         kind = event.get('type', '')
+        if agent == 'claude':
+            if not event.get('isSidechain'):
+                claude_event(state, event, timestamp(event.get('timestamp')), waiting)
+            continue
         data = event.get('payload', {}) if agent == 'codex' else event.get('data', {})
         if not isinstance(data, dict):
             continue
@@ -99,6 +168,11 @@ def session_state(path, agent):
             state.update(status='waiting', label='승인·입력 대기')
         if moment:
             state['updated'] = moment
+    if agent == 'claude':
+        state['pending'] = bool(waiting)
+    if state['status'] == 'unknown' and span < 1 << 24 and path.stat().st_size > span:
+        # A pasted image or compacted history can make the newest line larger than the tail.
+        return _session_state.__wrapped__(path, agent, version, span * 8)
     return state
 
 
@@ -107,23 +181,101 @@ def session_activity(path, agent):
     return state['label'] if state['status'] in ('running', 'waiting') else None
 
 
-def live_agent_files():
+def live_agent_files(claude=None):
     found = set()
-    for process in Path('/proc').glob('[0-9]*'):
-        try:
-            if (process / 'comm').read_text().strip() not in ('agy', 'copilot', 'codex'):
+    try:
+        processes = os.scandir('/proc')
+    except OSError:
+        return found
+    with processes:
+        for process in processes:
+            if not process.name.isdigit():
                 continue
-            for fd in (process / 'fd').iterdir():
-                try:
-                    target = os.readlink(fd)
-                    if (target.endswith('.jsonl') and '/sessions/' in target or target.endswith('/events.jsonl')
-                            or '/conversations/' in target and target.endswith('.db')):
-                        found.add(target)
-                except OSError:
-                    pass
-        except OSError:
-            pass
+            try:
+                with open(process.path + '/comm') as stream:
+                    name = stream.read().strip()
+                if name not in ('agy', 'copilot', 'codex', 'claude'):
+                    continue
+                if name == 'claude' and claude is not None:
+                    claude.append(process.path)
+                with os.scandir(process.path + '/fd') as descriptors:
+                    for fd in descriptors:
+                        try:
+                            target = os.readlink(fd.path)
+                            if (target.endswith('.jsonl') and '/sessions/' in target or target.endswith('/events.jsonl') or target.endswith('.jsonl') and '/.claude/projects/' in target
+                                    or '/conversations/' in target and target.endswith('.db')):
+                                found.add(target)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
     return found
+
+
+def claude_project(cwd):
+    # Claude names a project folder after its working directory: /home/a_b/.x -> -home-a-b--x
+    return re.sub(r'[^A-Za-z0-9]', '-', cwd)
+
+
+def claude_roots(home):
+    profile = claude_max_dir() / 'projects'
+    try:
+        profile = home / profile.relative_to(Path.home())
+    except ValueError:
+        pass
+    return home / '.claude/projects', profile
+
+
+def claude_sessions(processes, roots):
+    """Claude keeps no transcript open; a running CLI keeps its project's newest sessions visible."""
+    projects = {}
+    try:
+        with open('/proc/stat') as stream:
+            boot = next(int(line.split()[1]) for line in stream if line.startswith('btime '))
+        for process in processes:
+            try:
+                cwd = os.readlink(process + '/cwd')
+                with open(process + '/stat') as stream:
+                    started = boot + int(stream.read().rsplit(')', 1)[1].split()[19]) / os.sysconf('SC_CLK_TCK')
+            except (OSError, ValueError, IndexError):
+                continue
+            count, first = projects.get(claude_project(cwd), (0, started))
+            projects[claude_project(cwd)] = count + 1, min(first, started)
+    except (OSError, ValueError, IndexError, StopIteration):
+        return set()
+    found = set()
+    for project, (count, started) in projects.items():
+        for root in roots:
+            try:
+                with os.scandir(root / project) as entries:
+                    files = sorted(((entry.stat().st_mtime, entry.path) for entry in entries if entry.name.endswith('.jsonl')), reverse=True)
+            except OSError:
+                continue
+            # Older logs belong to earlier runs, so a crashed turn is not revived.
+            found.update(path for modified, path in files[:count] if modified >= started)
+    return found
+
+
+def subagent_activity(path):
+    try:
+        with os.scandir(path[:-len('.jsonl')] + '/subagents') as entries:
+            return max((entry.stat().st_mtime for entry in entries), default=0)
+    except OSError:
+        return 0
+
+
+def recent_sessions(directory, pattern):
+    for root, folders, names in os.walk(directory):
+        # Claude subagent transcripts belong to the parent session, which represents the work.
+        folders[:] = [name for name in folders if name != 'subagents']
+        for name in names:
+            if not (name.endswith('.jsonl') if pattern == '*.jsonl' else name == pattern):
+                continue
+            path = os.path.join(root, name)
+            try:
+                yield os.stat(path).st_mtime, path
+            except OSError:
+                continue
 
 
 def antigravity_step(path):
@@ -143,15 +295,32 @@ def antigravity_step(path):
 def read_activity(home=None, now=None, detailed=False):
     home, now = Path(home or Path.home()), time.time() if now is None else now
     result = []
-    live = live_agent_files()
+    claude = []
+    live = live_agent_files(claude)
+    roots = claude_roots(home)
+    live = live | claude_sessions(claude, roots)
     for agent, folder, pattern in (('codex', '.codex/sessions', '*.jsonl'),
-                                    ('copilot', '.copilot/session-state', 'events.jsonl')):
+                                    ('copilot', '.copilot/session-state', 'events.jsonl'),
+                                    ('claude', roots[0], '*.jsonl'), ('claude', roots[1], '*.jsonl')):
         try:
-            paths = sorted((home / folder).rglob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-            for path in paths[:32]:
+            live_paths = []
+            def other_sessions():
+                for modified, path in recent_sessions(home / folder, pattern):
+                    if path in live:
+                        live_paths.append((modified, path))
+                    else:
+                        yield modified, path
+            paths = heapq.nlargest(32, other_sessions()) + live_paths
+            for modified, path in paths:
                 try:
-                    if str(path) in live or now - path.stat().st_mtime <= 120:
-                        result.append(session_state(path, agent))
+                    if path in live or now - modified <= 120:
+                        state = session_state(Path(path), agent)
+                        if state.pop('subagent', False):
+                            continue
+                        if state.pop('pending', False) and state['status'] == 'running' and now - max(modified, subagent_activity(path)) > 30:
+                            # Claude logs no permission prompt; a silent pending tool may be waiting for approval.
+                            state.update(status='waiting', label='승인 대기 또는 실행 중')
+                        result.append(state)
                 except OSError:
                     continue
         except OSError:
@@ -163,7 +332,15 @@ def read_activity(home=None, now=None, detailed=False):
         try:
             connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=.1)
             try:
-                rows = connection.execute('SELECT title,last_modified_time,conversation_id,status,not_fully_idle,killed,last_user_input_time FROM conversation_summaries ORDER BY last_modified_time DESC LIMIT 16').fetchall()
+                query = 'SELECT title,last_modified_time,conversation_id,status,not_fully_idle,killed,last_user_input_time FROM conversation_summaries'
+                rows = connection.execute(query + ' ORDER BY last_modified_time DESC LIMIT 16').fetchall()
+                recent_ids = {row[2] for row in rows}
+                for path in sorted(live):
+                    target = Path(path)
+                    if target.parent == database.parent / 'conversations' and target.stem not in recent_ids:
+                        row = connection.execute(query + ' WHERE conversation_id = ?', (target.stem,)).fetchone()
+                        if row:
+                            rows.append(row)
                 for title, modified, identifier, status, busy, killed, started in rows:
                     target = database.parent / 'conversations' / (identifier + '.db')
                     updated = timestamp(modified)
@@ -229,7 +406,8 @@ class ActivityTracker:
                 active.append(item)
             if self.ready and status in ('done', 'failed'):
                 observed = old and old['status'] in ('running', 'waiting')
-                new_task = item['updated'] > self.last_scan and (old is None or item['started'] > old['started'])
+                # A later write to an old log is not a new task; only a turn that started since the last scan is.
+                new_task = item['started'] > self.last_scan
                 if observed or new_task:
                     notices.append(item)
             self.previous[key] = item

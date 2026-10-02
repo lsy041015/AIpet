@@ -15,7 +15,7 @@ def atlas():
     if source.width() != 1536 or source.height() != 1872:
         raise ValueError("Tiny CRT atlas missing or invalid")
     source = source.convertToFormat(QImage.Format_RGBA8888)
-    data = bytearray(source.constBits())
+    data = source.bits()
     for offset in range(0, len(data), 4):
         r, g, b, a = data[offset:offset + 4]
         if not a:
@@ -28,7 +28,7 @@ def atlas():
         elif r > b * 1.12 and g > b * 1.04 and r > 65:
             shade = min(255, int(r * 1.02))
             data[offset:offset + 3] = bytes((max(0,shade-6), max(0,shade-2), shade))
-    return QImage(data, source.width(), source.height(), source.bytesPerLine(), QImage.Format_RGBA8888).copy()
+    return source
 
 def animation_row(widget):
     if widget.preview_row is not None:
