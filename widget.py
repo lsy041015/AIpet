@@ -3,6 +3,7 @@
 import argparse
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -52,11 +53,11 @@ SERVICES = {
 THEMES = {
     "dark": {"background": "#171b24", "card": "#252c38", "text": "#f5f5f7",
              "muted": "#aeaeb8", "track": "#414146", "control": "#363639",
-             "selected": "#485364", "border": "#384353", "warning": "#ffb970",
+             "selected": "#485364", "border": "#384353", "warning": "#ffb970", "danger": "#ff8a80",
              "codex": "#66dfb5", "antigravity": "#91bcff", "copilot": "#d4b3ff", "claude": "#f29c7b", "claude_max": "#f29c7b"},
     "light": {"background": "#f2f2f7", "card": "#ffffff", "text": "#1c1c1e",
               "muted": "#62626c", "track": "#e6e6ec", "control": "#e4e4eb",
-              "selected": "#ffffff", "border": "#d3d3dd", "warning": "#a04a00",
+              "selected": "#ffffff", "border": "#d3d3dd", "warning": "#a04a00", "danger": "#c62828",
               "codex": "#087e61", "antigravity": "#185ec7", "copilot": "#7b3bb4", "claude": "#a34224", "claude_max": "#a34224"},
 }
 
@@ -77,6 +78,38 @@ def label(text, role=""):
     if role:
         item.setObjectName(role)
     return item
+
+
+def risk_level(remaining):
+    if remaining is None:
+        return ""
+    return "critical" if remaining <= 10 else "low" if remaining <= 20 else ""
+
+
+def time_left(reset_at, now=None):
+    if reset_at is None:
+        return ""
+    seconds = reset_at - (time.time() if now is None else now)
+    if seconds <= 0:
+        return "곧 초기화"
+    minutes = math.ceil(seconds / 60)
+    days, hours, mins = minutes // 1440, minutes % 1440 // 60, minutes % 60
+    if days:
+        return f"{days}일 {hours}시간 후" if hours else f"{days}일 후"
+    if hours:
+        return f"{hours}시간 {mins}분 후" if mins else f"{hours}시간 후"
+    return f"{mins}분 후"
+
+
+def reset_line(row, now=None):
+    return " · ".join(v for v in (row.get("detail"), row["reset"], time_left(row.get("reset_at"), now)) if v)
+
+
+def set_risk(item, level):
+    if item.property("risk") != level:
+        item.setProperty("risk", level)
+        item.style().unpolish(item)
+        item.style().polish(item)
 
 
 def motion_curve():
@@ -820,6 +853,7 @@ class Card(QWidget):
         layout.addWidget(self.status)
         self.last_success = None
         self.data = []
+        self.captions = []
 
     def open_claude_login(self):
         try:
@@ -888,11 +922,13 @@ class Card(QWidget):
         self.bar.setVisible(remaining is not None)
         self.bar.setValue(round(remaining * 10) if remaining is not None else 1000)
         self.bar.setAccessibleName(primary["label"] + " 남은 한도")
-        self.reset.setText(" · ".join(v for v in (primary.get("detail"), primary["reset"]) if v)
-                          if remaining is not None else "사용량 제한 없음")
+        self.reset.setText(reset_line(primary) if remaining is not None else "사용량 제한 없음")
+        for item in (self.amount, self.bar):
+            set_risk(item, risk_level(remaining))
         self.set_warning(any(row["remaining"] is not None and row["remaining"] <= 20 for row in rows))
         while self.rows.count():
             self.rows.takeAt(0).widget().deleteLater()
+        self.captions = []
         for row in rows:
             box = QWidget()
             stack = QVBoxLayout(box)
@@ -904,6 +940,7 @@ class Card(QWidget):
             amount = "무제한" if remaining is None else f"{remaining:g}% 남음"
             value = label(amount, "rowValue")
             value.setWordWrap(False)
+            set_risk(value, risk_level(remaining))
             line.addWidget(value)
             stack.addLayout(line)
             if remaining is not None:
@@ -913,15 +950,23 @@ class Card(QWidget):
                 bar.setTextVisible(False)
                 bar.setFixedHeight(4)
                 bar.setAccessibleName(row["label"] + " " + amount)
+                set_risk(bar, risk_level(remaining))
                 stack.addWidget(bar)
-                detail = " · ".join(v for v in (row.get("detail"), row["reset"]) if v)
-                stack.addWidget(label(detail, "caption"))
+                caption = label(reset_line(row), "caption")
+                self.captions.append((caption, row))
+                stack.addWidget(caption)
             self.rows.addWidget(box)
         self.last_success = datetime.now().strftime("%m/%d %H:%M:%S")
         self.status.setText("갱신 " + self.last_success)
         self.status.hide()
         self.details.setToolTip("마지막 갱신 " + self.last_success)
         self.setToolTip("")
+
+    def refresh_countdown(self, now=None):
+        if self.data and self.data[0]["remaining"] is not None:
+            self.reset.setText(reset_line(self.data[0], now))
+        for caption, row in self.captions:
+            caption.setText(reset_line(row, now))
 
 
 class ActivityFetch(QThread):
@@ -1016,6 +1061,10 @@ class Widget(QWidget):
                 setting = f"notify/{key}/{threshold}"
                 action.setChecked(self.settings.value(setting, True, type=bool))
                 action.toggled.connect(lambda enabled, name=setting: self.settings.setValue(name, enabled))
+        self.waiting_action = alerts.addAction("에이전트 승인 대기")
+        self.waiting_action.setCheckable(True)
+        self.waiting_action.setChecked(self.settings.value("notify/agents/waiting", True, type=bool))
+        self.waiting_action.toggled.connect(lambda enabled: self.settings.setValue("notify/agents/waiting", enabled))
         self.menu.addSeparator()
         opacity_panel = QWidget()
         opacity_panel.setMinimumWidth(230)
@@ -1234,6 +1283,10 @@ class Widget(QWidget):
     def received_activity(self, activity):
         self.agent_activity, notices = self.activity_tracker.update(activity)
         for item in notices:
+            if item['status'] == 'waiting':
+                if self.settings.value("notify/agents/waiting", True, type=bool):
+                    self.send_notification(SERVICES[item['agent']][0] + ' · 승인·입력 대기', item['label'])
+                continue
             self.send_notification(SERVICES[item['agent']][0] + (' · 작업 실패' if item['status'] == 'failed' else ' · 작업 완료'), item['label'])
             self.restore_button.set_status(5 if item['status'] == 'failed' else 8)
         if self.restore_button.isVisible():
@@ -1299,8 +1352,16 @@ class Widget(QWidget):
             self.clock_day = now.date()
         if hasattr(self, "cards") and getattr(self, "billing_day", None) != now.date():
             self.update_billing()
+        minute = now.replace(second=0, microsecond=0)
+        if hasattr(self, "cards") and getattr(self, "clock_minute", None) != minute:
+            self.clock_minute = minute
+            self.update_countdowns()
         if quiet and self.reduce_motion.isChecked():
             self.restore_button.update()
+
+    def update_countdowns(self):
+        for card in self.cards.values():
+            card.refresh_countdown()
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -1519,7 +1580,12 @@ class Widget(QWidget):
             f"QWidget[service='{key}'] QLabel#badge, QWidget[service='{key}'] QLabel#rowValue {{color:{colors[key]};}} "
             f"QWidget[service='{key}'] QProgressBar::chunk {{background:{colors[key]};}}"
             for key in SERVICES
-        ) + f"\nQWidget[warning='true'] QLabel#status {{color:{colors['warning']};}}")
+        ) + f"\nQWidget[warning='true'] QLabel#status {{color:{colors['warning']};}}" + "\n".join(
+            # Per-service selectors are needed to outrank the service-colored chunk and rowValue rules.
+            f"QProgressBar[risk='{risk}']::chunk, QWidget[service='{key}'] QProgressBar[risk='{risk}']::chunk {{background:{colors[token]};}} "
+            f"QLabel[risk='{risk}'], QWidget[service='{key}'] QLabel#rowValue[risk='{risk}'] {{color:{colors[token]};}}"
+            for risk, token in (("low", "warning"), ("critical", "danger")) for key in SERVICES
+        ))
         self.update_page_icons()
 
     def set_transparency(self, value):

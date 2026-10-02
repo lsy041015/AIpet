@@ -4,16 +4,18 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCore import QSettings, QPoint, QPointF, QSize, QEvent, QObject, QAbstractAnimation, Qt
+from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QMenu
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QMenu, QProgressBar
 
-from widget import Widget, activate_existing, listen_for_activation
+from widget import THEMES, Card, Widget, activate_existing, listen_for_activation, risk_level, time_left
 from pixel_pet import DURATIONS, animation_row, display_row
 
 
@@ -186,6 +188,21 @@ class InstanceTests(unittest.TestCase):
                         if process and process.poll() is None:
                             process.kill()
                             process.communicate()
+
+
+class QuotaHelperTests(unittest.TestCase):
+    def test_time_left_formats(self):
+        now = 1_000_000.0
+        cases = [(30 * 3600 + 5 * 60, "1일 6시간 후"), (48 * 3600, "2일 후"), (3 * 3600, "3시간 후"),
+                 (3 * 3600 + 20 * 60, "3시간 20분 후"), (45 * 60, "45분 후"), (20, "1분 후"),
+                 (-5, "곧 초기화"), (0, "곧 초기화")]
+        for seconds, expected in cases:
+            self.assertEqual(time_left(now + seconds, now), expected, seconds)
+        self.assertEqual(time_left(None, now), "")
+
+    def test_risk_level_thresholds(self):
+        self.assertEqual([risk_level(v) for v in (None, 100, 21, 20, 11, 10, 0)],
+                         ["", "", "", "low", "low", "critical", "critical"])
 
 
 class WidgetTests(unittest.TestCase):
@@ -713,6 +730,23 @@ class WidgetTests(unittest.TestCase):
             self.window.received_activity([task])
             notify.assert_called_once()
 
+    def test_waiting_notification_respects_setting(self):
+        task = dict(id='w', agent='claude', status='running', label='명령 실행 중', started=1, updated=2, target='x')
+        waiting = dict(task, status='waiting', label='승인·입력 대기', updated=3)
+        self.assertTrue(self.window.waiting_action.isChecked())
+        with patch.object(self.window, 'send_notification') as notify, \
+             patch.object(self.window.restore_button, 'set_status') as status:
+            self.window.received_activity([task])
+            self.window.received_activity([waiting])
+            notify.assert_called_once_with("Claude Code · 승인·입력 대기", "승인·입력 대기")
+            status.assert_not_called()
+            notify.reset_mock()
+            self.window.waiting_action.setChecked(False)
+            self.assertFalse(self.settings.value("notify/agents/waiting", True, type=bool))
+            self.window.received_activity([task])
+            self.window.received_activity([waiting])
+            notify.assert_not_called()
+
     def test_smoke_render_does_not_store_notification_state(self):
         before = self.settings.value("notification_state")
         smoke = Widget(smoke=True)
@@ -873,6 +907,55 @@ class WidgetTests(unittest.TestCase):
             self.assertEqual(card.details.findChild(QLabel, "rowValue").font().pixelSize(), 10)
         self.window.close()
         self.assertFalse(self.window.clock_timer.isActive())
+
+    def test_risk_colors_on_bars_and_amounts(self):
+        self.window.set_theme("light")
+        colors = THEMES["light"]
+        card = self.window.cards["codex"]
+        card.details_button.setChecked(True)
+        cases = [(7, "critical", colors["danger"]), (15, "low", colors["warning"]), (50, "", colors["codex"])]
+        for remaining, risk, color in cases:
+            card.update_result([{"label": "Codex · 주간", "remaining": remaining, "reset": "10/04 02:11 초기화"},
+                                {"label": "Codex · 5시간", "remaining": 80, "reset": "10/03 02:11 초기화"}], "")
+            self.app.processEvents()
+            self.assertEqual(card.amount.property("risk"), risk)
+            self.assertEqual(card.bar.property("risk"), risk)
+            self.assertEqual(card.bar.grab().toImage().pixelColor(8, 3), QColor(color), remaining)
+            first, second = (card.rows.itemAt(i).widget() for i in range(2))
+            value, detail = first.findChild(QLabel, "rowValue"), first.findChild(QProgressBar)
+            self.assertEqual(value.property("risk"), risk)
+            self.assertEqual(detail.property("risk"), risk)
+            self.assertEqual(detail.grab().toImage().pixelColor(8, 2), QColor(color), remaining)
+            self.assertEqual(second.findChild(QProgressBar).property("risk"), "")
+
+    def test_card_countdown_updates_each_minute(self):
+        card = Card("codex")
+        reset_at = time.time() + 2 * 3600
+        card.update_result([{"label": "Codex · 주간", "remaining": 50, "detail": "한도 안내",
+                             "reset": "10/04 02:11 초기화", "reset_at": reset_at},
+                            {"label": "Codex · 5시간", "remaining": 80, "reset": "10/03 02:11 초기화",
+                             "reset_at": reset_at + 3600}], "")
+        self.assertEqual(card.reset.text(), "한도 안내 · 10/04 02:11 초기화 · 2시간 후")
+        card.refresh_countdown(reset_at - 59 * 60)
+        self.assertEqual(card.reset.text(), "한도 안내 · 10/04 02:11 초기화 · 59분 후")
+        captions = [item.text() for item in card.details.findChildren(QLabel, "caption")]
+        self.assertEqual(captions[1], "10/03 02:11 초기화 · 1시간 59분 후")
+        self.assertEqual(card.data[0]["reset"], "10/04 02:11 초기화")
+        card.deleteLater()
+
+    def test_clock_refreshes_countdowns_once_per_minute_even_when_collapsed(self):
+        with patch.object(self.window, "update_countdowns") as update, patch("widget.datetime") as clock:
+            for second, calls in ((5, 1), (30, 1), (59, 1)):
+                clock.now.return_value = datetime(2026, 9, 11, 10, 0, second)
+                self.window.update_clock()
+                self.assertEqual(update.call_count, calls)
+            self.window.toggle_collapsed()
+            clock.now.return_value = datetime(2026, 9, 11, 10, 1, 0)
+            self.window.update_clock()
+            self.assertEqual(update.call_count, 2)
+        with patch.object(Card, "refresh_countdown") as refresh:
+            self.window.update_countdowns()
+            self.assertEqual(refresh.call_count, len(self.window.cards))
 
     def test_resize_and_geometry_restore(self):
         self.window.move(0, 0)
