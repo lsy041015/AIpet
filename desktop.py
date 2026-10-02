@@ -5,10 +5,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QTimer, QRect, QRectF
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
-                               QPushButton, QToolButton, QButtonGroup, QScrollArea, QSizePolicy)
+                               QPushButton, QToolButton, QButtonGroup, QScrollArea, QSizePolicy, QProgressBar)
 
-from widget import Widget, SERVICES, THEMES, label
-from billing import next_payment, payment_summary, PERIODS
+from widget import Widget, SERVICES, THEMES, label, risk_level, set_risk, logo_asset
+from billing import next_payment, PERIODS
 
 
 PAGES = {
@@ -61,6 +61,20 @@ def panel(title, subtitle=""):
     if subtitle:
         layout.addWidget(label(subtitle, "caption"))
     return box, layout
+
+
+def due_text(upcoming, today):
+    days = (upcoming - today).days
+    return "오늘" if days == 0 else f"{days}일 후" if days > 0 else "확인 필요"
+
+
+def place(grid, widgets, columns):
+    for item in widgets:
+        grid.removeWidget(item)
+    for index, item in enumerate(widgets):
+        grid.addWidget(item, index // columns, index % columns)
+    grid.setColumnStretch(0, 1)
+    grid.setColumnStretch(1, 1 if columns == 2 else 0)
 
 
 def scroll_page(content):
@@ -236,26 +250,43 @@ class DesktopWindow(Widget):
         layout.setSpacing(16)
         metrics = QHBoxLayout()
         metrics.setSpacing(12)
-        self.metrics = {}
-        for key, title in (("accounts", "AI 계정"), ("agents", "진행 중인 작업"), ("events", "오늘 일정"), ("billing", "가장 가까운 결제")):
+        self.metrics, self.metric_notes = {}, {}
+        for key, title in (("lowest", "가장 적게 남은 한도"), ("agents", "진행 중인 작업"), ("events", "오늘 일정"), ("billing", "가장 가까운 결제")):
             box, inner = panel(title)
+            # A wrapped title in one box must not push its value out of line with the others.
+            inner.addStretch()
             value = label("—", "metricValue")
             inner.addWidget(value)
-            self.metrics[key] = value
+            note = label("오늘 기준" if key == "events" else "", "metricNote")
+            inner.addWidget(note)
+            self.metrics[key], self.metric_notes[key] = value, note
             metrics.addWidget(box, 1)
         layout.addLayout(metrics)
         grid = QGridLayout()
         grid.setSpacing(16)
         quotas, quota_layout = panel("AI 한도 요약", "주간 잔여량을 먼저 확인하세요")
-        self.overview_quotas = {}
+        self.overview_quotas, self.overview_bars = {}, {}
         for key, info in SERVICES.items():
+            stack = QVBoxLayout()
+            stack.setSpacing(2)
             row = QHBoxLayout()
             row.addWidget(label(info[0], "overviewName"), 1)
             value = label("조회 전", "overviewValue")
             value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             row.addWidget(value)
-            self.overview_quotas[key] = value
-            quota_layout.addLayout(row)
+            stack.addLayout(row)
+            bar = QProgressBar()
+            bar.setObjectName("overviewBar")
+            bar.setProperty("service", key)
+            bar.setRange(0, 1000)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(4)
+            policy = bar.sizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            bar.setSizePolicy(policy)
+            stack.addWidget(bar)
+            self.overview_quotas[key], self.overview_bars[key] = value, bar
+            quota_layout.addLayout(stack)
         quota_layout.addStretch()
         details = QPushButton("모든 한도 보기  →")
         details.setObjectName("desktopTextButton")
@@ -307,25 +338,51 @@ class DesktopWindow(Widget):
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 4, 0)
-        layout.setSpacing(12)
-        self.billing_labels = {}
-        self.billing_plans = {}
+        layout.setSpacing(14)
+        box, inner = panel("결제 요약")
+        self.billing_summary = label("", "billingSummary")
+        inner.addWidget(self.billing_summary)
+        layout.addWidget(box)
+        self.billing_grid = QGridLayout()
+        self.billing_grid.setSpacing(14)
+        self.billing_cards, self.billing_plans, self.billing_dates = {}, {}, {}
+        self.billing_notes, self.billing_buttons = {}, {}
         for key, info in SERVICES.items():
-            box, inner = panel(info[0])
+            box = QFrame()
+            box.setObjectName("desktopPanel")
+            stack = QVBoxLayout(box)
+            stack.setContentsMargins(20, 18, 20, 18)
+            stack.setSpacing(10)
+            head = QHBoxLayout()
+            head.setSpacing(10)
+            logo = label("", "badge")
+            logo.setFixedSize(34, 34)
+            logo.setAlignment(Qt.AlignCenter)
+            logo.setPixmap(QIcon(str(logo_asset(key))).pixmap(QSize(26, 26), self.devicePixelRatioF()))
+            logo.setAccessibleName(info[0] + " 로고")
+            head.addWidget(logo)
+            names = QVBoxLayout()
+            names.setSpacing(2)
+            names.addWidget(label(info[0], "serviceTitle"))
             self.billing_plans[key] = label("플랜 확인 중", "caption")
-            inner.addWidget(self.billing_plans[key])
-            row = QHBoxLayout()
-            value = label("다음 결제일 미설정", "billingValue")
-            row.addWidget(value, 1)
+            names.addWidget(self.billing_plans[key])
+            head.addLayout(names, 1)
+            stack.addLayout(head)
+            self.billing_dates[key] = label("미설정", "billingDate")
+            stack.addWidget(self.billing_dates[key])
+            foot = QHBoxLayout()
+            self.billing_notes[key] = label("", "caption")
+            foot.addWidget(self.billing_notes[key], 1)
             edit = QPushButton("결제일 설정")
             edit.setAccessibleName(info[0] + " 결제일 설정")
             edit.clicked.connect(lambda checked=False, service=key: self.edit_billing(service))
-            row.addWidget(edit)
-            inner.addLayout(row)
-            self.billing_labels[key] = value
-            layout.addWidget(box)
+            foot.addWidget(edit)
+            stack.addLayout(foot)
+            self.billing_cards[key], self.billing_buttons[key] = box, edit
+        layout.addLayout(self.billing_grid)
         layout.addWidget(label("결제일은 직접 설정한 예정일입니다. 한도 초기화 시각과 별도로 관리합니다.", "caption"))
         layout.addStretch()
+        self.billing_columns = 0
         self.billing_page = scroll_page(content)
         self.pages.addWidget(self.billing_page)
 
@@ -369,15 +426,12 @@ class DesktopWindow(Widget):
         if not self.desktop_ready or self.collapsed:
             return
         columns = 2 if self.width() >= 1060 else 1
-        if columns == self.quota_columns:
-            return
-        self.quota_columns = columns
-        for card in self.cards.values():
-            self.quota_grid.removeWidget(card)
-        for index, card in enumerate(self.cards.values()):
-            self.quota_grid.addWidget(card, index // columns, index % columns)
-        self.quota_grid.setColumnStretch(0, 1)
-        self.quota_grid.setColumnStretch(1, 1 if columns == 2 else 0)
+        if columns != self.quota_columns:
+            self.quota_columns = columns
+            place(self.quota_grid, list(self.cards.values()), columns)
+        if columns != self.billing_columns:
+            self.billing_columns = columns
+            place(self.billing_grid, list(self.billing_cards.values()), columns)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -408,26 +462,63 @@ class DesktopWindow(Widget):
                 self.overview_minute = minute
                 self.update_dashboard()
 
-    def update_dashboard(self):
+    def update_dashboard(self, today=None):
         if not self.desktop_ready:
             return
-        self.metrics["accounts"].setText(f"{sum(bool(c.data) for c in self.cards.values())} / {len(self.cards)}")
+        today = today or datetime.now().astimezone().date()
+        lowest = None
         for key, card in self.cards.items():
             value = self.pet_quotas.get(key, "조회 전")
             if value == "조회 실패" and card.data:
                 value = card.amount.text() + " · 조회 실패"
+            remaining = card.data[0]["remaining"] if card.data else None
             self.overview_quotas[key].setText(value)
             self.overview_quotas[key].setToolTip(card.summary_label.text() + ("\n" + card.status.text() if not card.status.isHidden() else ""))
-            record = self.billing_record(key)
-            self.billing_labels[key].setText(payment_summary(record) + (" · " + PERIODS[record["period"]] if record else ""))
-            self.billing_plans[key].setText(card.plan.text())
-        self.metrics["agents"].setText(str(len(self.agent_activity)))
-        today = datetime.now().astimezone().date()
-        dates = [next_payment(self.billing_record(key), today) for key in SERVICES]
-        upcoming = [day for day in dates if day and day >= today]
-        self.metrics["billing"].setText(min(upcoming).strftime("%m.%d") if upcoming else "확인 필요" if any(dates) else "미설정")
+            bar = self.overview_bars[key]
+            bar.setVisible(remaining is not None)
+            bar.setValue(round(remaining * 10) if remaining is not None else 0)
+            bar.setAccessibleName(f"{SERVICES[key][0]} {value}")
+            for item in (self.overview_quotas[key], bar):
+                set_risk(item, risk_level(remaining))
+            if remaining is not None and (lowest is None or remaining < lowest[0]):
+                lowest = (remaining, key, card.data[0]["label"])
+        self.metrics["lowest"].setText(f"{lowest[0]:g}%" if lowest else "—")
+        self.metric_notes["lowest"].setText(f"{SERVICES[lowest[1]][0]} · {lowest[2]}" if lowest else "조회 전")
+        set_risk(self.metrics["lowest"], risk_level(lowest[0]) if lowest else "")
+        waiting = sum(task["status"] == "waiting" for task in self.agent_activity)
+        active = len(self.agent_activity)
+        self.metrics["agents"].setText(str(active))
+        self.metric_notes["agents"].setText(f"승인 대기 {waiting}건" if waiting else f"실행 중 {active}건" if active else "실행 중인 작업 없음")
+        set_risk(self.metric_notes["agents"], "low" if waiting else "")
+        self.update_billing_page(today)
         self.render_schedule()
         self.render_agents()
+
+    def update_billing_page(self, today):
+        records = {key: self.billing_record(key) for key in SERVICES}
+        dates = {key: next_payment(records[key], today) for key in SERVICES}
+        for key, card in self.cards.items():
+            self.billing_plans[key].setText(card.plan.text())
+            day = dates[key]
+            self.billing_dates[key].setText(f"{day:%m/%d}" if day else "미설정")
+            self.billing_notes[key].setText(f"{due_text(day, today)} · {PERIODS[records[key]['period']]}" if day else "결제 기준일과 주기를 입력하세요")
+            self.billing_buttons[key].setText("수정" if day else "결제일 설정")
+        upcoming = {key: day for key, day in dates.items() if day and day >= today}
+        soon = min(upcoming, key=upcoming.get) if upcoming else None
+        count, total = sum(bool(day) for day in dates.values()), len(SERVICES)
+        if soon:
+            self.metrics["billing"].setText(f"{upcoming[soon]:%m.%d}")
+            self.metric_notes["billing"].setText(due_text(upcoming[soon], today))
+            self.billing_summary.setText(f"설정된 구독 {count} / {total} · 다음 결제 {upcoming[soon]:%m/%d} ({due_text(upcoming[soon], today)}) · {SERVICES[soon][0]}")
+        elif count:
+            self.metrics["billing"].setText("확인 필요")
+            self.metric_notes["billing"].setText("지난 결제일 수정 필요")
+            self.billing_summary.setText(f"설정된 구독 {count} / {total} · 결제일 확인 필요")
+        else:
+            self.metrics["billing"].setText("미설정")
+            self.metric_notes["billing"].setText("구독·결제에서 설정")
+            self.billing_summary.setText("각 서비스의 결제일 설정에서 결제 기준일과 주기를 입력하면 다음 결제 예정일과 남은 날짜를 표시합니다. "
+                                         "결제일 자동 조회·자동 결제는 하지 않습니다.")
 
     def render_schedule(self):
         now = datetime.now().astimezone()
@@ -535,6 +626,12 @@ class DesktopWindow(Widget):
         sidebar = "#eef0f4" if theme == "light" else "#1e222c"
         selected = "#dfeaff" if theme == "light" else "#2b3b55"
         accent = "#3268ce" if theme == "light" else "#9bbcff"
+        # Widget's generic risk rules lose to the ID selectors below, so repeat them per desktop widget.
+        service_bars = "".join(f"QProgressBar#overviewBar[service='{key}']::chunk {{background:{c[key]};}} " for key in SERVICES)
+        risk_rules = "".join(
+            f"QLabel#metricValue[risk='{risk}'], QLabel#metricNote[risk='{risk}'], QLabel#overviewValue[risk='{risk}'] {{color:{c[token]};}} "
+            f"QProgressBar#overviewBar[risk='{risk}']::chunk {{background:{c[token]};}} "
+            for risk, token in (("low", "warning"), ("critical", "danger")))
         self.setStyleSheet(self.styleSheet() + f"""
             QWidget#window {{background:{canvas};}}
             QFrame#surface {{background:{canvas}; border:0; border-radius:0;}}
@@ -550,6 +647,7 @@ class DesktopWindow(Widget):
             QFrame#desktopPanel {{background:{c['card']}; border:1px solid {c['border']}; border-radius:16px;}}
             QLabel#panelTitle {{font-size:13px; font-weight:650;}}
             QLabel#metricValue {{font-size:27px; font-weight:700; color:{accent};}}
+            QLabel#metricNote {{font-size:11px; color:{c['muted']};}}
             QLabel#overviewName {{font-size:12px; padding:5px 0;}}
             QLabel#overviewValue {{font-size:12px; font-weight:650; color:{accent};}}
             QLabel#scheduleSummary {{font-size:13px; padding:4px 0;}}
@@ -557,9 +655,10 @@ class DesktopWindow(Widget):
             QPushButton#desktopPrimary {{background:{accent}; color:{c['card']}; font-weight:650; padding:8px 16px;}}
             QPushButton#agentTask {{text-align:left; padding:14px; background:{canvas}; border:1px solid {c['border']}; border-radius:12px; font-size:13px;}}
             QPushButton#agentTask[waiting='true'] {{border-color:{c['warning']};}}
-            QLabel#billingValue {{font-size:14px; font-weight:550;}}
+            QLabel#billingSummary {{font-size:13px;}}
+            QLabel#billingDate {{font-size:24px; font-weight:700;}}
             QWidget#card {{border-radius:16px;}}
-        """)
+        """ + service_bars + risk_rules)
         self.update_navigation_icons()
 
     def update_navigation_icons(self):
