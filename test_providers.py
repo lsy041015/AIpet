@@ -3,11 +3,11 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 import providers
-from providers import parse_codex, parse_antigravity, parse_copilot, parse_claude, claude_reset, percent, reset_text, QuotaError
+from providers import parse_codex, parse_antigravity, parse_copilot, parse_claude, claude_reset, claude_reset_moment, percent, reset_text, QuotaError
 
 
 class QuotaTests(unittest.TestCase):
@@ -130,6 +130,22 @@ class QuotaTests(unittest.TestCase):
     def test_date_only_reset_does_not_invent_a_time(self):
         self.assertEqual(reset_text("2026-10-01"), "10/01 초기화 · 시각 미제공")
         self.assertEqual(reset_text("invalid"), "초기화 시각 미제공")
+
+    def test_rows_carry_exact_reset_timestamp(self):
+        bucket = {"primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 1790000000}}
+        self.assertEqual(parse_codex({"rateLimits": bucket})[0]["reset_at"], 1790000000.0)
+        row = parse_antigravity("Gemini Models\tWeekly Limit Remaining\t93%\t2026-10-07T02:26:00Z")[0]
+        self.assertEqual(row["reset_at"], datetime(2026, 10, 7, 2, 26, tzinfo=timezone.utc).timestamp())
+        copilot = parse_copilot({"quota_snapshots": {"chat": {"percent_remaining": 50, "reset_date": "2026-11-01"}}})
+        self.assertIsNone(copilot[0]["reset_at"])
+        now = datetime(2026, 10, 2, 19, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+        self.assertEqual(claude_reset_moment("Oct 6, 2pm (Asia/Seoul)", now).timestamp(),
+                         datetime(2026, 10, 6, 14, tzinfo=ZoneInfo("Asia/Seoul")).timestamp())
+        self.assertIsNone(claude_reset_moment("tomorrow", now))
+        rows = parse_claude({"is_error": False, "result": "Current session: 1% used · resets tomorrow\n"
+                             "Current week (all models): 5% used"})
+        self.assertEqual([row["reset_at"] for row in rows], [None, None])
+        self.assertIn("reset_at", parse_claude({"is_error": False, "result": "Current session: 1% used · resets Oct 6, 2pm (Asia/Seoul)"})[0])
 
 
 if __name__ == "__main__":
