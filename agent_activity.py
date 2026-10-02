@@ -410,6 +410,8 @@ class ActivityTracker:
                 new_task = item['started'] > self.last_scan
                 if observed or new_task:
                     notices.append(item)
+            elif self.ready and status == 'waiting' and (not old or old['status'] != 'waiting'):
+                notices.append(item)
             self.previous[key] = item
         self.ready = True
         self.last_scan = now
