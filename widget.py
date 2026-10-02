@@ -1029,8 +1029,9 @@ class QuotaRow(QFrame):
         self.bar.setVisible(remaining is not None)
         self.bar.setValue(round(remaining * 10) if remaining is not None else 0)
         for item in (self.amount, self.bar):
-            set_risk(item, risk_level(remaining))
-        self.setToolTip("\n".join(([card.error] if card.error and rows else []) + tip))
+            # A failed lookup with nothing to show is flagged like a low quota.
+            set_risk(item, "low" if card.error and not rows else risk_level(remaining))
+        self.setToolTip("\n".join(([card.error] if card.error else []) + tip))
         self.setAccessibleName(f"{SERVICES[self.key][0]} {amount} · 카드로 자세히 보기")
 
     def mouseReleaseEvent(self, event):

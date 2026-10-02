@@ -984,6 +984,10 @@ class WidgetTests(unittest.TestCase):
         window.received("copilot", {"rows": [{"label": "채팅", "remaining": None, "reset": "", "reset_at": None}]}, "")
         self.assertEqual(window.quota_rows["copilot"].amount.text(), "무제한")
         self.assertEqual(window.quota_rows["copilot"].amount.property("risk"), "")
+        window.received("claude_max", None, "로그인 확인 필요")
+        failed = window.quota_rows["claude_max"]
+        self.assertEqual((failed.amount.text(), failed.amount.property("risk")), ("조회 실패", "low"))
+        self.assertIn("로그인 확인 필요", failed.toolTip())
         with patch("widget.time.time", return_value=time.time() + 61 * 60):
             window.update_countdowns()
         self.assertEqual(anti.caption.text(), "Gemini · 주간 · 59분 후")
