@@ -1782,6 +1782,10 @@ class Widget(QWidget):
         self.waiting_action.setCheckable(True)
         self.waiting_action.setChecked(self.settings.value("notify/agents/waiting", True, type=bool))
         self.waiting_action.toggled.connect(lambda enabled: self.settings.setValue("notify/agents/waiting", enabled))
+        self.done_action = alerts.addAction("에이전트 작업 완료·실패 알림")
+        self.done_action.setCheckable(True)
+        self.done_action.setChecked(self.settings.value("notify/agents/done", True, type=bool))
+        self.done_action.toggled.connect(lambda enabled: self.settings.setValue("notify/agents/done", enabled))
         self.menu.addSeparator()
         opacity_panel = QWidget()
         opacity_panel.setMinimumWidth(230)
@@ -2072,7 +2076,8 @@ class Widget(QWidget):
                 if self.settings.value("notify/agents/waiting", True, type=bool):
                     self.send_notification(service_info(item['agent'])[0] + ' · 승인·입력 대기', item['label'])
                 continue
-            self.send_notification(service_info(item['agent'])[0] + (' · 작업 실패' if item['status'] == 'failed' else ' · 작업 완료'), item['label'])
+            if self.settings.value("notify/agents/done", True, type=bool):
+                self.send_notification(service_info(item['agent'])[0] + (' · 작업 실패' if item['status'] == 'failed' else ' · 작업 완료'), item['label'])
             self.restore_button.set_status(5 if item['status'] == 'failed' else 8)
         if self.restore_button.isVisible():
             if animation_row(self.restore_button) != self.restore_button.animation_state:
