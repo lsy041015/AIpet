@@ -66,7 +66,8 @@ A screen-by-screen guide (Korean) is in [docs/GUIDE.md](docs/GUIDE.md).
 ## Run
 
 Needs Ubuntu GNOME (X11), Python 3, PySide6 and the agent CLIs you want (`claude`, `codex`, `gh`, `agy`, `opencode`, ...).
-The Google OAuth helpers are vendored in `vendor/`.
+The Google OAuth helpers are vendored in `vendor/`. Login terminals need `terminator`, `x-terminal-emulator` or `gnome-terminal`.
+`rtk` is optional: when installed, CLIs run through `rtk proxy`; otherwise they run directly.
 
 ```bash
 git clone https://github.com/lsy041015/AIpet.git ~/ai-quota-widget

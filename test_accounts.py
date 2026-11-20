@@ -222,12 +222,28 @@ class LoginTests(Isolated):
                     return "/bin/" + name
                 raise providers.QuotaError("missing")
             return executable
-        with patch("accounts.executable", found("terminator")):
+        with patch("accounts.executable", found("terminator")), patch("providers.executable", found()):
             self.assertEqual(accounts.terminal_command("T", ["claude", "auth", "login"]),
                              ("/bin/terminator", ["--no-dbus", "--title", "T", "-x", "/bin/rtk", "proxy", "/bin/claude", "auth", "login"]))
         with patch("accounts.executable", found("gnome-terminal")):
             self.assertEqual(accounts.terminal_command("T", ["claude"])[1][:3], ["--title", "T", "--"])
-        with patch("accounts.executable", found()), self.assertRaises(providers.QuotaError):
+        with patch("accounts.executable", found()), self.assertRaisesRegex(providers.QuotaError, "터미널"):
+            accounts.terminal_command("T", ["claude"])
+
+    def test_rtk_is_optional_and_missing_cli_is_named(self):
+        def found(*names):
+            def executable(name):
+                if name in names:
+                    return "/bin/" + name
+                raise providers.QuotaError(name + " 설치·로그인 필요")
+            return executable
+        with patch("accounts.executable", found("terminator")), patch("providers.executable", found("claude")):
+            self.assertEqual(accounts.terminal_command("T", ["claude", "auth", "login"])[1][-3:], ["/bin/claude", "auth", "login"])
+            self.assertEqual(providers.cli(["claude", "x"]), ["/bin/claude", "x"])
+        with patch("providers.executable", found("claude", "rtk")):
+            self.assertEqual(providers.cli(["claude"]), ["/bin/rtk", "proxy", "/bin/claude"])
+        with patch("accounts.executable", found("terminator")), patch("providers.executable", found("rtk")), \
+             self.assertRaisesRegex(providers.QuotaError, "claude 명령 없음"):
             accounts.terminal_command("T", ["claude"])
 
 
