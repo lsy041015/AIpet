@@ -324,6 +324,49 @@ def parse_claude(data):
     return rows
 
 
+def claude_cached(account, now=None):
+    """Last usage the CLI cached in .claude.json (no credentials there), for when /usage prints no rows.
+
+    The CLI drops the rows when its usage request fails, e.g. a remembered 429 for the account.
+    """
+    home = Path(account["profile_dir"]) if not account.get("use_default") else Path.home()
+    try:
+        config = json.loads((home / ".claude.json").read_text())
+        cache = config["cachedUsageUtilization"]
+        if cache["accountUuid"] != config["oauthAccount"]["accountUuid"]:
+            return []
+        fetched = datetime.fromtimestamp(cache["fetchedAtMs"] / 1000).astimezone()
+        limits = cache["utilization"]["limits"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    now = now or datetime.now().astimezone()
+    rows = []
+    for limit in limits if isinstance(limits, list) else []:
+        try:
+            moment = datetime.fromisoformat(limit["resets_at"]).astimezone()
+            remaining = 100 - percent(limit["percent"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if moment <= now:
+            continue  # window already reset: the cached percent no longer applies
+        kind = limit.get("kind")
+        if kind == "session":
+            label = "현재 세션"
+        elif kind == "weekly_all":
+            label = "이번 주 · 전체 모델"
+        elif kind == "weekly_scoped":
+            model = ((limit.get("scope") or {}).get("model") or {}).get("display_name")
+            if not isinstance(model, str):
+                continue
+            label = "이번 주 · " + model[:40]
+        else:
+            continue
+        rows.append({"label": label, "remaining": remaining,
+                     "reset": moment.strftime("%m/%d %H:%M") + " 초기화 · " + fetched.strftime("%H:%M") + " 기준",
+                     "reset_at": moment.timestamp()})
+    return rows
+
+
 def claude_max_dir():
     # Profile of the former fixed "Claude · Max 5x" card; offered once as an existing login.
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wego/check-ai-claude/max"
@@ -447,11 +490,20 @@ def claude(account):
         raise QuotaError("계정 분리 확인 실패 · CLI 설정 확인")
     data = json.loads(output(["claude", "--print", "/usage", "--output-format", "json",
                               "--no-session-persistence"], env=env, timeout=25))
+    try:
+        rows = parse_claude(data)
+    except QuotaError:
+        if not isinstance(data, dict) or data.get("is_error"):
+            raise
+        # A success reply without rows means the CLI's own usage request failed (usually 429).
+        rows = claude_cached(account)
+        if not rows:
+            raise QuotaError("Claude 사용량 조회 제한(요청 과다 추정) · 자동 재시도") from None
 
     def text(key):
         value = auth.get(key)
         return value[:160] if isinstance(value, str) else ""
-    return {"rows": parse_claude(data), "plan": auth.get("subscriptionType"),
+    return {"rows": rows, "plan": auth.get("subscriptionType"),
             "org": text("orgName"), "tier": text("planTier"), "account": text("email")}
 
 

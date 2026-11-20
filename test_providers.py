@@ -125,6 +125,33 @@ class QuotaTests(unittest.TestCase):
                         providers.claude(isolated(profile))
                     self.assertEqual(output.call_count, 1)
 
+    def test_claude_rows_missing_uses_cached_usage_or_clear_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / 'max'
+            profile.mkdir()
+            auth = {'loggedIn': True, 'authMethod': 'claude.ai', 'configDirectory': str(profile)}
+            header_only = {'is_error': False, 'result': 'You are currently using your subscription to power your Claude Code usage'}
+            calls = lambda: patch('providers.output', side_effect=[json.dumps(auth), json.dumps(header_only)])
+            with calls(), self.assertRaisesRegex(providers.QuotaError, '조회 제한'):
+                providers.claude(isolated(profile))
+            limits = [{'kind': 'session', 'percent': 50, 'resets_at': '2000-01-01T00:00:00+00:00'},
+                      {'kind': 'weekly_all', 'percent': 27, 'resets_at': '2999-01-01T00:00:00+00:00'},
+                      {'kind': 'weekly_scoped', 'percent': 15, 'resets_at': '2999-01-01T00:00:00+00:00',
+                       'scope': {'model': {'display_name': 'Fable'}}}]
+            config = {'oauthAccount': {'accountUuid': 'a'},
+                      'cachedUsageUtilization': {'accountUuid': 'a', 'fetchedAtMs': 1795146398526,
+                                                 'utilization': {'limits': limits}}}
+            (profile / '.claude.json').write_text(json.dumps(config))
+            with calls():
+                rows = providers.claude(isolated(profile))['rows']
+            self.assertEqual([(r['label'], r['remaining']) for r in rows],
+                             [('이번 주 · 전체 모델', 73), ('이번 주 · Fable', 85)])  # expired session window dropped
+            self.assertIn('기준', rows[0]['reset'])
+            config['cachedUsageUtilization']['accountUuid'] = 'other'
+            (profile / '.claude.json').write_text(json.dumps(config))
+            with calls(), self.assertRaises(providers.QuotaError):
+                providers.claude(isolated(profile))
+
     def test_invalid_data_is_never_full_quota(self):
         for invalid in (float("nan"), float("inf"), -1, 101, True):
             with self.assertRaises(ValueError):
