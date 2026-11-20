@@ -1028,14 +1028,16 @@ class ComputerPet(CircleButton):
     def __init__(self, owner):
         super().__init__(owner)
         self.setFixedSize(96, 96)
+        from pixel_pet import Life
         atlas()
         self.animation_state = 0
-        self.cycles = 0
         self.status_row = 3
         self.preview_row = None
-        self.frame = 0
+        self.life = Life()  # row/frame/idle scheduler; tests seed self.life.rng
+        self.setMouseTracking(True)  # hover eyes follow the cursor
+        # Single shot, re-armed with each frame's own time: a still pose costs one wake-up every few seconds.
         self.idle = QTimer(self)
-        self.idle.setInterval(120)
+        self.idle.setSingleShot(True)
         self.idle.timeout.connect(self.tick)
         self.bubble_timer = QTimer(self)
         self.bubble_timer.setSingleShot(True)
@@ -1043,7 +1045,34 @@ class ComputerPet(CircleButton):
         self.bubble_timer.timeout.connect(self.show_bubble)
         self.bubble = PetBubble(self)
 
+    @property
+    def frame(self):
+        return self.life.frame
+
+    @frame.setter
+    def frame(self, value):
+        self.life.frame = value
+
+    def look_side(self, x):
+        return -1 if x < 36 else 1 if x > 60 else 0
+
+    def reduced(self):
+        return self.owner.reduce_motion.isChecked() and self.preview_row is None
+
+    def mode(self):
+        """How the state row plays: once as a preview, looped while held, hover reactions, or 3 cycles then idle."""
+        if self.preview_row is not None:
+            return "preview"
+        if self.dragging:
+            return "held"
+        if self.animation_state == 4:
+            return "hover"
+        if self.owner.agent_activity or self.owner.jobs or self.owner.calendar.job:
+            return "held"
+        return "status"
+
     def enterEvent(self, event):
+        self.life.look = self.look_side(event.position().x())
         super().enterEvent(event)
         self.sync_animation()
         self.bubble_timer.start()
@@ -1118,6 +1147,9 @@ class ComputerPet(CircleButton):
         super().mouseMoveEvent(event)
         if self.dragging and animation_row(self) != previous:
             self.sync_animation()
+        elif not self.dragging and not self.reduced() and self.life.look_at(self.look_side(event.position().x())):
+            self.set_frame_interval()
+            self.update()
 
     def mouseReleaseEvent(self, event):
         was_dragging = self.dragging
@@ -1128,7 +1160,7 @@ class ComputerPet(CircleButton):
 
     def sync_animation(self):
         self.animation_state = animation_row(self)
-        self.cycles = self.frame = 0
+        self.life.restart(self.animation_state, self.mode(), self.reduced())
         self.set_frame_interval()
         self.update()
 
@@ -1138,19 +1170,19 @@ class ComputerPet(CircleButton):
             self.sync_animation()
 
     def set_frame_interval(self):
-        if self.owner.reduce_motion.isChecked() and self.preview_row is None:
+        if self.reduced():
             self.idle.stop()
             return
-        row = display_row(self)
-        self.idle.setInterval(DURATIONS[row][self.frame] * (12 if row == 0 and self.preview_row is None else 1))
+        self.idle.setInterval(self.life.duration(jitter=self.preview_row is None))  # previews keep exact timing
         if self.isVisible():
             self.idle.start()
 
     def contextMenuEvent(self, event):
+        from pixel_pet import PREVIEW_ROWS
         menu = QMenu(self)
         action = menu.addAction("빠른 일정 입력")
         animations = menu.addMenu("애니메이션 미리보기")
-        previews = {animations.addAction(name): row for row, name in enumerate(ANIMATION_NAMES)}
+        previews = {animations.addAction(ANIMATION_NAMES[row]): row for row in PREVIEW_ROWS}
         chosen = menu.exec(event.globalPos())
         if chosen == action:
             if self.owner.collapsed:
@@ -1165,9 +1197,8 @@ class ComputerPet(CircleButton):
             return
         self.preview_row = row
         self.animation_state = row
-        self.cycles = 0
-        self.frame = 0
-        self.idle.start(DURATIONS[row][0])
+        self.life.play(row)
+        self.set_frame_interval()
         self.update()
 
     def showEvent(self, event):
@@ -1179,6 +1210,7 @@ class ComputerPet(CircleButton):
     def hideEvent(self, event):
         self.idle.stop()
         self.preview_row = None
+        self.life.play(0)  # come back standing, not mid-fidget
         self.bubble_timer.stop()
         self.bubble.hide()
         super().hideEvent(event)
@@ -1188,18 +1220,12 @@ class ComputerPet(CircleButton):
         if state != self.animation_state:
             self.sync_animation()
             return
-        row = display_row(self)
-        if self.owner.reduce_motion.isChecked() and self.preview_row is None:
+        if self.reduced():
             self.frame = 0
-        else:
-            self.frame = (self.frame + 1) % len(DURATIONS[row])
-            if self.frame == 0:
-                if self.preview_row is not None:
-                    self.preview_row = None
-                    self.sync_animation()
-                    return
-                if state and self.cycles < 3:
-                    self.cycles += 1
+        elif not self.life.advance(state, self.mode()):
+            self.preview_row = None
+            self.sync_animation()
+            return
         self.set_frame_interval()
         self.update()
 
