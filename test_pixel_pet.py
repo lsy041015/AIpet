@@ -39,7 +39,7 @@ class PixelPetTest(unittest.TestCase):
         dimmed = frame_image(5, 2)
         self.assertNotIn(BODY.rgb(), {dimmed.pixel(x, y) for x in range(SIZE) for y in range(SIZE)})
         self.assertEqual(frame_image(2, 0), frame_image(1, 0).mirrored(True, False))
-        self.assertEqual(atlas().width(), SIZE * 8)
+        self.assertEqual(atlas().width(), SIZE * max(map(len, DURATIONS)))
         self.assertEqual(atlas().pixel(SIZE * 4 + 48, SIZE * 4 + 80), frame_image(4, 4).pixel(48, 80))
 
 
