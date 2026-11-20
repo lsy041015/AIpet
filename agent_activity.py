@@ -306,8 +306,12 @@ def live_agent_files(claude=None):
             if not process.name.isdigit():
                 continue
             try:
-                with open(process.path + '/comm') as stream:
-                    name = stream.read().strip()
+                # Raw reads: this runs for every process each poll, and a text stream costs twice as much.
+                handle = os.open(process.path + '/comm', os.O_RDONLY)
+                try:
+                    name = os.read(handle, 64).decode('utf-8', 'replace').strip()
+                finally:
+                    os.close(handle)
                 # cursor-agent (not installed here) would be matched here and read from its own store.
                 if name not in ('agy', 'copilot', 'codex', 'claude', 'opencode'):
                     continue

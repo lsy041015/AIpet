@@ -25,7 +25,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout,
                                QLabel, QPushButton, QProgressBar, QScrollArea,
                                QFrame, QButtonGroup, QToolButton, QMenu, QSizeGrip,
-                               QGraphicsDropShadowEffect, QSlider, QWidgetAction,
+                               QGraphicsDropShadowEffect, QGraphicsScene, QSlider, QWidgetAction,
                                QInputDialog, QMessageBox, QStackedWidget, QSizePolicy, QGridLayout)
 
 from providers import KINDS, PROVIDERS, QuotaError
@@ -205,6 +205,54 @@ def paint_edge_glow(painter, rect, radius, color, strength=1.0):
         line.setAlpha(round(alpha * strength))
         painter.setPen(QPen(line, width))
         painter.drawRoundedRect(QRectF(rect).adjusted(inset, inset, -inset, -inset), radius - inset, radius - inset)
+
+
+@lru_cache(maxsize=2)
+def surface_shadow(blur, dy, rgba):
+    """Nine-slice window shadow, blurred once by QGraphicsDropShadowEffect's own filter; returns (pixmap, edge).
+
+    A live effect on the surface re-blurred and repainted every child whenever any of them changed (each clock tick).
+    The pixmap is the shadow of a small rounded surface, offset by (-blur, -blur); its middle row and column are
+    far enough from the corners to be stretched to any surface size."""
+    edge = 32 + 3 * blur + abs(dy)
+    width = height = 2 * (edge - blur) + 1
+    mask = QPixmap(width, height)
+    mask.fill(Qt.transparent)
+    p = QPainter(mask)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(Qt.black)
+    p.drawRoundedRect(QRectF(0, 0, width, height), 32, 32)  # QFrame#surface border-radius
+    p.end()
+    scene = QGraphicsScene()
+    effect = QGraphicsDropShadowEffect()
+    effect.setBlurRadius(blur)
+    effect.setColor(QColor(*rgba))
+    # Push the shadow clear of its source, then keep only the shadow. The source must stay in the rendered
+    # rect: the scene culls an item by its own bounds, not its effect's.
+    far = height + 3 * blur
+    effect.setOffset(0, dy + far)
+    scene.addPixmap(mask).setGraphicsEffect(effect)
+    image = QPixmap(width + 2 * blur, far + height + blur)
+    image.fill(Qt.transparent)
+    p = QPainter(image)
+    scene.render(p, QRectF(image.rect()), QRectF(-blur, 0, image.width(), image.height()))
+    p.end()
+    return image.copy(0, far - blur, width + 2 * blur, height + 2 * blur), edge
+
+
+def paint_surface_shadow(painter, rect, blur, dy, rgba):
+    """Stretch the nine-slice shadow around a surface rect; the centre stays under the opaque surface."""
+    image, edge = surface_shadow(blur, dy, rgba)
+    outer = rect.adjusted(-blur, -blur, blur, blur)
+    columns = ((0, edge, outer.left(), edge), (edge, 1, outer.left() + edge, outer.width() - 2 * edge),
+               (edge + 1, edge, outer.right() + 1 - edge, edge))
+    rows = ((0, edge, outer.top(), edge), (edge, 1, outer.top() + edge, outer.height() - 2 * edge),
+            (edge + 1, edge, outer.bottom() + 1 - edge, edge))
+    for sx, sw, tx, tw in columns:
+        for sy, sh, ty, th in rows:
+            if sw != 1 or sh != 1:
+                painter.drawPixmap(QRect(tx, ty, tw, th), image, QRect(sx, sy, sw, sh))
 
 
 @lru_cache(maxsize=32)
@@ -1685,12 +1733,8 @@ class Widget(QWidget):
         outer.setContentsMargins(12, 12, 12, 12)
         self.surface = QFrame()
         self.surface.setObjectName("surface")
-        # The only graphics effect: nested effects break painting, so other glows are painted.
-        shadow = QGraphicsDropShadowEffect(self.surface)
-        shadow.setBlurRadius(24)
-        shadow.setOffset(0, 4)
-        shadow.setColor(QColor(0, 0, 0, 65))
-        self.surface.setGraphicsEffect(shadow)
+        # Window shadow (blur, y offset, rgba), painted from a cached pixmap; no graphics effects, glows are painted too.
+        self.shadow = (24, 4, (0, 0, 0, 65))
         outer.addWidget(self.surface)
         self.restore_button = ComputerPet(self)
         self.restore_button.setAccessibleName("Claude 마스코트 · 클릭하여 위젯 열기")
@@ -1998,6 +2042,12 @@ class Widget(QWidget):
             self.neon_started = True
             if not self.smoke and not self.reduce_motion.isChecked() and THEMES[self.theme]["glow"]:
                 self.neon_motion.start()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.shadow is None or not self.surface.isVisible():
+            return
+        paint_surface_shadow(QPainter(self), self.surface.geometry(), *self.shadow)
 
     def refresh_activity(self):
         if self.activity_job is not None:
@@ -2391,12 +2441,10 @@ class Widget(QWidget):
         if not self.smoke:
             self.settings.setValue("theme", theme)
         neon = bool(colors["glow"])
-        effect = self.surface.graphicsEffect()
-        if effect is not None:
+        if self.shadow is not None:
             # The window's one shadow becomes a faint orange bloom on the dark wall.
-            effect.setColor(QColor(255, 106, 26, 38) if neon else QColor(0, 0, 0, 65))
-            effect.setBlurRadius(28 if neon else 24)
-            effect.setOffset(0, 0 if neon else 4)
+            self.shadow = (28, 0, (255, 106, 26, 38)) if neon else (24, 4, (0, 0, 0, 65))
+            self.update()
         accent, soft = colors["accent"], colors["accent_soft"]
         primary = (f"background:{rgba(accent, .1)}; border:1px solid {accent}; color:{colors['core']}; font-weight:650;"
                    if neon else f"background:{accent}; border:1px solid {accent}; color:{colors['card']}; font-weight:700;")

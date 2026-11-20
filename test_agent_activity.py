@@ -49,6 +49,20 @@ class ActivityTests(unittest.TestCase):
             with self.subTest(error=error), patch("agent_activity.os.scandir", side_effect=error):
                 self.assertEqual(live_agent_files(), set())
 
+    def test_live_files_come_from_agent_processes_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory)
+            for pid, name in ((10, 'codex'), (11, 'bash'), (12, 'claude')):
+                (fake / str(pid) / 'fd').mkdir(parents=True)
+                (fake / str(pid) / 'comm').write_text(name + '\n')
+                (fake / str(pid) / 'fd' / '3').symlink_to(f'/h/.codex/sessions/{pid}.jsonl')
+            (fake / 'self').mkdir()
+            real = os.scandir
+            with patch('agent_activity.os.scandir', side_effect=lambda path: real(fake if path == '/proc' else path)):
+                claude = []
+                self.assertEqual(live_agent_files(claude), {'/h/.codex/sessions/10.jsonl', '/h/.codex/sessions/12.jsonl'})
+                self.assertEqual(claude, [str(fake / '12')])
+
     def test_unchanged_logs_are_cached_but_append_and_replace_are_detected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session.jsonl"
