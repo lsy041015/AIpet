@@ -721,6 +721,10 @@ class ActivityTracker:
                 records.append(old)
         for record in records:
             item = dict(record)
+            helpers = [s for s in item.get('subagents') or () if isinstance(s, dict) and s.get('status') == 'running']
+            if item['status'] == 'done' and helpers:
+                # The main turn ended but background subagents still work: the session is still busy.
+                item['status'], item['label'] = 'running', f'서브에이전트 {len(helpers)}개 작업 중'
             key, status = item['id'], item['status']
             old = self.previous.get(key)
             if key in confirmed:

@@ -711,6 +711,25 @@ class WidgetTests(unittest.TestCase):
             self.window.received_activity([dict(task, status='cancelled') for task in tasks])
             self.assertFalse(pet.bubble.isVisible())
 
+    def test_bubble_shows_subagent_model_effort_and_can_hide_it(self):
+        self.window.toggle_collapsed()
+        pet = self.window.restore_button
+        sub = {'type': 'implementer-hard', 'model': 'opus 5.5', 'effort': 'xhigh', 'status': 'running'}
+        task = dict(id='s', agent='claude', label='서브에이전트 2개 작업 중', status='running', title='ADD',
+                    started=datetime.now().timestamp() - 60, updated=2, target='/tmp/test', model='opus 5.5',
+                    effort='medium', subagents=[sub, dict(sub, type='reviewer')])
+        with patch.object(pet, 'underMouse', return_value=False):
+            self.window.received_activity([task])
+            text = pet.bubble.text.text()
+            self.assertIn('서브에이전트 2 · opus 5.5 xhigh ×2', text)
+            self.assertIn('opus 5.5 · medium', text)
+            self.window.settings.setValue("pet/show_models", False)
+            pet.show_activity()
+            text = pet.bubble.text.text()
+            self.assertNotIn('xhigh', text)
+            self.assertNotIn('medium', text)
+            self.window.settings.setValue("pet/show_models", True)
+
     def test_unknown_agents_never_raise_and_opencode_is_read(self):
         from widget import ActivityFetch, service_info, session_title
         from agent_windows import agent_pids

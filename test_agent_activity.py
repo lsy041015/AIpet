@@ -129,6 +129,19 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(len(notices), 1)
         self.assertEqual(tracker.update([], 120), ([], []))
 
+    def test_done_session_with_running_subagents_stays_active(self):
+        tracker = ActivityTracker()
+        sub = {'type': 'reviewer', 'description': 'x', 'model': 'opus 5.5', 'effort': 'xhigh', 'status': 'running'}
+        base = dict(id='s', agent='claude', status='done', label='완료', started=0, updated=100, target='s',
+                    model='opus 5.5', effort='medium')
+        tracker.update([dict(base, status='running')], 100)
+        active, notices = tracker.update([dict(base, subagents=[sub, dict(sub)])], 105)
+        self.assertEqual([x['status'] for x in active], ['running'])
+        self.assertEqual(active[0]['label'], '서브에이전트 2개 작업 중')
+        self.assertEqual(notices, [])
+        active, notices = tracker.update([dict(base, subagents=[])], 110)
+        self.assertEqual((active, len(notices)), ([], 1))
+
     def test_tracker_elapsed_terminal_and_missing_records(self):
         tracker = ActivityTracker()
         task = dict(id='a', agent='codex', status='done', label='완료', started=10, updated=20, target='x')
