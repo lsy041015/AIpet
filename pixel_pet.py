@@ -1,47 +1,68 @@
-"""Procedural pixel mascot: an orange blocky creature with a neon glow."""
+"""Procedural pixel mascot: the orange Claude critter drawn cell by cell (12x8 base grid, 6 px cells)."""
 from functools import lru_cache
 from PySide6.QtCore import Qt, QPointF
 from PySide6.QtGui import QImage, QPainter, QColor, QPen, QRadialGradient
 
-# Idle (row 0) runs at 12x these values when live, so its blink stays short.
-DURATIONS = ((300, 250, 300, 250, 20, 200), (83,)*8, (83,)*8,
-             (120, 100, 100, 100, 100, 160), (110, 90, 120, 90, 150), (120,)*7+(300,),
-             (100, 83, 83, 400, 83, 83, 83, 83, 400, 140), (90, 90, 90, 90, 140, 90), (110, 90, 120, 90, 120, 240))
-ANIMATION_NAMES = ("기본 대기", "오른쪽 이동", "왼쪽 이동", "인사", "점프", "실패", "확인 대기", "작업 중", "결과 확인")
-
-SIZE, PX, GROUND, WIDTH, LEG = 96, 6, 88, 11, 3  # frame px, px per cell, feet baseline, body cells, leg cells
-BODY, SHADE, EYE = QColor("#D97757"), QColor("#BF6649"), QColor("#2B1A14")
+SIZE, PX, GROUND, COLS = 96, 6, 13, 16  # frame px, px per cell, grid row of the feet, grid columns
+BODY, SHADE, EYE = QColor("#D97757"), QColor("#B4593B"), QColor("#000000")
 GLOW, BANG = QColor("#ff6a1a"), QColor("#ffb454")
-LID, LID_EDGE = QColor("#9a9a9a"), QColor("#6c6c6c")
-LEGS = (1, 3, 7, 9)  # two left, two right, wider middle gap
-EYES = (3, 7)
-ARMS = {"up": ((0, 0), (0, 1), (1, -1), (1, 0)), "wave": ((0, 1), (0, 2), (1, 0), (1, 1))}  # (cells outward, row)
 
-BASE = dict(dy=0, sink=0, lean=0, h=6, wide=0, legs=(0, 0, 0, 0), arm_l="mid", arm_r="mid",
-            eyes="open", look=0, eye_dy=0, dim=False, bang=False, laptop=False)
-UP = dict(arm_l="up", arm_r="up")
-HAPPY = dict(eyes="happy")
-STEP = [dict(legs=(1, 0, 1, 0), sink=-1), {}, dict(legs=(0, 1, 0, 1), sink=-1), {}]
-FAIL = dict(dim=True, arm_l="down", arm_r="down")
-LOOK = [(0, 1), (-3, 1), (-6, 1), (-6, 1), (-3, 0), (0, 0), (3, 1), (6, 1), (6, 1), (0, 0)]
-WORK = dict(laptop=True, eye_dy=2, sink=LEG * PX - 4)
+# 'o' body, 'd' dark orange, '#' eye, '-' thin closed eye on body, '!' alert. Rows are bottom-aligned on GROUND.
+TOP, EYES, ARM, LEG = "..oooooooo..", "..o#oooo#o..", "oooooooooooo", "..o.o..o.o.."
+STAND = (TOP, EYES, ARM, ARM, TOP, TOP)
+BASE_POSE = STAND + (LEG, LEG)
+SQUASH = (TOP, "ooo#oooo#ooo", ARM, TOP, LEG, LEG)  # 4-row body, 2 rows lower, arms and eyes drop
+TUCKED = STAND + (LEG,)
+CHEER = ("o.oooooooo.o", "o.o##oo##o.o", ARM, ARM, TOP, TOP)  # both arms up, happy squint
+FLAT = "..o--oo--o.."
+ALERT = ("..........!.", "..........!.", "", "..........!.", "")
+
+
+def F(rows, x=2, lift=0, bang=False, dim=False):
+    """One frame: grid rows, grid column of rows[i][0], cells raised off the ground."""
+    return dict(rows=(ALERT if bang else ()) + tuple(rows), x=x, lift=lift, dim=dim)
+
+
+WALK_BODY = (TOP, "..oo#dooo#..", "ooooooooooo.", "ooooooooooo.", TOP, TOP)  # 3/4 view facing right
+WALK_LEGS = (("..o.o..o.o..", ".o..o.oo.o..", ".o....o...o."), ("..oo.o.o.o..", "..o..o.o.o..", "......o..o.."),
+             ("...o.o..o...", "...o.o..o..."), ("..o.o..o.o..", "..oo....o..."), (".o.oo..o.oo.", ".o.....o...."))
+WAVE_TOP = "...oooooooo.."  # wave rows start one column left to make room for the raised arm
+WAVE_BODY = (WAVE_TOP, "...o##ooodo..", ".oooooooddo..", ".oooooooooo..", WAVE_TOP, WAVE_TOP, "...o.o..o.o..", "...o.o..o.o..")
+WAVE_STUB = ".........o..."
+LOOK = ((1, EYES), (1, "..o#dooo#d.."), (0, "..o#dooo#d.."), (0, "..#dooo#do.."), (2, "oo#dooo#dooo"),
+        (2, "ooo#oooo#ooo"), (1, "..o#dooo#d.."), (1, EYES))  # (body row, eye row) each held 3 frames
+WORK_TOP, WORK_EYE = "...oooooooooo....", "...ooo#ooo#oo...."
+WORK_BODY = (WORK_TOP, WORK_EYE, WORK_EYE, ".oooooooooooo...d", ".oooooooooooo..dd",
+             "...oooooooooo.dd.")  # sitting 3/4 view, laptop lid rising front-right
+TYPE_DOWN, TYPE_UP, TOUCH = "..oooo.oooooodd..", "..oooo.oooo.ddd..", "...ooooooooooodd."
+
+
+def _look(row, line, bang):
+    rows = [TOP, TOP] + list(STAND[2:]) + [LEG, LEG]
+    rows[row] = line
+    return F(rows, bang=bang)
+
+
 POSES = (
-    [{}, dict(sink=1), {}, dict(sink=1), dict(eyes="blink"), {}],
-    [dict(s, look=2 * PX, lean=2, arm_l="none") for s in STEP * 2],
+    [F(BASE_POSE), F((TOP, TOP) + BASE_POSE[2:]), F(BASE_POSE)],
+    [F(WALK_BODY + legs) for legs in WALK_LEGS],
     None,  # mirrored walk right
-    [dict(sink=4, h=5, wide=1), dict(HAPPY, arm_r="up"), dict(HAPPY, arm_r="wave"), dict(HAPPY, arm_r="up"),
-     dict(HAPPY, arm_r="wave"), dict(HAPPY)],
-    [dict(sink=4, h=5, wide=1), dict(UP, dy=-10, sink=-2), dict(UP, eyes="happy", dy=-16), dict(dy=-7, sink=-2), dict(sink=4, h=5, wide=1)],
-    [dict(UP, dy=-3), dict(FAIL, eyes="x"), dict(FAIL, eyes="x", sink=3), dict(FAIL, eyes="x", h=5, sink=5),
-     dict(FAIL, eyes="flat", h=5, wide=1, sink=8), dict(FAIL, eyes="flat", h=4, wide=1, sink=10),
-     dict(FAIL, eyes="x", h=5, wide=1, sink=8), dict(FAIL, eyes="flat", h=4, wide=1, sink=10)],
-    [dict(look=look, bang=bool(bang), sink=1 if i in (3, 8) else 0, eyes="blink" if i == 9 else "open")
-     for i, (look, bang) in enumerate(LOOK)],
-    [dict(WORK, arm_l=-1, arm_r=1), dict(WORK, arm_l=1, arm_r=-1), dict(WORK, arm_l=-1, arm_r=1),
-     dict(WORK, arm_l=1, arm_r=-1), dict(WORK, eyes="blink"), dict(WORK, arm_l=1, arm_r=-1)],
-    [dict(HAPPY, sink=4), dict(UP, eyes="happy", dy=-6, sink=-2), dict(HAPPY, arm_l="wave", arm_r="wave", dy=-10),
-     dict(UP, eyes="happy", dy=-5), dict(HAPPY, sink=4), dict(HAPPY)],
+    [F(BASE_POSE), F(SQUASH),
+     F(("...........oo", "..........oo.", TOP, EYES, "oooooooooo..", "oooooooooo..", TOP, TOP, TOP, LEG, LEG)),
+     *[F((hand, WAVE_STUB, WAVE_STUB) + WAVE_BODY, x=1) for hand in (".........oo..", "........oo...") * 3],
+     F(WAVE_BODY[:1] + ("...o##ooodooo", ".oooooooddooo") + WAVE_BODY[3:], x=1), F(BASE_POSE)],
+    [F(SQUASH), F(TUCKED, lift=2), F(TUCKED, lift=3), F(TUCKED, lift=2), F(SQUASH), F(BASE_POSE)],
+    [F(BASE_POSE), F((TOP, FLAT) + BASE_POSE[2:], dim=True), F((TOP, FLAT, ARM, ARM, TOP, LEG), dim=True),
+     F((TOP, FLAT, ARM, ARM), dim=True)],
+    [_look(row, line, i % 2 == 0) for i, (row, line) in enumerate(LOOK)],
+    [F(WORK_BODY + (TYPE_DOWN,), x=-1), F(WORK_BODY[:-1] + (TOUCH, TYPE_UP), x=-1), F(WORK_BODY + (TYPE_UP,), x=-1)],
+    [F(BASE_POSE), F(SQUASH), F(CHEER + (LEG,), lift=2), F(CHEER + (LEG,), lift=3), F(CHEER + (LEG,), lift=2),
+     F((TOP, "ooo##oo##ooo", ARM, TOP, LEG, LEG)), F(CHEER + (LEG, LEG)), F(BASE_POSE)],
 )
+# Idle (row 0) runs at 12x these values when live: ~3 s still, a one-frame (84 ms) blink, ~2 s still.
+DURATIONS = ((250, 7, 167), (83,)*5, (83,)*5, (166,) + (83,)*9 + (166,), (83, 83, 166, 83, 83, 83),
+             (166, 83, 83, 664), (249,)*8, (83,)*3, (83, 83, 83, 166, 83, 83, 249, 166))
+ANIMATION_NAMES = ("기본 대기", "오른쪽 이동", "왼쪽 이동", "인사", "점프", "실패", "확인 대기", "작업 중", "결과 확인")
 
 
 def _dim(color):
@@ -49,55 +70,27 @@ def _dim(color):
     return QColor.fromHsv(h, s // 3, v * 3 // 4, a)
 
 
-def _draw(p, s):
-    P, w, h = PX, WIDTH + 2 * s["wide"], s["h"]
-    body, shade = (_dim(BODY), _dim(SHADE)) if s["dim"] else (BODY, SHADE)
-    ground = GROUND + s["dy"]
-    bottom = ground - LEG * P + s["sink"]
-    top, left = bottom - h * P, SIZE // 2 - w * P // 2
-    glow = QRadialGradient(QPointF(SIZE / 2, top + h * P / 2), 48)
-    alpha = 45 if s["dim"] else 110
+def cells(frame):
+    """(column, row, char) for every painted cell of a frame spec."""
+    top = GROUND + 1 - frame["lift"] - len(frame["rows"])
+    return [(frame["x"] + c, top + r, ch) for r, line in enumerate(frame["rows"])
+            for c, ch in enumerate(line) if ch != "."]
+
+
+def _draw(p, frame):
+    body, shade = (_dim(BODY), _dim(SHADE)) if frame["dim"] else (BODY, SHADE)
+    colors = {"o": body, "-": body, "d": shade, "#": EYE, "!": BANG}
+    painted = cells(frame)
+    xs, ys = [x for x, _, ch in painted if ch != "!"], [y for _, y, ch in painted if ch != "!"]
+    glow = QRadialGradient(QPointF((min(xs) + max(xs) + 1) * PX / 2, (min(ys) + max(ys) + 1) * PX / 2), 48)
+    alpha = 45 if frame["dim"] else 110
     for stop, a in ((0, alpha), (.45, alpha * 2 // 5), (1, 0)):
         glow.setColorAt(stop, QColor(GLOW.red(), GLOW.green(), GLOW.blue(), a))
     p.fillRect(0, 0, SIZE, SIZE, glow)
-    if not s["laptop"]:
-        for i, column in enumerate(LEGS):
-            x = left + (column + s["wide"]) * P
-            p.fillRect(x, bottom, P, ground - s["legs"][i] * P - bottom, shade)
-    left += s["lean"]
-    p.fillRect(left, top, w * P, h * P, body)
-    p.fillRect(left, bottom - 2, w * P, 2, shade)
-    for side, arm in ((0, s["arm_l"]), (1, s["arm_r"])):
-        edge = left + w * P if side else left - P
-        out = P if side else -P
-        if arm in ARMS:
-            for dx, row in ARMS[arm]:
-                p.fillRect(edge + dx * out, top + row * P, P, P, body)
-        elif arm != "none":
-            y = top + (h - 2) // 2 * P + (P if arm == "down" else 0) + (arm if isinstance(arm, int) else 0)
-            p.fillRect(edge, y, P, 2 * P, body)
-            p.fillRect(edge, y + 2 * P - 2, P, 2, shade)
-    for column in EYES:
-        x, y = left + (column + s["wide"]) * P + s["look"], top + P + s["eye_dy"]
-        cells = {"open": ((0, 0), (0, 1)), 
-                 "x": ((-1, 0), (1, 0), (0, 1), (-1, 2), (1, 2))}.get(s["eyes"], ())
-        for cx, cy in cells:
-            p.fillRect(x + cx * P, y + cy * P, P, P, EYE)
-        if s["eyes"] == "happy":  # thin ^ from 4px blocks
-            for step in range(-2, 3):
-                p.fillRect(x + 1 + 3 * step, y + 2 + 3 * abs(step), 4, 4, EYE)
-        if s["eyes"] in ("blink", "flat"):
-            p.fillRect(x - (P // 2 if s["eyes"] == "flat" else 0), y + P, P * (2 if s["eyes"] == "flat" else 1), 2, EYE)
-    if s["bang"]:
-        p.fillRect(SIZE // 2 - 2, top - 26, 4, 12, BANG)
-        p.fillRect(SIZE // 2 - 2, top - 11, 4, 4, BANG)
-    if s["laptop"]:
-        # Lid seen from behind, sitting on a thin base in front of the mascot.
-        lid = (SIZE // 2 - 5 * P, ground - 20, 10 * P, 16)
-        p.fillRect(*lid, LID_EDGE)
-        p.fillRect(lid[0] + 2, lid[1] + 2, lid[2] - 4, lid[3] - 2, LID)
-        p.fillRect(SIZE // 2 - 2, lid[1] + 7, 4, 4, LID.lighter(125))
-        p.fillRect(SIZE // 2 - 6 * P, ground - 4, 12 * P, 4, LID_EDGE)
+    for x, y, ch in painted:
+        p.fillRect(x * PX, y * PX, PX, PX, colors[ch])
+        if ch == "-":
+            p.fillRect(x * PX, y * PX + 3, PX, 2, EYE)
 
 
 @lru_cache(maxsize=None)
@@ -107,7 +100,7 @@ def frame_image(row, frame):
     image = QImage(SIZE, SIZE, QImage.Format_ARGB32_Premultiplied)
     image.fill(Qt.transparent)
     p = QPainter(image)
-    _draw(p, dict(BASE, **POSES[row][frame]))
+    _draw(p, POSES[row][frame])
     p.end()
     return image
 
