@@ -23,8 +23,13 @@ def agent_pids(agent, target):
                 # Claude keeps no transcript open; match the CLI by its project working directory.
                 matches = ((name == 'claude' or any(a.rsplit(b'/', 1)[-1] == b'claude' for a in args[:2]))
                            and claude_project(os.readlink(process / 'cwd')) == Path(target).parent.name)
-            else:
+            elif agent == 'opencode':
+                matches = 'opencode' in name
+            elif agent == 'codex':
                 matches = name in ('codex', 'codex-desktop')
+            else:
+                # An agent without a rule must not focus another agent's window.
+                matches = False
             if not matches:
                 continue
             fallback.add(pid)
