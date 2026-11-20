@@ -125,6 +125,17 @@ class QuotaTests(unittest.TestCase):
                         providers.claude(isolated(profile))
                     self.assertEqual(output.call_count, 1)
 
+    def test_claude_status_failure_is_not_reported_as_logged_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory)
+            logged_out = json.dumps({'loggedIn': False, 'authMethod': 'none', 'configDirectory': str(profile)})
+            for reply, message in ((providers.QuotaError('조회 시간 초과'), '상태 확인 실패'), ('', '상태 확인 실패'),
+                                   (logged_out, '로그인 만료 · 카드 메뉴에서 다시 로그인')):
+                with self.subTest(message=message), patch('providers.output', side_effect=[reply]) as output, \
+                     self.assertRaisesRegex(providers.QuotaError, message):
+                    providers.claude(isolated(profile))
+                self.assertFalse(output.call_args.kwargs['check'])
+
     def test_claude_rows_missing_uses_cached_usage_or_clear_error(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = Path(directory) / 'max'

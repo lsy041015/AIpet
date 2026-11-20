@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,13 +66,19 @@ class RegistryTests(Isolated):
     def test_each_kind_isolates_its_profile_and_scrubs_inherited_credentials(self):
         inherited = {"CLAUDE_CONFIG_DIR": "/other", "CODEX_HOME": "/other", "GH_CONFIG_DIR": "/other",
                      "GH_TOKEN": "x", "OPENAI_API_KEY": "x", "ANTHROPIC_API_KEY": "x", "CLAUDE_CODE_OAUTH_TOKEN": "x"}
+        a, b = str(self.root / "profiles/a"), str(self.root / "profiles/b")
+        for path in (a, b):
+            Path(path).mkdir(parents=True)
         with patch.dict(os.environ, inherited):
             for kind, variable in (("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME"),
                                    ("copilot", "GH_CONFIG_DIR"), ("opencode", "XDG_DATA_HOME")):
                 with self.subTest(kind=kind):
-                    first = providers.environment(record(kind, "a", "/profiles/a"))
-                    second = providers.environment(record(kind, "b", "/profiles/b"))
-                    self.assertEqual((first[variable], second[variable]), ("/profiles/a", "/profiles/b"))
+                    first = providers.environment(record(kind, "a", a))
+                    second = providers.environment(record(kind, "b", b))
+                    self.assertEqual((first[variable], second[variable]), (a, b))
+                    # A removed profile is never handed to a CLI, which would recreate it.
+                    with self.assertRaises(providers.QuotaError):
+                        providers.environment(record(kind, "c", str(self.root / "profiles/removed")))
                     default = providers.environment(record(kind))
                     if variable == "XDG_DATA_HOME":
                         self.assertEqual(default[variable], str(self.root / "data"))
@@ -86,6 +93,7 @@ class RegistryTests(Isolated):
 
     def test_fetchers_run_with_the_account_environment(self):
         account = record("copilot", "a", str(self.root / "gh-a"))
+        (self.root / "gh-a").mkdir()
         with patch("providers.output", return_value=json.dumps({"copilot_plan": "individual", "login": "octo",
                                                                "quota_snapshots": {"chat": {"unlimited": True}}})) as output:
             snapshot = providers.copilot(account)
@@ -209,6 +217,59 @@ class LoginTests(Isolated):
         self.assertFalse(pending.exists())
         self.assertTrue(kept.is_dir())
 
+    def test_startup_cleanup_removes_old_unregistered_profiles_only(self):
+        root = accounts.accounts_root()
+        registered, old, fresh = (accounts.create_profile(name) for name in ("reg1", "old1", "new1"))
+        for folder in (registered, old, fresh):
+            (folder / accounts.PENDING).unlink()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (root / "link1").symlink_to(outside)
+        hour_ago = time.time() - 3600
+        for folder in (registered, old, root / "link1"):
+            os.utime(folder, (hour_ago, hour_ago), follow_symlinks=False)
+        accounts.cleanup_pending([record("claude", "reg1", str(registered)), record("codex")])
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ["link1", "new1", "reg1"])
+        self.assertTrue(outside.is_dir())
+
+    def test_relogin_keeps_the_account_and_waits_for_a_new_login(self):
+        profile = accounts.create_profile("keep1")
+        (profile / accounts.PENDING).unlink()
+        credentials = profile / ".credentials.json"
+        credentials.write_text("old")
+        account = record("claude", "keep1", str(profile), "업무")
+        login = accounts.Login("claude", None, account)
+        process = MagicMock()
+        process.return_value.startDetached.return_value = True
+        with patch("accounts.QProcess", process), \
+             patch("accounts.terminal_command", return_value=("/usr/bin/terminator", ["-x", "login"])):
+            login.start()
+        env = process.return_value.setProcessEnvironment.call_args.args[0]
+        self.assertEqual(env.value("CLAUDE_CONFIG_DIR"), str(profile))
+        with patch("accounts.logged_in", return_value=True):
+            login.poll()
+            self.assertFalse(login.ok, "the old, still valid login is not a new sign-in")
+            credentials.write_text("new token")
+            login.poll()
+            self.assertTrue(login.ok)
+        results = []
+        login.finished.connect(results.append)
+        login.tick()
+        self.assertEqual(results, [account])
+        for end in ("cancel", "timeout"):
+            again = accounts.Login("claude", None, account)
+            with patch("accounts.QProcess", process), \
+                 patch("accounts.terminal_command", return_value=("/usr/bin/terminator", ["-x", "login"])):
+                again.start()
+            if end == "cancel":
+                again.cancel()
+            else:
+                again.deadline = 0
+                again.tick()
+            self.assertTrue(credentials.is_file(), end)
+        default = accounts.Login("claude", None, record("claude", "d1"))
+        self.assertEqual(default.watch, self.home / ".claude/.credentials.json")
+
     def test_agents_without_profiles_log_in_to_the_default(self):
         login, process, _ = self.start("cursor")
         self.assertTrue(login.account["use_default"])
@@ -265,6 +326,17 @@ class AgySwitchTests(Isolated):
         self.assertTrue(login.ok)
         self.accounts_file("")
         self.assertFalse(providers.logged_in(record("antigravity")))
+
+    def test_agy_login_to_the_same_account_completes_once_the_file_is_rewritten(self):
+        self.accounts_file("same@example.test")
+        path = self.home / ".gemini/google_accounts.json"
+        os.utime(path, ns=(1, 1))
+        login = accounts.Login("antigravity")
+        login.poll()
+        self.assertFalse(login.ok)
+        self.accounts_file("same@example.test")
+        login.poll()
+        self.assertTrue(login.ok)
 
     def test_dialog_offers_switch_when_agy_is_already_linked(self):
         with patch("accounts.installed", return_value=True):
@@ -404,6 +476,45 @@ class WidgetAccountTests(Isolated):
             window.remove_account(linked["id"])
         self.assertTrue((self.home / ".claude").is_dir())
         self.assertFalse(window.empty_state.isHidden())
+
+    def test_relogin_keeps_the_card_and_refreshes_it(self):
+        profile = accounts.create_profile("cl1")
+        (profile / accounts.PENDING).unlink()
+        self.settings.setValue("accounts", json.dumps([record("claude", "cl1", str(profile), "업무")]))
+        self.settings.setValue("billing/cl1", "keep")
+        window = self.window()
+        login = MagicMock()
+        with patch("widget.Login", login):
+            window.cards["cl1"].relogin_requested.emit("cl1")
+        login.assert_called_once_with("claude", window, window.accounts[0])
+        login.return_value.start.assert_called_once()
+        window.relogin_finished(login.return_value, dict(window.accounts[0]))
+        window.fetch_account.assert_called_with(window.accounts[0])
+        self.assertEqual(([a["id"] for a in accounts.load(self.settings)], self.settings.value("billing/cl1")), (["cl1"], "keep"))
+        login.return_value.start.side_effect = providers.QuotaError("claude 명령 없음 · CLI 설치 확인")
+        with patch("widget.Login", login), patch("widget.QMessageBox.warning") as warning:
+            window.relogin_account("cl1")
+        self.assertIn("claude 명령 없음", warning.call_args.args[2])
+        self.assertEqual(window.logins, [])
+
+    def test_removing_during_a_fetch_deletes_the_profile_after_it(self):
+        profile = accounts.create_profile("cl2")
+        (profile / accounts.PENDING).unlink()
+        self.settings.setValue("accounts", json.dumps([record("claude", "cl2", str(profile))]))
+        window = self.window()
+        job = MagicMock(key="cl2")
+        window.jobs.append(job)
+        with patch("widget.confirm_remove", return_value=(True, True)):
+            window.remove_account("cl2")
+        self.assertTrue(profile.is_dir(), "a running CLI could write it back")
+        # The late result of the removed account is dropped, even before its card is gone.
+        window.cards["cl2"] = window.cards.get("cl2") or MagicMock()
+        window.received("cl2", {"rows": [{"label": "주간", "remaining": 5, "reset": ""}]}, "")
+        window.cards.pop("cl2")
+        window.quota_failed = False
+        with patch.object(window, "sender", return_value=job):
+            window.finished()
+        self.assertFalse(profile.exists())
 
     def test_unsupported_agents_show_no_quota_and_are_not_fetched(self):
         self.settings.setValue("accounts", json.dumps([record("opencode")]))

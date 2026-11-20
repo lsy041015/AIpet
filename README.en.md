@@ -87,7 +87,7 @@ in the widget's **Google 연결** dialog. It only asks for the `calendar.events.
 
 X11 only, so no Wayland, Windows or macOS. The Copilot quota relies on an internal API the official extension uses, so it may
 break if the response changes. Antigravity (`agy`) has no login command (only the in-app `/login`) and keeps a single login in the system keyring, so **Antigravity 계정 바꾸기** opens `agy` in a terminal and your `/login` replaces this PC's Antigravity account instead of adding one; Cursor and opencode show
-no quota. Claude Team seat prices can't be told apart, so enter yours by hand, and an expired login means removing and re-adding the account.
+no quota. Claude Team seat prices can't be told apart, so enter yours by hand, and an expired login is renewed with **다시 로그인** in the card menu, which keeps the same card.
 
 Service logos are used only to identify each service ([assets/SOURCES.md](assets/SOURCES.md)). The pet is drawn in code,
 modeled on Anthropic's Claude mascot (no image file). It's a personal project, so there's no license file.

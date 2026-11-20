@@ -13,11 +13,14 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
                                QDialogButtonBox, QMessageBox, QCheckBox)
 
-from providers import KINDS, QuotaError, active_login, claude_max_dir, cli, default_login, environment, executable, logged_in
+from providers import (KINDS, QuotaError, claude_max_dir, cli, codex_home, default_login, environment, executable,
+                       logged_in, opencode_data)
 
 
 PENDING = ".check-ai-pending"
 LOGIN_TIMEOUT = 600
+# Unregistered profile folders older than this are leftovers of an abandoned or removed login.
+ORPHAN_AGE = 15 * 60
 # Former fixed cards whose billing/notification settings carry over to the matching account.
 LEGACY_KEYS = ("claude", "codex", "copilot", "antigravity")
 
@@ -98,17 +101,20 @@ def remove_profile(path):
     return True
 
 
-def cleanup_pending():
+def cleanup_pending(accounts=()):
+    """Removes unfinished logins, and folders no account uses that a terminal login may have recreated."""
     try:
         folders = list(accounts_root().iterdir())
     except OSError:
         return
+    used = {Path(a["profile_dir"]).resolve() for a in accounts if not a["use_default"]}
     for folder in folders:
-        if (folder / PENDING).is_file():
-            try:
+        try:
+            if (folder / PENDING).is_file() or (
+                    folder.resolve() not in used and time.time() - folder.lstat().st_mtime > ORPHAN_AGE):
                 remove_profile(folder)
-            except OSError:
-                pass
+        except OSError:
+            pass
 
 
 def candidates(accounts, kind):
@@ -168,18 +174,46 @@ def terminal_command(title, args):
     raise QuotaError("터미널 프로그램 없음 · terminator 설치 확인")
 
 
+def login_file(account):
+    """The file the agent writes on a login, or None when unknown."""
+    kind, profile = account["kind"], None if account["use_default"] else Path(account["profile_dir"])
+    if kind == "claude":
+        return (profile or Path.home() / ".claude") / ".credentials.json"
+    if kind == "codex":
+        return codex_home(account) / "auth.json"
+    if kind == "copilot":
+        return (profile or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "gh") / "hosts.yml"
+    if kind == "opencode":
+        return opencode_data(account) / "opencode/auth.json"
+    switch = KINDS[kind].get("switch")
+    return Path.home() / switch if switch else None
+
+
+def file_stamp(path):
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return info.st_ino, info.st_mtime_ns, info.st_size
+
+
 class Login(QObject):
-    """Runs the agent's own login in a terminal and waits for its status to report a login."""
+    """Runs the agent's own login in a terminal and waits for its status to report a login.
+
+    With `account`, logs in again to that registered account's own profile (or default login).
+    """
     finished = Signal(object)
 
-    def __init__(self, kind, parent=None):
+    def __init__(self, kind, parent=None, account=None):
         super().__init__(parent)
-        self.account = {"id": new_id(), "kind": kind, "label": "", "profile_dir": "",
-                        "use_default": KINDS[kind]["env"] is None}
+        self.existing = account is not None
+        self.account = dict(account) if self.existing else {
+            "id": new_id(), "kind": kind, "label": "", "profile_dir": "", "use_default": KINDS[kind]["env"] is None}
         self.ok = False
-        # Agents with one PC-wide login (agy) are already logged in; wait for the account to change.
+        # A PC-wide login (agy) or a re-login is already logged in: wait until the login file is rewritten.
         self.switch = bool(KINDS[kind].get("switch"))
-        self.before = active_login(kind) if self.switch else None
+        self.watch = login_file(self.account) if self.switch or self.existing else None
+        self.before = file_stamp(self.watch) if self.watch else None
         self.check = None
         self.deadline = 0
         self.timer = QTimer(self)
@@ -188,7 +222,7 @@ class Login(QObject):
 
     def start(self):
         kind = self.account["kind"]
-        if not self.account["use_default"]:
+        if not self.account["use_default"] and not self.existing:
             self.account["profile_dir"] = str(create_profile(self.account["id"]))
         try:
             program, arguments = terminal_command(KINDS[kind]["name"] + " 로그인", KINDS[kind]["login"])
@@ -222,7 +256,7 @@ class Login(QObject):
         self.check.start()
 
     def poll(self):
-        self.ok = logged_in(self.account) and (not self.switch or active_login(self.account["kind"]) != self.before)
+        self.ok = logged_in(self.account) and (self.watch is None or file_stamp(self.watch) != self.before)
 
     def done(self, ok):
         self.timer.stop()
@@ -238,7 +272,8 @@ class Login(QObject):
             self.discard()
 
     def discard(self):
-        if self.account["profile_dir"]:
+        # A re-login never deletes the registered account's profile.
+        if self.account["profile_dir"] and not self.existing:
             try:
                 remove_profile(self.account["profile_dir"])
             except OSError:

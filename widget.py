@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
 
 from providers import KINDS, PROVIDERS, QuotaError
 from accounts import (AddAccountDialog, Login, confirm_remove, cleanup_pending, link as link_account,
-                      load as load_accounts, logo_asset, save as save_accounts, unregister)
+                      load as load_accounts, logo_asset, remove_profile, save as save_accounts, unregister)
 from calendar_panel import CalendarPanel
 from todo import TodoPanel
 from billing import BillingDialog, payment_summary, next_payment, list_price, parse_price, price_summary
@@ -1389,6 +1389,7 @@ class ResizeGrip(QSizeGrip):
 class Card(GlowFrame):
     billing_requested = Signal(str)
     remove_requested = Signal(str)
+    relogin_requested = Signal(str)
     radius = 18
 
     def __init__(self, account):
@@ -1443,6 +1444,7 @@ class Card(GlowFrame):
         self.menu_button.setAccessibleName(title + " 계정 메뉴")
         self.menu_button.setPopupMode(QToolButton.InstantPopup)
         menu = QMenu(self.menu_button)
+        menu.addAction("다시 로그인").triggered.connect(lambda: self.relogin_requested.emit(self.key))
         menu.addAction("계정 제거…").triggered.connect(lambda: self.remove_requested.emit(self.key))
         self.menu_button.setMenu(menu)
         heading.addWidget(self.menu_button, 0, Qt.AlignTop)
@@ -1722,8 +1724,9 @@ class Widget(QWidget):
         self.meta = {}
         self.accounts = load_accounts(self.settings)
         self.logins = []
+        self.pending_deletes = {}
         if not smoke:
-            cleanup_pending()
+            cleanup_pending(self.accounts)
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon.fromTheme("utilities-system-monitor"))
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
@@ -2166,6 +2169,7 @@ class Widget(QWidget):
             card = Card(account)
             card.billing_requested.connect(self.edit_billing)
             card.remove_requested.connect(self.remove_account)
+            card.relogin_requested.connect(self.relogin_account)
             row = QuotaRow(account)
             row.activated.connect(self.show_card)
             self.cards[key], self.quota_rows[key] = card, row
@@ -2225,18 +2229,42 @@ class Widget(QWidget):
         if action == "link":
             self.account_added(link_account(self.settings, self.accounts, value, self.new_label(value["kind"])))
             return
-        login = Login(value, self)
+        self.start_login(Login(value, self), self.login_finished,
+                         "터미널의 agy에서 /login을 마치면 카드가 갱신됩니다 · 최대 10분 대기"
+                         if KINDS[value].get("switch") else "터미널에서 로그인을 마치면 카드가 추가됩니다 · 최대 10분 대기")
+
+    def relogin_account(self, key):
+        account = self.account(key)
+        if account is None:
+            return
+        # Same id and profile: settings stay, and a cancelled re-login keeps the profile.
+        self.start_login(Login(account["kind"], self, account), self.relogin_finished,
+                         "터미널에서 로그인을 마치면 카드가 갱신됩니다 · 최대 10분 대기")
+
+    def start_login(self, login, done, note):
         try:
             login.start()
-        except (OSError, QuotaError):
+        except (OSError, QuotaError) as error:
             login.deleteLater()
-            QMessageBox.warning(self, "에이전트 로그인", "로그인 터미널을 열지 못했습니다. 에이전트 CLI와 터미널 프로그램 설치를 확인해 주세요.")
+            # QuotaError names what is missing: the agent CLI or a terminal program.
+            QMessageBox.warning(self, "에이전트 로그인", "로그인 터미널을 열지 못했습니다.\n"
+                                + (str(error) if isinstance(error, QuotaError) else "터미널 실행 실패 · 터미널 프로그램 확인"))
             return
-        login.finished.connect(lambda account, job=login: self.login_finished(job, account))
+        login.finished.connect(lambda account, job=login: done(job, account))
         self.logins.append(login)
-        self.note.setText("터미널의 agy에서 /login을 마치면 카드가 갱신됩니다 · 최대 10분 대기"
-                          if KINDS[value].get("switch") else "터미널에서 로그인을 마치면 카드가 추가됩니다 · 최대 10분 대기")
+        self.note.setText(note)
         self.note.show()
+
+    def relogin_finished(self, login, result):
+        self.logins.remove(login)
+        login.deleteLater()
+        account = self.account(result["id"]) if result else None
+        if account is None:
+            self.note.setText("로그인이 확인되지 않았습니다 · 카드 메뉴에서 다시 시도해 주세요")
+            return
+        self.note.hide()
+        self.fetch_account(account)
+        self.show_card(account["id"])
 
     def login_finished(self, login, account):
         self.logins.remove(login)
@@ -2269,11 +2297,18 @@ class Widget(QWidget):
         confirmed, delete_profile = confirm_remove(self, account_title(account), account)
         if not confirmed:
             return
+        # A running fetch's CLI could write the folder back: delete it once that fetch ends.
+        later = delete_profile and any(job.key == key for job in self.jobs)
+        if later:
+            self.pending_deletes[key] = account["profile_dir"]
         try:
-            unregister(self.settings, self.accounts, key, delete_profile)
+            unregister(self.settings, self.accounts, key, delete_profile and not later)
         except OSError:
-            QMessageBox.warning(self, "계정 제거", "계정은 목록에서 제거했지만 프로필 폴더를 삭제하지 못했습니다.\n" + account["profile_dir"])
+            self.profile_delete_failed(account["profile_dir"])
         self.sync_accounts()
+
+    def profile_delete_failed(self, path):
+        QMessageBox.warning(self, "계정 제거", "계정은 목록에서 제거했지만 프로필 폴더를 삭제하지 못했습니다.\n" + path)
 
     def set_quota_view(self, view, persist=True):
         view = view if view in ("cards", "list") else "cards"
@@ -2769,7 +2804,7 @@ class Widget(QWidget):
 
     def received(self, key, snapshot, error):
         # A removed account's late result is dropped.
-        if key not in self.cards:
+        if key not in self.cards or self.account(key) is None:
             return
         self.quota_failed = getattr(self, "quota_failed", False) or bool(error)
         card = self.cards[key]
@@ -2790,6 +2825,12 @@ class Widget(QWidget):
         job = self.sender()
         self.jobs.remove(job)
         job.deleteLater()
+        if job.key in self.pending_deletes and not any(other.key == job.key for other in self.jobs):
+            path = self.pending_deletes.pop(job.key)
+            try:
+                remove_profile(path)
+            except OSError:
+                self.profile_delete_failed(path)
         self.refresh_button.setEnabled(not self.jobs)
         if not self.jobs:
             self.restore_button.set_status(5 if self.quota_failed else 8)

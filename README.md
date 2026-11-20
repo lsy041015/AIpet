@@ -85,7 +85,7 @@ QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme li
 
 X11 전용이라 Wayland, Windows, macOS에서는 안 돌아가요. Copilot 한도는 공식 확장이 쓰는 내부 API에 기대고 있어서
 응답 형식이 바뀌면 고쳐야 할 수 있어요. Antigravity(`agy`)는 로그인 명령이 없고(앱 안의 `/login`만 있음) 로그인 정보를 시스템 키링에 하나만 저장해요. 그래서 **Antigravity 계정 바꾸기**를 누르면 터미널에 `agy`가 열리고, `/login`을 마치면 계정이 추가되는 게 아니라 이 PC의 Antigravity 계정이 바뀌어요. Cursor·opencode는 한도를
-못 읽어요. Claude Team 좌석 요금은 구분이 안 돼서 직접 입력해야 하고, 로그인이 만료된 계정은 지우고 다시 추가해야 해요.
+못 읽어요. Claude Team 좌석 요금은 구분이 안 돼서 직접 입력해야 하고, 로그인이 만료된 계정은 카드 메뉴의 **다시 로그인**으로 같은 카드에 다시 로그인해요.
 
 서비스 로고는 식별용으로만 써요([assets/SOURCES.md](assets/SOURCES.md)). 펫은 Anthropic의 Claude 마스코트를 참고해서
 코드로 직접 그린 도트예요(그림 파일 없음). 개인 프로젝트라 라이선스 파일은 없어요.

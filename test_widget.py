@@ -352,8 +352,8 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(personal.plan_badge.text(), 'Max')
         self.assertEqual(personal.findChild(QLabel, 'serviceTitle').text(), 'Claude · Max 5x')
         self.assertEqual(business.findChild(QLabel, 'serviceTitle').text(), 'Claude Code')
-        # Logins are started from "+ 추가" now; cards carry only a remove menu.
-        self.assertEqual([action.text() for action in personal.menu_button.menu().actions()], ['계정 제거…'])
+        # New logins start from "+ 추가"; a card only logs in again to its own account or is removed.
+        self.assertEqual([action.text() for action in personal.menu_button.menu().actions()], ['다시 로그인', '계정 제거…'])
 
     def test_wayland_uses_positionable_backend_without_overriding_explicit_choice(self):
         import os
