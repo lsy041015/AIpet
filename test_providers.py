@@ -9,6 +9,12 @@ from zoneinfo import ZoneInfo
 import providers
 from providers import parse_codex, parse_antigravity, parse_copilot, parse_claude, claude_reset, claude_reset_moment, percent, reset_text, QuotaError
 
+DEFAULT_CLAUDE = {"id": "a", "kind": "claude", "label": "", "profile_dir": "", "use_default": True}
+
+
+def isolated(profile):
+    return {"id": "b", "kind": "claude", "label": "", "profile_dir": str(profile), "use_default": False}
+
 
 class QuotaTests(unittest.TestCase):
     def test_codex_primary_can_be_weekly_and_secondary_can_be_missing(self):
@@ -69,27 +75,28 @@ class QuotaTests(unittest.TestCase):
             self.assertEqual(claude_reset(unknown, now), unknown + ' 초기화')
 
     def test_default_claude_ignores_inherited_profile(self):
-        auth = {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'team', 'email': 'work@example.test'}
+        auth = {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'team', 'email': 'work@example.test',
+                'orgName': 'Example Org', 'planTier': 'other'}
         usage = {'is_error': False, 'result': 'Current session: 20% used · resets 1pm'}
         with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/max'}), \
              patch('providers.output', side_effect=[json.dumps(auth), json.dumps(usage)]) as output:
-            self.assertEqual(providers.claude()['plan'], 'team')
+            snapshot = providers.claude(DEFAULT_CLAUDE)
+            self.assertEqual((snapshot['plan'], snapshot['org'], snapshot['tier']), ('team', 'Example Org', 'other'))
             for call in output.call_args_list:
                 self.assertNotIn('CLAUDE_CONFIG_DIR', call.kwargs['env'])
 
-    def test_claude_max_uses_separate_login_and_reports_account(self):
+    def test_isolated_claude_uses_its_own_login_and_reports_account(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = Path(directory) / 'max'
             profile.mkdir()
-            auth = {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'max',
+            auth = {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'max', 'planTier': 'max_5x',
                     'configDirectory': str(profile), 'email': 'personal@example.test'}
             usage = {'is_error': False, 'result': 'Current session: 20% used · resets 1pm'}
-            with patch('providers.claude_max_dir', return_value=profile), \
-                 patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/business', 'CLAUDE_CODE_OAUTH_TOKEN': 'other-account'}), \
+            with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/business', 'CLAUDE_CODE_OAUTH_TOKEN': 'other-account'}), \
                  patch('providers.output', side_effect=[json.dumps(auth), json.dumps(usage)]) as output:
-                snapshot = providers.claude_max()
+                snapshot = providers.claude(isolated(profile))
                 self.assertEqual(snapshot['account'], 'personal@example.test')
-                self.assertEqual(snapshot['plan'], 'max')
+                self.assertEqual((snapshot['plan'], snapshot['tier']), ('max', 'max_5x'))
                 self.assertEqual(snapshot['rows'][0]['remaining'], 80)
                 for call in output.call_args_list:
                     env = call.kwargs['env']
@@ -97,26 +104,25 @@ class QuotaTests(unittest.TestCase):
                     self.assertNotIn('CLAUDE_CODE_OAUTH_TOKEN', env)
                 self.assertEqual(os.environ['CLAUDE_CONFIG_DIR'], '/business')
 
-    def test_claude_max_requires_explicit_profile_setup(self):
+    def test_isolated_claude_requires_its_profile_folder(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = Path(directory) / 'not-created'
-            with patch('providers.claude_max_dir', return_value=profile), patch('providers.output') as output:
+            with patch('providers.output') as output:
                 with self.assertRaises(providers.QuotaError):
-                    providers.claude_max()
+                    providers.claude(isolated(profile))
                 output.assert_not_called()
                 self.assertFalse(profile.exists())
 
-    def test_claude_max_never_falls_back_to_business_account(self):
+    def test_isolated_claude_never_falls_back_to_another_login(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = Path(directory) / 'max'
             profile.mkdir()
             for auth in ({'loggedIn': False},
-                         {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'team', 'configDirectory': str(profile)},
+                         {'loggedIn': True, 'authMethod': 'console', 'configDirectory': str(profile)},
                          {'loggedIn': True, 'authMethod': 'claude.ai', 'subscriptionType': 'max', 'configDirectory': '/business'}):
-                with self.subTest(auth=auth), patch('providers.claude_max_dir', return_value=profile), \
-                     patch('providers.output', return_value=json.dumps(auth)) as output:
+                with self.subTest(auth=auth), patch('providers.output', return_value=json.dumps(auth)) as output:
                     with self.assertRaises(providers.QuotaError):
-                        providers.claude_max()
+                        providers.claude(isolated(profile))
                     self.assertEqual(output.call_count, 1)
 
     def test_invalid_data_is_never_full_quota(self):
