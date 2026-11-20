@@ -189,7 +189,10 @@ def codex(account):
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
                 message = json.loads(line)
-                if message.get("id") in (1, 2) and "error" in message:
+                # Server requests and notifications carry "method"; only replies to our ids count.
+                if not isinstance(message, dict) or "method" in message or message.get("id") not in (1, 2):
+                    continue
+                if "error" in message:
                     raise QuotaError("Codex 조회 실패 · Codex 로그인·네트워크 확인")
                 if message.get("id") == 1:
                     send({"method": "initialized"})
@@ -242,13 +245,21 @@ def parse_copilot(data):
         if not isinstance(quota, dict):
             continue
         unlimited = quota.get("unlimited") is True
-        remaining = None if unlimited else percent(quota["percent_remaining"])
+        remaining = None
+        if not unlimited:
+            # One odd bucket must not fail the account: skip it, clamp the rest.
+            value = quota.get("percent_remaining")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                continue
+            remaining = min(100.0, max(0.0, float(value)))
         detail = "무제한" if unlimited else ""
         total = quota.get("entitlement")
         count = quota.get("quota_remaining", quota.get("remaining"))
         if not unlimited and total is not None and count is not None:
             unit = "크레딧" if quota.get("token_based_billing") else "요청"
             detail = f"{count:g}/{total:g} {unit}" if isinstance(count, (int, float)) and isinstance(total, (int, float)) else ""
+        if not unlimited and quota["percent_remaining"] < 0:
+            detail = "초과 사용"
         reset = quota.get("reset_date") or data.get("quota_reset_date")
         rows.append({"label": names.get(key, key), "remaining": remaining, "detail": detail,
                      "reset": reset_text(reset), "reset_at": reset_at(reset_moment(reset))})
@@ -280,6 +291,8 @@ def claude_reset_moment(text, now=None):
             raise ValueError("invalid hour")
         moment = datetime(now.year, MONTHS.index(month) + 1 if month else now.month, int(day or now.day),
                           int(hour) % 12 + (12 if half == "pm" else 0), int(minute or 0), tzinfo=zone)
+        if not month and moment <= now:
+            moment += timedelta(days=1)  # a time-only reset is the next one, e.g. "1am" printed at 23:30
         if moment < now - timedelta(days=1):
             moment = moment.replace(year=now.year + 1)
         return moment.astimezone()
@@ -298,24 +311,26 @@ def parse_claude(data):
         raise QuotaError("Claude Code 사용량 응답 없음 · claude /usage 확인")
     rows = []
     for line in data["result"].splitlines():
-        name, separator, detail = line.partition(":")
-        if not separator or not name.startswith("Current "):
+        name, separator, detail = line.strip().partition(":")
+        key = name.lower()
+        if not separator or not key.startswith("current "):
             continue
-        match = re.search(r"(\d+(?:\.\d+)?)% used", detail)
+        match = re.search(r"(\d+(?:\.\d+)?)\s*%\s*used", detail, re.I)
         if not match:
             continue
         try:
             remaining = 100 - percent(match.group(1))
         except ValueError:
             raise QuotaError("Claude Code 사용량 비율 오류") from None
-        if name == "Current session":
+        if key == "current session":
             label = "현재 세션"
-        elif name.startswith("Current week (") and name.endswith(")"):
+        elif key.startswith("current week (") and key.endswith(")"):
             model = name[len("Current week ("):-1]
-            label = "이번 주 · " + ("전체 모델" if model == "all models" else model)
+            label = "이번 주 · " + ("전체 모델" if model.lower() == "all models" else model)
         else:
             label = name
-        reset = detail.partition("resets ")[2].strip()
+        reset = re.search(r"resets\s+(.*)", detail, re.I)
+        reset = reset[1].strip() if reset else ""
         rows.append({"label": label, "remaining": remaining,
                      "reset": claude_reset(reset) if reset else "초기화 시각 미제공",
                      "reset_at": reset_at(claude_reset_moment(reset))})
