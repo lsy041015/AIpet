@@ -37,7 +37,7 @@ from billing import BillingDialog, payment_summary, next_payment, list_price, pa
 from notifications import Notifications
 from agent_activity import read_activity, ActivityTracker, claude_project
 from agent_windows import XWindows
-from pixel_pet import paint_computer, animation_row, display_row, DURATIONS, ANIMATION_NAMES, atlas
+from pixel_pet import paint_computer, animation_row, display_row, DURATIONS, ANIMATION_NAMES
 from html import escape
 
 
@@ -1077,7 +1077,6 @@ class ComputerPet(CircleButton):
         super().__init__(owner)
         self.setFixedSize(96, 96)
         from pixel_pet import Life
-        atlas()
         self.animation_state = 0
         self.status_row = 3
         self.preview_row = None
