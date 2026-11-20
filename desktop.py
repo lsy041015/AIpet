@@ -1,13 +1,15 @@
 """Desktop workspace reusing the widget's accounts, calendar and pet lifecycle."""
 from datetime import datetime
-from pathlib import Path
+from html import escape
 
-from PySide6.QtCore import Qt, QSize, QTimer, QRect, QRectF
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QShortcut, QKeySequence
+from PySide6.QtCore import Qt, QSize, QTimer, QRect, QRectF, QPointF, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout,
-                               QPushButton, QToolButton, QButtonGroup, QScrollArea, QSizePolicy, QProgressBar)
+                               QLabel, QPushButton, QToolButton, QButtonGroup, QScrollArea, QSizePolicy)
 
-from widget import Widget, SERVICES, THEMES, label, risk_level, set_risk, set_logo, account_title, nearest_reset, time_left
+from widget import (Widget, SERVICES, THEMES, DISPLAY_CSS, label, risk_level, set_risk, account_title, nearest_reset, time_left,
+                    service_info, session_title, model_text, subagent_text, todo_progress, theme_colors, rgba, neon_tube,
+                    LogoBadge, NeonSign, GlowLabel, NeonBar, GlowFrame)
 from billing import next_payment, price_summary, PERIODS
 
 
@@ -55,6 +57,167 @@ def navigation_icon(kind, color):
         painter.drawLine(6, 16, 10, 16)
     painter.end()
     return QIcon(pixmap)
+
+
+class NavButton(QPushButton):
+    """Sidebar entry; the selected one gets a short neon tube on its left edge."""
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.isChecked():
+            return
+        colors = theme_colors(self)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        tube = QPainterPath(QPointF(7, 13))
+        tube.lineTo(7, self.height() - 13)
+        if colors["glow"]:
+            neon_tube(p, tube, QColor(colors["accent"]), 2.4)
+        else:
+            p.strokePath(tube, QPen(QColor(colors["accent"]), 3, Qt.SolidLine, Qt.RoundCap))
+
+
+class SessionCard(GlowFrame):
+    """One agent session: title, model chip, status, current todo with progress and running subagents."""
+    activated = Signal()
+    expanded_changed = Signal(str, bool)
+    radius = 14
+
+    def __init__(self, task, colors, expanded=False, compact=False):
+        super().__init__()
+        self.task_id = str(task.get("id"))
+        waiting = task.get("status") == "waiting"
+        agent, activity = task.get("agent"), str(task.get("label") or "")
+        name, title = service_info(agent)[0], session_title(task)
+        status = "승인·입력 대기" if waiting else "작업 중"
+        elapsed = task.get("elapsed", 0)
+        duration = f"{elapsed // 60}분 경과" if elapsed >= 60 else "방금 시작"
+        self.setObjectName("sessionCard")
+        self.setProperty("waiting", waiting)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
+        self.setAccessibleName(" · ".join(v for v in (title, name, status, duration, activity) if v))
+        self.setToolTip(activity + "\n클릭하여 작업 창으로 이동")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 13, 16, 13)
+        layout.setSpacing(7)
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        head.addWidget(LogoBadge(agent, 34), 0, Qt.AlignTop)
+        names = QVBoxLayout()
+        names.setSpacing(3)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        top.addWidget(label(title, "sessionTitle"), 1)
+        pill = label("● " + status, "statusPill")
+        pill.setWordWrap(False)
+        pill.setProperty("waiting", waiting)
+        top.addWidget(pill, 0, Qt.AlignTop)
+        names.addLayout(top)
+        meta = QHBoxLayout()
+        meta.setSpacing(8)
+        details = [name] + ([activity] if activity and activity != status else []) + [duration]
+        meta.addWidget(label(" · ".join(details), "caption"), 1)
+        if model_text(task):
+            chip = label(model_text(task), "modelChip")
+            chip.setWordWrap(False)
+            chip.setToolTip("메인 모델 · effort")
+            meta.addWidget(chip, 0, Qt.AlignVCenter)
+        names.addLayout(meta)
+        head.addLayout(names, 1)
+        layout.addLayout(head)
+        todos = [item for item in task.get("todos") or () if isinstance(item, dict)]
+        done, total = todo_progress(task)
+        current = task.get("current_task") or next((item.get("text") for item in todos if item.get("status") == "in_progress"), None)
+        self.toggle = None
+        if current or total:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.addWidget(label("▸ " + (current or ("할 일 모두 완료" if done == total else "다음 할 일 대기")), "currentTask"), 1)
+            if total and not compact:
+                self.toggle = QToolButton()
+                self.toggle.setObjectName("todoToggle")
+                self.toggle.setCheckable(True)
+                self.toggle.setAccessibleName(f"할 일 {done}/{total} 목록 펼치기")
+                row.addWidget(self.toggle, 0, Qt.AlignVCenter)
+            elif total:
+                row.addWidget(label(f"할 일 {done}/{total}", "caption"), 0, Qt.AlignVCenter)
+            layout.addLayout(row)
+            if total:
+                progress = NeonBar(3)
+                progress.setObjectName("todoProgress")
+                progress.setValue(round(done / total * 1000))
+                progress.setAccessibleName(f"할 일 {done}/{total} 완료")
+                layout.addWidget(progress)
+        helpers = [item for item in task.get("subagents") or () if isinstance(item, dict)]
+        if helpers:
+            chips = QHBoxLayout()
+            chips.setSpacing(6)
+            shown = helpers[:2 if compact else 3]
+            for helper in shown:
+                running = helper.get("status", "running") == "running"
+                chip = QLabel(f'<span style="color:{colors["accent"] if running else colors["muted"]};">●</span>&nbsp;'
+                              + escape(subagent_text(helper)))
+                chip.setObjectName("agentChip")
+                chip.setProperty("running", running)
+                chip.setToolTip(str(helper.get("description") or helper.get("type") or "서브에이전트"))
+                chip.setAccessibleName("서브에이전트 " + subagent_text(helper) + (" 실행 중" if running else ""))
+                chips.addWidget(chip)
+            if len(helpers) > len(shown):
+                chips.addWidget(label(f"+{len(helpers) - len(shown)}", "agentChip"))
+            chips.addStretch(1)
+            layout.addLayout(chips)
+        self.todo_list = None
+        if self.toggle is not None:
+            marks = {"completed": ("✓", colors["muted"]), "in_progress": ("●", colors["accent"]), "cancelled": ("✕", colors["muted"])}
+            rows = []
+            for item in todos:
+                mark, color = marks.get(item.get("status"), ("○", colors["text"]))
+                text = escape(str(item.get("text") or ""))
+                if item.get("status") in ("completed", "cancelled"):
+                    text = f"<s>{text}</s>"
+                rows.append(f'<span style="color:{color};">{mark}&nbsp;&nbsp;{text}</span>')
+            self.todo_list = QLabel("<br>".join(rows))
+            self.todo_list.setObjectName("todoList")
+            self.todo_list.setWordWrap(True)
+            self.todo_list.hide()
+            layout.addWidget(self.todo_list)
+            self.toggle.toggled.connect(self.show_todos)
+            self.summary = f"할 일 {done}/{total}"
+            self.show_todos(expanded)
+            self.toggle.setChecked(expanded)
+
+    def show_todos(self, expanded):
+        self.todo_list.setVisible(expanded)
+        self.toggle.setText(self.summary + (" ▴" if expanded else " ▾"))
+        self.expanded_changed.emit(self.task_id, expanded)
+
+    def set_expanded(self, expanded):
+        if self.toggle is not None:
+            self.toggle.setChecked(expanded)
+
+    def lit(self):
+        # Waiting sessions keep their warning edge lit until the agent continues.
+        return super().lit() or bool(self.property("waiting"))
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.activated.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.activated.emit()
+        else:
+            super().keyPressEvent(event)
+
+
+def set_muted(item, muted):
+    if item.property("muted") != muted:
+        item.setProperty("muted", muted)
+        item.style().unpolish(item)
+        item.style().polish(item)
 
 
 def panel(title, subtitle=""):
@@ -136,14 +299,15 @@ class DesktopWindow(Widget):
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(16, 28, 16, 18)
         sidebar_layout.setSpacing(8)
-        brand = label("AI Desk", "desktopBrand")
-        sidebar_layout.addWidget(brand)
+        self.brand = NeonSign("check AI", 28, brand=True)
+        self.neon_signs.append(self.brand)
+        sidebar_layout.addWidget(self.brand)
         sidebar_layout.addWidget(label("나의 작업 공간", "caption"))
         sidebar_layout.addSpacing(30)
         self.nav_buttons = {}
         nav_group = QButtonGroup(self)
         for number, (key, info) in enumerate(PAGES.items(), 1):
-            button = QPushButton(info[0])
+            button = NavButton(info[0])
             button.setObjectName("sidebarButton")
             button.setCheckable(True)
             button.setMinimumHeight(44)
@@ -223,6 +387,9 @@ class DesktopWindow(Widget):
         for card in self.cards.values():
             card.setParent(self.quota_content)
             card.show()
+        self.add_tile.setParent(self.quota_content)
+        self.add_tile.setMinimumHeight(120)
+        self.add_tile.show()
         self.scroll.setWidget(self.quota_content)
         old_content.deleteLater()
         self.quota_columns = 0
@@ -262,7 +429,8 @@ class DesktopWindow(Widget):
             box, inner = panel(title)
             # A wrapped title in one box must not push its value out of line with the others.
             inner.addStretch()
-            value = label("—", "metricValue")
+            value = GlowLabel("—")
+            value.setObjectName("metricValue")
             inner.addWidget(value)
             note = label("오늘 기준" if key == "events" else "", "metricNote")
             inner.addWidget(note)
@@ -294,6 +462,7 @@ class DesktopWindow(Widget):
         quota_layout.addLayout(links)
         schedule, schedule_layout = panel("다가오는 일정", "현재 조회한 캘린더 기준")
         self.overview_schedule = label("캘린더 연결 후 일정을 표시합니다.", "scheduleSummary")
+        self.overview_schedule.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         schedule_layout.addWidget(self.overview_schedule, 1)
         open_calendar = QPushButton("캘린더 열기  →")
         open_calendar.setObjectName("desktopTextButton")
@@ -305,6 +474,9 @@ class DesktopWindow(Widget):
         grid.setColumnStretch(1, 1)
         layout.addLayout(grid)
         activity, activity_layout = panel("에이전트 작업", "작업이 감지되면 여기에 표시됩니다")
+        self.overview_sessions = QVBoxLayout()
+        self.overview_sessions.setSpacing(10)
+        activity_layout.addLayout(self.overview_sessions)
         self.overview_activity = label("실행 중인 작업이 없습니다.", "scheduleSummary")
         activity_layout.addWidget(self.overview_activity)
         open_agents = QPushButton("작업 목록 열기  →")
@@ -320,7 +492,7 @@ class DesktopWindow(Widget):
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 4, 0)
-        box, inner = panel("실시간 작업", "Codex · Claude Code · Antigravity · GitHub Copilot")
+        box, inner = panel("실시간 작업", "Claude Code · Codex · Antigravity · GitHub Copilot · opencode")
         self.agents_empty = label("감지된 작업이 없습니다.\n이 PC의 터미널이나 에이전트 앱에서 작업을 시작하면 표시됩니다.", "scheduleSummary")
         inner.addWidget(self.agents_empty)
         self.task_layout = QVBoxLayout()
@@ -331,6 +503,7 @@ class DesktopWindow(Widget):
         layout.addStretch()
         self.task_buttons = []
         self.task_signature = None
+        self.expanded_sessions = set()
         self.agents_page = scroll_page(content)
         self.pages.addWidget(self.agents_page)
 
@@ -370,17 +543,16 @@ class DesktopWindow(Widget):
             stack.setContentsMargins(0, 0, 0, 0)
             stack.setSpacing(2)
             row = QHBoxLayout()
+            row.setSpacing(10)
+            row.addWidget(LogoBadge(account["kind"], 22))
             row.addWidget(label(account_title(account), "overviewName"), 1)
             value = label(self.pet_quotas.get(key, "조회 전"), "overviewValue")
             value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             row.addWidget(value)
             stack.addLayout(row)
-            bar = QProgressBar()
+            bar = NeonBar(4)
             bar.setObjectName("overviewBar")
             bar.setProperty("service", account["kind"])
-            bar.setRange(0, 1000)
-            bar.setTextVisible(False)
-            bar.setFixedHeight(4)
             policy = bar.sizePolicy()
             policy.setRetainSizeWhenHidden(True)
             bar.setSizePolicy(policy)
@@ -407,11 +579,8 @@ class DesktopWindow(Widget):
             stack.setContentsMargins(20, 18, 20, 18)
             stack.setSpacing(10)
             head = QHBoxLayout()
-            head.setSpacing(10)
-            logo = label("", "badge")
-            logo.setFixedSize(34, 34)
-            logo.setAlignment(Qt.AlignCenter)
-            set_logo(logo, account["kind"], 26)
+            head.setSpacing(12)
+            logo = LogoBadge(account["kind"], 36)
             logo.setAccessibleName(title + " 로고")
             head.addWidget(logo)
             names = QVBoxLayout()
@@ -421,7 +590,8 @@ class DesktopWindow(Widget):
             names.addWidget(self.billing_plans[key])
             head.addLayout(names, 1)
             stack.addLayout(head)
-            self.billing_dates[key] = label("미설정", "billingDate")
+            self.billing_dates[key] = GlowLabel("미설정")
+            self.billing_dates[key].setObjectName("billingDate")
             stack.addWidget(self.billing_dates[key])
             self.billing_prices[key] = label("", "caption")
             stack.addWidget(self.billing_prices[key])
@@ -445,7 +615,7 @@ class DesktopWindow(Widget):
             if card.parent() is not self.quota_content:
                 card.setParent(self.quota_content)
                 card.show()
-        place(self.quota_grid, list(self.cards.values()), self.quota_columns or 1)
+        place(self.quota_grid, [*self.cards.values(), self.add_tile], self.quota_columns or 1)
         self.rebuild_overview()
         self.rebuild_billing_cards()
         place(self.billing_grid, list(self.billing_cards.values()), self.billing_columns or 1)
@@ -497,7 +667,7 @@ class DesktopWindow(Widget):
         columns = 2 if self.width() >= 1060 else 1
         if columns != self.quota_columns:
             self.quota_columns = columns
-            place(self.quota_grid, list(self.cards.values()), columns)
+            place(self.quota_grid, [*self.cards.values(), self.add_tile], columns)
         if columns != self.billing_columns:
             self.billing_columns = columns
             place(self.billing_grid, list(self.billing_cards.values()), columns)
@@ -547,14 +717,15 @@ class DesktopWindow(Widget):
             bar.setVisible(remaining is not None)
             bar.setValue(round(remaining * 10) if remaining is not None else 0)
             bar.setAccessibleName(f"{account_title(self.account(key))} {value}")
-            for item in (self.overview_quotas[key], bar):
-                set_risk(item, risk_level(remaining))
+            set_risk(bar, risk_level(remaining))
+            # A failed lookup is a warning even while the last value is still shown.
+            set_risk(self.overview_quotas[key], risk_level(remaining) or ("low" if card.error else ""))
             if remaining is not None and (lowest is None or remaining < lowest[0]):
                 lowest = (remaining, key, card.data[0]["label"])
         self.metrics["lowest"].setText(f"{lowest[0]:g}%" if lowest else "—")
         self.metric_notes["lowest"].setText(f"{account_title(self.account(lowest[1]))} · {lowest[2]}" if lowest else "조회 전")
         set_risk(self.metrics["lowest"], risk_level(lowest[0]) if lowest else "")
-        waiting = sum(task["status"] == "waiting" for task in self.agent_activity)
+        waiting = sum(task.get("status") == "waiting" for task in self.agent_activity)
         active = len(self.agent_activity)
         self.metrics["agents"].setText(str(active))
         self.metric_notes["agents"].setText(f"승인 대기 {waiting}건" if waiting else f"실행 중 {active}건" if active else "실행 중인 작업 없음")
@@ -567,9 +738,10 @@ class DesktopWindow(Widget):
         records = {key: self.payment_record(key) for key in self.cards}
         dates = {key: next_payment(records[key], today) for key in self.cards}
         for key, card in self.cards.items():
-            self.billing_plans[key].setText(card.plan.text())
+            self.billing_plans[key].setText(self.plan_text(key))
             day = dates[key]
             self.billing_dates[key].setText(f"{day:%m/%d}" if day else "미설정")
+            set_muted(self.billing_dates[key], not day)
             period = "ChatGPT 구독 만료일" if day and records[key].get("auto") else PERIODS[records[key]["period"]] if day else ""
             self.billing_notes[key].setText(f"{due_text(day, today)} · {period}" if day else "결제 기준일과 주기를 입력하세요")
             self.billing_buttons[key].setText("수정" if self.billing_record(key) else "결제일 설정")
@@ -621,36 +793,39 @@ class DesktopWindow(Widget):
         self.metrics["events"].setText(str(len(self.calendar.events_in("today", now))))
         self.overview_schedule.setText("\n\n".join(item[1] for item in sorted(lines)[:4]) or "다가오는 일정이 없습니다.")
 
-    def render_agents(self):
-        signature = tuple((task["id"], task["status"], task["label"], task.get("elapsed", 0)//60) for task in self.agent_activity)
-        if signature == self.task_signature:
+    def render_agents(self, force=False):
+        fields = ("id", "agent", "status", "label", "title", "model", "effort", "current_task", "todos", "subagents")
+        signature = (self.theme, tuple((repr([task.get(name) for name in fields]), task.get("elapsed", 0) // 60)
+                                       for task in self.agent_activity))
+        if signature == self.task_signature and not force:
             return
         self.task_signature = signature
-        while self.task_layout.count():
-            self.task_layout.takeAt(0).widget().deleteLater()
+        for layout in (self.task_layout, self.overview_sessions):
+            while layout.count():
+                item = layout.takeAt(0).widget()
+                item.hide()
+                item.deleteLater()
+        colors = THEMES[self.theme]
+        self.expanded_sessions &= {str(task.get("id")) for task in self.agent_activity}
         self.task_buttons = []
-        summaries = []
         for index, task in enumerate(self.agent_activity):
-            title = SERVICES[task["agent"]][0]
-            elapsed = task.get("elapsed", 0)
-            duration = f"{elapsed//60}분 경과" if elapsed >= 60 else "방금 시작"
-            status = "승인·입력 대기" if task["status"] == "waiting" else "작업 중"
-            button = QPushButton(f"{title} · {status} · {duration}\n{task['label']}")
-            button.setObjectName("agentTask")
-            button.setProperty("waiting", task["status"] == "waiting")
-            button.setMinimumHeight(76)
-            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-            button.setAccessibleName(title + " · " + status + " · " + task["label"])
-            asset = Path(__file__).parent / "assets" / (task["agent"] + (".png" if task["agent"] == "antigravity" else ".svg"))
-            button.setIcon(QIcon(str(asset)))
-            button.setIconSize(QSize(28, 28))
-            button.setToolTip(task["label"] + "\n클릭하여 작업 창으로 이동")
-            button.clicked.connect(lambda checked=False, item=index: self.open_activity(str(item)))
-            self.task_layout.addWidget(button)
-            self.task_buttons.append(button)
-            summaries.append(f"{title}   ·   {status}   ·   {duration}\n{task['label']}")
+            card = SessionCard(task, colors, str(task.get("id")) in self.expanded_sessions)
+            card.activated.connect(lambda item=index: self.open_activity(str(item)))
+            card.expanded_changed.connect(self.remember_expanded)
+            self.task_layout.addWidget(card)
+            self.task_buttons.append(card)
+            if index < 3:
+                summary = SessionCard(task, colors, compact=True)
+                summary.activated.connect(lambda item=index: self.open_activity(str(item)))
+                self.overview_sessions.addWidget(summary)
         self.agents_empty.setVisible(not self.task_buttons)
-        self.overview_activity.setText("\n\n".join(summaries[:3]) or "실행 중인 작업이 없습니다.")
+        extra = len(self.agent_activity) - 3
+        self.overview_activity.setText("실행 중인 작업이 없습니다." if not self.agent_activity else
+                                       f"외 {extra}개 작업은 작업 목록에서 확인하세요." if extra > 0 else "")
+        self.overview_activity.setVisible(bool(self.overview_activity.text()))
+
+    def remember_expanded(self, task_id, expanded):
+        (self.expanded_sessions.add if expanded else self.expanded_sessions.discard)(task_id)
 
     def toggle_collapsed(self):
         if not self.desktop_ready:
@@ -696,46 +871,54 @@ class DesktopWindow(Widget):
         if not self.desktop_ready:
             return
         c = THEMES[theme]
-        canvas = "#f5f6f8" if theme == "light" else "#171a21"
-        sidebar = "#eef0f4" if theme == "light" else "#1e222c"
-        selected = "#dfeaff" if theme == "light" else "#2b3b55"
-        accent = "#3268ce" if theme == "light" else "#9bbcff"
+        neon = bool(c["glow"])
+        accent, soft = c["accent"], c["accent_soft"]
         # Widget's generic risk rules lose to the ID selectors below, so repeat them per desktop widget.
         service_bars = "".join(f"QProgressBar#overviewBar[service='{key}']::chunk {{background:{c[key]};}} " for key in SERVICES)
         risk_rules = "".join(
             f"QLabel#metricValue[risk='{risk}'], QLabel#metricNote[risk='{risk}'], QLabel#overviewValue[risk='{risk}'] {{color:{c[token]};}} "
             f"QProgressBar#overviewBar[risk='{risk}']::chunk {{background:{c[token]};}} "
             for risk, token in (("low", "warning"), ("critical", "danger")))
+        primary = (f"background:{rgba(accent, .1)}; border:1px solid {accent}; color:{c['core']};" if neon else
+                   f"background:{accent}; border:1px solid {accent}; color:{c['card']};")
         self.setStyleSheet(self.styleSheet() + f"""
-            QWidget#window {{background:{canvas};}}
-            QFrame#surface {{background:{canvas}; border:0; border-radius:0;}}
-            QFrame#sidebar {{background:{sidebar}; border:0; border-right:1px solid {c['border']};}}
-            QLabel#desktopBrand {{font-size:26px; font-weight:750; letter-spacing:-1px;}}
+            QWidget#window {{background:{c['background']};}}
+            QFrame#surface {{background:{c['background']}; border:0; border-radius:0;}}
+            QFrame#sidebar {{background:{c['sidebar']}; border:0; border-right:1px solid {c['border']};}}
             QLabel#clock {{font-size:14px; color:{c['muted']}; font-weight:500;}}
-            QLabel#pageHeading {{font-size:28px; padding:0;}}
             QLabel#desktopDescription {{font-size:12px; color:{c['muted']};}}
-            QPushButton#sidebarButton {{text-align:left; padding:10px 12px; background:transparent; border:0; border-radius:10px; font-size:13px;}}
-            QPushButton#sidebarButton:hover {{background:{c['control']};}}
-            QPushButton#sidebarButton:checked {{background:{selected}; color:{accent}; font-weight:650;}}
+            QPushButton#sidebarButton {{text-align:left; padding:10px 12px 10px 18px; background:transparent; border:0; border-radius:10px; font-size:13px; color:{c['muted'] if neon else c['text']};}}
+            QPushButton#sidebarButton:hover {{background:{c['control']}; color:{c['text']};}}
+            QPushButton#sidebarButton:checked {{background:{soft}; color:{c['core'] if neon else accent}; font-weight:650;}}
             QToolButton#sidebarSettings {{text-align:left; padding:8px 14px; background:transparent; border:1px solid {c['border']};}}
             QFrame#desktopPanel {{background:{c['card']}; border:1px solid {c['border']}; border-radius:16px;}}
             QLabel#panelTitle {{font-size:13px; font-weight:650;}}
-            QLabel#metricValue {{font-size:27px; font-weight:700; color:{accent};}}
+            QLabel#metricValue {{font-family:{DISPLAY_CSS}; font-size:30px; font-weight:600; color:{c['core']};}}
             QLabel#metricNote {{font-size:11px; color:{c['muted']};}}
             QLabel#overviewName {{font-size:12px; padding:5px 0;}}
-            QLabel#overviewValue {{font-size:12px; font-weight:650; color:{accent};}}
+            QLabel#overviewValue {{font-size:12px; font-weight:650;}}
             QLabel#scheduleSummary {{font-size:13px; padding:4px 0;}}
             QPushButton#desktopTextButton {{background:transparent; color:{accent}; padding:5px 0; border:0; font-size:12px;}}
-            QPushButton#desktopPrimary {{background:{accent}; color:{c['card']}; font-weight:650; padding:8px 16px;}}
-            QPushButton#agentTask {{text-align:left; padding:14px; background:{canvas}; border:1px solid {c['border']}; border-radius:12px; font-size:13px;}}
-            QPushButton#agentTask[waiting='true'] {{border-color:{c['warning']};}}
+            QPushButton#desktopTextButton:hover {{color:{c['core'] if neon else accent}; text-decoration:underline;}}
+            QPushButton#desktopPrimary {{{primary} font-weight:650; padding:8px 16px;}}
+            QPushButton#desktopPrimary:hover {{background:{rgba(accent, .22) if neon else accent};}}
+            QFrame#sessionCard {{background:{c['background'] if neon else c['card']}; border:1px solid {c['border']}; border-radius:14px;}}
+            QLabel#sessionTitle {{font-size:14px; font-weight:700;}}
+            QLabel#statusPill {{color:{accent}; background:{rgba(accent, .1)}; border:1px solid {rgba(accent, .45)}; border-radius:9px; padding:2px 9px; font-size:11px; font-weight:650;}}
+            QLabel#statusPill[waiting='true'] {{color:{c['warning']}; background:{rgba(c['warning'], .1)}; border-color:{rgba(c['warning'], .55)};}}
+            QLabel#modelChip {{background:{c['control']}; border:1px solid {c['border']}; border-radius:8px; padding:1px 8px; font-size:10px; font-weight:600;}}
+            QLabel#currentTask {{font-size:12px;}}
+            QToolButton#todoToggle {{background:transparent; border:0; color:{accent}; font-size:11px; font-weight:600; padding:0 2px;}}
+            QLabel#agentChip {{background:{c['control'] if neon else c['background']}; border:1px solid {c['border']}; border-radius:9px; padding:2px 9px; font-size:10px;}}
+            QLabel#todoList {{font-size:11px; padding:2px 0 0 4px;}}
             QLabel#billingSummary {{font-size:13px;}}
-            QLabel#billingDate {{font-size:24px; font-weight:700;}}
-            QWidget#card {{border-radius:16px;}}
+            QLabel#billingDate {{font-family:{DISPLAY_CSS}; font-size:26px; font-weight:600; color:{c['core']};}}
+            QLabel#billingDate[muted='true'] {{color:{c['muted']};}}
         """ + service_bars + risk_rules)
         self.update_navigation_icons()
+        self.render_agents()
 
     def update_navigation_icons(self):
-        accent = "#3268ce" if self.theme == "light" else "#9bbcff"
+        colors = THEMES[self.theme]
         for key, button in self.nav_buttons.items():
-            button.setIcon(navigation_icon(key, accent if button.isChecked() else THEMES[self.theme]["muted"]))
+            button.setIcon(navigation_icon(key, colors["accent"] if button.isChecked() else colors["muted"]))

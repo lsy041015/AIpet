@@ -323,7 +323,7 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(personal.amount.text(), '25%')
         self.assertIn('work@example.test', business.plan.text())
         self.assertIn('personal@example.test', personal.plan.text())
-        self.assertIn('Max', personal.plan.text())
+        self.assertEqual(personal.plan_badge.text(), 'Max')
         self.assertEqual(personal.findChild(QLabel, 'serviceTitle').text(), 'Claude · Max 5x')
         self.assertEqual(business.findChild(QLabel, 'serviceTitle').text(), 'Claude Code')
         # Logins are started from "+ 추가" now; cards carry only a remove menu.
@@ -639,6 +639,54 @@ class WidgetTests(unittest.TestCase):
             self.assertTrue(pet.bubble.isVisible())
             self.window.received_activity([dict(task, status='cancelled') for task in tasks])
             self.assertFalse(pet.bubble.isVisible())
+
+    def test_unknown_agents_never_raise_and_opencode_is_read(self):
+        from widget import ActivityFetch, service_info, session_title
+        from agent_windows import agent_pids
+        self.assertEqual(service_info("gemini")[0], "gemini")
+        self.assertEqual(service_info(None)[0], "에이전트")
+        home = "-".join(("", *Path.home().parts[1:]))
+        self.assertEqual(session_title({"agent": "claude", "target": f"/x/.claude/projects/{home}-my-app/s.jsonl"}), "my-app")
+        self.assertEqual(session_title({"agent": "claude", "title": " 리뷰 ", "target": ""}), "리뷰")
+        self.assertEqual(session_title({"agent": "codex", "target": "/tmp/r.jsonl"}), "GPT / Codex")
+        with patch("widget.read_activity", return_value=[]) as read:
+            ActivityFetch().run()
+        read.assert_called_once_with(detailed=True, extra_agents=True)
+        self.assertEqual(agent_pids("gemini", "/nonexistent"), set())
+        self.window.toggle_collapsed()
+        pet = self.window.restore_button
+        now = datetime.now().timestamp()
+        tasks = [dict(id="g", agent="gemini", label="작업 중", status="running", started=now - 30, updated=now, target="/tmp/g",
+                      subagents=[{"type": None, "model": None}], todos=[{"text": "x"}]),
+                 dict(id="o", agent="opencode", label="작업 중", status="waiting", started=now - 30, updated=now, target="/tmp/o")]
+        with patch.object(pet, "underMouse", return_value=False), patch.object(Widget, "send_notification") as notify:
+            self.window.received_activity(tasks)
+            self.assertIn("gemini", pet.bubble.text.text())
+            self.assertIn("opencode-white.svg", pet.bubble.text.text())
+            self.assertIn("서브에이전트 1 · agent", pet.bubble.text.text())
+            self.window.received_activity([dict(task, status="done") for task in tasks])
+        self.assertEqual([call.args[0] for call in notify.call_args_list],
+                         ["gemini · 작업 완료", "opencode · 작업 완료"])
+        self.window.agent_activity = tasks
+        with patch("widget.QMenu") as menu:
+            menu.return_value.exec.return_value = None
+            self.window.open_activity("more")
+        self.assertIn("gemini · 작업 중", [call.args[0] for call in menu.return_value.addAction.call_args_list])
+
+    def test_neon_turn_on_flicker_respects_reduced_motion(self):
+        signs = self.window.neon_signs
+        self.assertEqual([sign.text() for sign in signs], ["check AI", "AI 한도"])
+        self.window.neon_motion.start()
+        self.window.neon_motion.setCurrentTime(150)
+        self.assertLess(signs[0].lit, 1.0)
+        self.window.reduce_motion.setChecked(True)
+        self.assertNotEqual(self.window.neon_motion.state(), QAbstractAnimation.Running)
+        self.assertEqual([sign.lit for sign in signs], [1.0, 1.0])
+        reduced = Widget()
+        reduced.show()
+        self.assertNotEqual(reduced.neon_motion.state(), QAbstractAnimation.Running)
+        reduced.close()
+        reduced.deleteLater()
 
     def test_activity_bubble_reanchors_after_each_pet_restore(self):
         self.window.move(50, 50)
@@ -1175,16 +1223,20 @@ class WidgetTests(unittest.TestCase):
             server.close()
 
     def test_plan_labels_preserve_raw_names_and_mark_manual_values(self):
-        self.assertEqual(self.window.cards["codex"].plan.text(), "플랜 · prolite")
-        self.assertEqual(self.window.cards["copilot"].plan.text(), "플랜 · Copilot Pro")
+        self.assertEqual(self.window.cards["codex"].plan_badge.text(), "prolite")
+        self.assertEqual(self.window.plan_text("codex"), "플랜 · prolite")
+        self.assertEqual(self.window.cards["copilot"].plan_badge.text(), "Copilot Pro")
         self.assertEqual(self.window.cards["antigravity"].plan.text(), "플랜 정보 미제공")
         with patch("widget.QInputDialog.getText", return_value=("Google AI Pro", True)):
             self.window.edit_antigravity_plan()
-        self.assertIn("Google AI Pro (직접 설정)", self.window.cards["antigravity"].plan.text())
+        self.assertEqual(self.window.cards["antigravity"].plan_badge.text(), "Google AI Pro")
+        self.assertIn("직접 설정", self.window.cards["antigravity"].plan.text())
+        self.assertEqual(self.window.plan_text("antigravity"), "플랜 · Google AI Pro (직접 설정)")
         self.window.received("copilot", None, "연결 실패")
-        self.assertIn("Copilot Pro", self.window.cards["copilot"].plan.text())
+        self.assertEqual(self.window.cards["copilot"].plan_badge.text(), "Copilot Pro")
         self.window.received("copilot", {"rows": ROWS["copilot"], "plan": None}, "")
         self.assertEqual(self.window.cards["copilot"].plan.text(), "플랜 확인 안 됨")
+        self.assertTrue(self.window.cards["copilot"].plan_badge.isHidden())
 
 
 if __name__ == "__main__":

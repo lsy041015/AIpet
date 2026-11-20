@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import time
 from datetime import datetime
+from functools import lru_cache
 
 # This widget does no parallel numerical work; avoid NumPy/BLAS helper pools.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -17,10 +18,11 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSettings, QUrl, QSize, QRectF, QPointF, QVariantAnimation, QEasingCurve, QProcess
-from PySide6.QtGui import QDesktopServices, QFont, QIcon, QColor, QPainter, QPen, QPalette, QPixmap, QLinearGradient, QPainterPath
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSettings, QUrl, QSize, QRect, QRectF, QPointF, QVariantAnimation, QEasingCurve, QProcess
+from PySide6.QtGui import (QDesktopServices, QFont, QFontMetricsF, QIcon, QColor, QPainter, QPen, QPalette, QPixmap,
+                           QLinearGradient, QPainterPath)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QBoxLayout,
                                QLabel, QPushButton, QProgressBar, QScrollArea,
                                QFrame, QButtonGroup, QToolButton, QMenu, QSizeGrip,
                                QGraphicsDropShadowEffect, QSlider, QWidgetAction,
@@ -28,12 +30,12 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
 
 from providers import PROVIDERS, QuotaError
 from accounts import (AddAccountDialog, Login, confirm_remove, cleanup_pending, link as link_account,
-                      load as load_accounts, save as save_accounts, unregister)
+                      load as load_accounts, logo_asset, save as save_accounts, unregister)
 from calendar_panel import CalendarPanel
 from todo import TodoPanel
 from billing import BillingDialog, payment_summary, next_payment, list_price, parse_price, price_summary
 from notifications import Notifications
-from agent_activity import read_activity, ActivityTracker
+from agent_activity import read_activity, ActivityTracker, claude_project
 from agent_windows import XWindows
 from pixel_pet import paint_computer, animation_row, display_row, DURATIONS, ANIMATION_NAMES, atlas
 from html import escape
@@ -55,18 +57,24 @@ SERVICES = {
     "opencode": ("opencode", "한도 정보 없음", "#c8c8d0", "https://opencode.ai/"),
 }
 
+# "dark" is the neon theme (saved settings keep the key). "glow" is empty where nothing glows.
 THEMES = {
-    "dark": {"background": "#171b24", "card": "#252c38", "text": "#f5f5f7",
-             "muted": "#aeaeb8", "track": "#414146", "control": "#363639",
-             "selected": "#485364", "border": "#384353", "warning": "#ffb970", "danger": "#ff8a80",
-             "codex": "#66dfb5", "antigravity": "#91bcff", "copilot": "#d4b3ff", "claude": "#f29c7b",
-             "cursor": "#c8c8d0", "opencode": "#c8c8d0"},
-    "light": {"background": "#f2f2f7", "card": "#ffffff", "text": "#1c1c1e",
+    "dark": {"background": "#0a0908", "card": "#14110f", "sidebar": "#0e0c0a", "text": "#ffeede",
+             "muted": "#b9a493", "track": "#2a211b", "control": "#1d1815",
+             "selected": "#2c1e15", "border": "#2e251e", "warning": "#ffd166", "danger": "#ff6b72",
+             "accent": "#ff8a3d", "accent_soft": "#2a180d", "glow": "#ff6a1a", "core": "#fff3e6",
+             "codex": "#5fe3b8", "antigravity": "#8fb8ff", "copilot": "#cba6ff", "claude": "#ff9a6c",
+             "cursor": "#e8dfd5", "opencode": "#d9cfc4"},
+    "light": {"background": "#f2f2f7", "card": "#ffffff", "sidebar": "#eceef3", "text": "#1c1c1e",
               "muted": "#62626c", "track": "#e6e6ec", "control": "#e4e4eb",
               "selected": "#ffffff", "border": "#d3d3dd", "warning": "#a04a00", "danger": "#c62828",
+              "accent": "#185ec7", "accent_soft": "#dfeaff", "glow": "", "core": "#1c1c1e",
               "codex": "#087e61", "antigravity": "#185ec7", "copilot": "#7b3bb4", "claude": "#a34224",
               "cursor": "#55555f", "opencode": "#55555f"},
 }
+# Thin geometric monoline letters for neon signs and numbers; Hangul falls back to Noto Sans CJK.
+DISPLAY_FONTS = ["URW Gothic", "Ubuntu", "Noto Sans CJK KR"]
+DISPLAY_CSS = ", ".join(f"'{name}'" for name in DISPLAY_FONTS)
 
 PLAN_NAMES = {
     "claude": {"pro": "Pro", "max": "Max", "team": "Business / Team", "enterprise": "Enterprise"},
@@ -117,23 +125,424 @@ def set_risk(item, level):
         item.setProperty("risk", level)
         item.style().unpolish(item)
         item.style().polish(item)
+        item.update()
 
 
-def logo_asset(kind):
-    return Path(__file__).parent / "assets" / (kind + (".png" if kind == "antigravity" else ".svg"))
+def service_info(kind):
+    """Display entry for an agent kind; an agent added to the activity reader later still gets a generic one."""
+    return SERVICES.get(kind) or (str(kind or "에이전트"), "", "#c8c8d0", "")
 
 
-def set_logo(badge, kind, size):
-    asset = logo_asset(kind)
+def session_title(task):
+    """Session name, else the Claude project folder, else the agent name."""
+    title = task.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    folder = Path(str(task.get("target") or "")).parent.name
+    if task.get("agent") == "claude" and folder.startswith("-"):
+        # Claude names the folder after the working directory (/home/u/app -> -home-u-app).
+        home = claude_project(str(Path.home()))
+        name = (folder[len(home):] if folder.startswith(home) else folder).strip("-")
+        if name:
+            return name
+    return service_info(task.get("agent"))[0]
+
+
+def model_text(task):
+    return " · ".join(str(v) for v in (task.get("model"), task.get("effort")) if v)
+
+
+def subagent_text(agent):
+    return " · ".join(str(v) for v in (agent.get("type") or "agent", agent.get("model"), agent.get("effort")) if v)
+
+
+def todo_progress(task):
+    todos = task.get("todos") or []
+    return sum(item.get("status") == "completed" for item in todos), len(todos)
+
+
+def theme_colors(widget):
+    """Colors of the window a widget belongs to; dialogs and bubbles find it through their parents."""
+    while widget is not None:
+        if getattr(widget, "theme", None) in THEMES:
+            return THEMES[widget.theme]
+        widget = widget.parentWidget()
+    return THEMES["dark"]
+
+
+def mix(first, second, amount):
+    a, b = QColor(first), QColor(second)
+    return QColor.fromRgbF(*(x + (y - x) * amount for x, y in zip(a.getRgbF()[:3], b.getRgbF()[:3])))
+
+
+def rgba(color, alpha):
+    color = QColor(color)
+    return f"rgba({color.red()},{color.green()},{color.blue()},{alpha})"
+
+
+def glow_strokes(painter, path, color, strength=1.0):
+    """Neon bloom without graphics effects: wide faint strokes under narrower brighter ones."""
+    for width, alpha in ((14, 9), (8, 20), (4, 46)):
+        halo = QColor(color)
+        halo.setAlpha(round(alpha * strength))
+        painter.strokePath(path, QPen(halo, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+
+
+def neon_tube(painter, path, color, width, strength=1.0):
+    """Stroke a path as a lit tube: colored halo, colored body and a near-white core."""
+    glow_strokes(painter, path, color, strength)
+    painter.strokePath(path, QPen(QColor(color), width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    core = mix(color, "#ffffff", .7)
+    core.setAlphaF(.85 * strength)
+    painter.strokePath(path, QPen(core, max(1.0, width * .4), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+
+
+def paint_edge_glow(painter, rect, radius, color, strength=1.0):
+    """Neon edge inside a rounded frame: a bright line on the border and a halo spreading inward."""
+    painter.setBrush(Qt.NoBrush)
+    for inset, width, alpha in ((4, 6, 16), (2.5, 3.5, 36), (1, 1.6, 215)):
+        line = QColor(color)
+        line.setAlpha(round(alpha * strength))
+        painter.setPen(QPen(line, width))
+        painter.drawRoundedRect(QRectF(rect).adjusted(inset, inset, -inset, -inset), radius - inset, radius - inset)
+
+
+@lru_cache(maxsize=32)
+def logo_icon(path):
+    return QIcon(path)
+
+
+def paint_logo(self, event):
+    """Logo tile: dark tile and white line logo in the neon theme, white tile in the light theme."""
+    colors = theme_colors(self)
+    dark = bool(colors["glow"])
+    p = QPainter(self)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+    rect = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
+    radius = rect.height() * .3
+    down = isinstance(self, QPushButton) and self.isDown()
+    p.setPen(QPen(QColor(colors["border"]), 1))
+    p.setBrush(QColor(colors["selected"] if down else colors["control"] if dark else "#ffffff"))
+    p.drawRoundedRect(rect, radius, radius)
+    asset = logo_asset(self.kind, dark)
+    side = round(rect.width() * .64)
+    target = QRect(round(rect.center().x() - side / 2), round(rect.center().y() - side / 2), side, side)
     if asset.exists():
-        badge.setPixmap(QIcon(str(asset)).pixmap(QSize(size, size), badge.devicePixelRatioF()))
+        logo_icon(str(asset)).paint(p, target)
     else:
-        # Cursor and opencode have no bundled logo.
-        badge.setText(kind[0].upper())
+        font = QFont(self.font())
+        font.setFamilies(DISPLAY_FONTS)
+        font.setPixelSize(round(side * .8))
+        p.setFont(font)
+        p.setPen(QColor(colors.get(self.kind, colors["text"])))
+        p.drawText(target, Qt.AlignCenter, str(self.kind or "?")[:1].upper())
+    if self.hasFocus() and self.testAttribute(Qt.WA_KeyboardFocusChange):
+        p.setPen(QPen(QColor(colors["accent"]), 1.5))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), radius, radius)
+
+
+class LogoBadge(QLabel):
+    def __init__(self, kind, size):
+        super().__init__()
+        self.kind = kind
+        self.setObjectName("badge")
+        self.setFixedSize(size, size)
+
+    paintEvent = paint_logo
+
+
+class LogoButton(QPushButton):
+    def __init__(self, kind, size):
+        super().__init__()
+        self.kind = kind
+        self.setObjectName("badge")
+        self.setFixedSize(size, size)
+
+    paintEvent = paint_logo
+
+
+class NeonSign(QWidget):
+    """Custom painted neon-tube text: near-white core, orange edge and bloom; plain text in the light theme."""
+    PAD = 6
+
+    def __init__(self, text="", pixel=28, brand=False):
+        super().__init__()
+        self._text = ""
+        self.brand = brand
+        self.lit = 1.0
+        # Kept apart from the widget font: the window stylesheet sets every widget's font size.
+        self.sign_font = QFont()
+        self.sign_font.setFamilies(DISPLAY_FONTS)
+        self.sign_font.setPixelSize(pixel)
+        self.sign_font.setWeight(QFont.Medium if brand else QFont.Normal)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.setText(text)
+
+    def text(self):
+        return self._text
+
+    def setText(self, text):
+        self._text = str(text)
+        self.setAccessibleName(self._text)
+        self.updateGeometry()
+        self.update()
+
+    def set_lit(self, value):
+        self.lit = float(value)
+        self.update()
+
+    def sizeHint(self):
+        metrics = QFontMetricsF(self.sign_font)
+        return QSize(math.ceil(metrics.horizontalAdvance(self._text)) + 2 * self.PAD,
+                     math.ceil(metrics.height()) + 2 * self.PAD)
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
+    def paintEvent(self, event):
+        colors = theme_colors(self)
+        metrics = QFontMetricsF(self.sign_font)
+        path = QPainterPath()
+        path.addText(self.PAD, (self.height() - metrics.height()) / 2 + metrics.ascent(), self.sign_font, self._text)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if not colors["glow"]:
+            p.fillPath(path, QColor(colors["accent"] if self.brand else colors["text"]))
+            return
+        glow_strokes(p, path, QColor(colors["glow"]), self.lit)
+        # An unlit tube is dim glass; the flicker fades it toward the bright core.
+        p.fillPath(path, mix("#4a3326", colors["core"], self.lit))
+        edge = QColor(colors["accent"])
+        edge.setAlphaF(.55 * self.lit)
+        p.strokePath(path, QPen(edge, .9))
+
+
+class PlanBadge(QWidget):
+    """Outlined plan pill that shortens its text instead of widening a narrow card."""
+    def __init__(self):
+        super().__init__()
+        self._text = ""
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+
+    def badge_font(self):
+        font = QFont(self.font())
+        font.setPixelSize(10)
+        font.setWeight(QFont.DemiBold)
+        return font
+
+    def text(self):
+        return self._text
+
+    def setText(self, text):
+        self._text = str(text)
+        self.setAccessibleName("플랜 " + self._text)
+        self.updateGeometry()
+        self.update()
+
+    def sizeHint(self):
+        metrics = QFontMetricsF(self.badge_font())
+        return QSize(math.ceil(metrics.horizontalAdvance(self._text)) + 18, math.ceil(metrics.height()) + 6)
+
+    def minimumSizeHint(self):
+        return QSize(min(44, self.sizeHint().width()), self.sizeHint().height())
+
+    def paintEvent(self, event):
+        colors = theme_colors(self)
+        accent = QColor(colors["accent"])
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
+        fill, line = QColor(accent), QColor(accent)
+        fill.setAlphaF(.09)
+        line.setAlphaF(.5)
+        p.setPen(QPen(line, 1))
+        p.setBrush(fill)
+        p.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+        font = self.badge_font()
+        p.setFont(font)
+        p.setPen(accent)
+        text = QFontMetricsF(font).elidedText(self._text, Qt.ElideRight, rect.width() - 14)
+        p.drawText(rect.adjusted(7, 0, -7, 0), Qt.AlignCenter, text)
+
+
+class GlowLabel(QLabel):
+    """Single-line label with a neon halo in the neon theme; its color still comes from the stylesheet."""
+    def paintEvent(self, event):
+        colors = theme_colors(self)
+        if colors["glow"] and self.text() not in ("", "—") and not self.property("muted"):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            metrics, rect = QFontMetricsF(self.font()), QRectF(self.contentsRect())
+            width = metrics.horizontalAdvance(self.text())
+            align = self.alignment()
+            x = (rect.right() - width if align & Qt.AlignRight else
+                 rect.center().x() - width / 2 if align & Qt.AlignHCenter else rect.left())
+            path = QPainterPath()
+            path.addText(x, rect.center().y() - metrics.height() / 2 + metrics.ascent(), self.font(), self.text())
+            # Risk-colored numbers glow in their own color; others in the neon orange.
+            color = self.palette().color(QPalette.WindowText) if self.property("risk") else QColor(colors["glow"])
+            glow_strokes(p, path, color, .75)
+            p.end()
+        super().paintEvent(event)
+
+
+class NeonBar(QProgressBar):
+    """Neon tube progress bar in the neon theme; the light theme keeps the stylesheet bar."""
+    def __init__(self, height):
+        super().__init__()
+        self.setRange(0, 1000)
+        self.setValue(0)
+        self.setTextVisible(False)
+        self.setFixedHeight(height)
+
+    def fill_color(self, colors):
+        risk = self.property("risk")
+        if risk:
+            return QColor(colors["danger" if risk == "critical" else "warning"])
+        widget = self
+        while widget is not None and not widget.property("service"):
+            widget = widget.parentWidget()
+        return QColor(colors.get(widget.property("service") if widget else "", colors["accent"]))
+
+    def fill_rect(self, rect):
+        span = (self.value() - self.minimum()) / max(1, self.maximum() - self.minimum())
+        return QRectF(rect.left(), rect.top(), max(rect.height(), rect.width() * span), rect.height()) if span > 0 else None
+
+    def paint_bloom(self, painter):
+        """Soft light around the filled part, painted by the parent underneath this bar."""
+        fill = self.fill_rect(QRectF(self.geometry()))
+        if fill is None:
+            return
+        color = self.fill_color(theme_colors(self))
+        painter.setPen(Qt.NoPen)
+        for grow, alpha in ((7, 9), (4, 18), (2, 30)):
+            halo = QColor(color)
+            halo.setAlpha(alpha)
+            painter.setBrush(halo)
+            box = fill.adjusted(-grow, -grow, grow, grow)
+            painter.drawRoundedRect(box, box.height() / 2, box.height() / 2)
+
+    def paintEvent(self, event):
+        colors = theme_colors(self)
+        if not colors["glow"]:
+            return super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        rect = QRectF(self.rect())
+        radius = rect.height() / 2
+        p.setBrush(QColor(colors["track"]))
+        p.drawRoundedRect(rect, radius, radius)
+        fill = self.fill_rect(rect)
+        if fill is None:
+            return
+        color = self.fill_color(colors)
+        body = QLinearGradient(fill.topLeft(), fill.topRight())
+        body.setColorAt(0, mix(color, colors["card"], .45))
+        body.setColorAt(1, color)
+        p.setBrush(body)
+        p.drawRoundedRect(fill, radius, radius)
+        core = mix(color, "#ffffff", .6)
+        core.setAlphaF(.8)
+        p.setPen(QPen(core, max(1.0, rect.height() / 3), Qt.SolidLine, Qt.RoundCap))
+        y = rect.center().y()
+        p.drawLine(QPointF(fill.left() + radius, y), QPointF(fill.right() - radius, y))
+
+
+class GlowFrame(QFrame):
+    """Styled frame with a neon edge while hovered or focused; bars directly inside get a soft bloom."""
+    radius = 16
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.update()
+
+    def lit(self):
+        return self.underMouse() or self.hasFocus()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        colors = theme_colors(self)
+        if not colors["glow"]:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        for bar in self.findChildren(NeonBar, "", Qt.FindDirectChildrenOnly):
+            if bar.isVisible():
+                bar.paint_bloom(p)
+        if self.lit():
+            glow = colors["warning"] if self.property("waiting") else colors["accent"]
+            paint_edge_glow(p, QRectF(self.rect()), self.radius, QColor(glow))
+
+
+class AddTile(QPushButton):
+    """Dashed neon outline tile that adds an agent account."""
+    def __init__(self, text="에이전트 추가"):
+        super().__init__(text)
+        self.setObjectName("addTile")
+        self.setAccessibleName("에이전트 추가")
+        self.setToolTip("AI 에이전트 계정 추가")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(64)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
+    def paintEvent(self, event):
+        colors = theme_colors(self)
+        lit = self.underMouse() or self.hasFocus() or self.isDown()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
+        accent = QColor(colors["accent"])
+        fill = QColor(accent)
+        fill.setAlpha(22 if lit else 8)
+        line = QColor(accent)
+        line.setAlpha(235 if lit else 150)
+        pen = QPen(line, 1.4)
+        pen.setDashPattern([4, 3])
+        p.setPen(pen)
+        p.setBrush(fill)
+        p.drawRoundedRect(rect, 18, 18)
+        font = QFont(self.font())
+        font.setPixelSize(13)
+        font.setWeight(QFont.DemiBold)
+        width = QFontMetricsF(font).horizontalAdvance(self.text())
+        left, middle = rect.center().x() - (width + 26) / 2, rect.center().y()
+        plus = QPainterPath(QPointF(left + 8, middle - 7))
+        plus.lineTo(left + 8, middle + 7)
+        plus.moveTo(left + 1, middle)
+        plus.lineTo(left + 15, middle)
+        if colors["glow"]:
+            neon_tube(p, plus, accent, 2.2, 1.0 if lit else .7)
+        else:
+            p.strokePath(plus, QPen(accent, 2.2, Qt.SolidLine, Qt.RoundCap))
+        p.setFont(font)
+        p.setPen(QColor(colors["core"] if colors["glow"] else colors["accent"]))
+        p.drawText(QRectF(left + 26, rect.top(), width + 4, rect.height()), Qt.AlignVCenter | Qt.AlignLeft, self.text())
 
 
 def account_title(account):
-    return account["label"] or SERVICES[account["kind"]][0]
+    return account["label"] or service_info(account["kind"])[0]
 
 
 def nearest_reset(rows, now=None):
@@ -263,6 +672,14 @@ class AppIconButton(QToolButton):
         self.motion.setEndValue(target)
         self.motion.start()
 
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
         if self.isDown():
@@ -274,6 +691,56 @@ class AppIconButton(QToolButton):
         self.pointer_activation = False
         self.animate_scale(1.0)
 
+    def glyph(self):
+        """The icon's line art for the neon theme, with its tube color token."""
+        path = QPainterPath()
+        if self.page == "quota":
+            for x, top in ((34, 45), (50, 34), (66, 23)):
+                path.moveTo(x, top)
+                path.lineTo(x, 55)
+            return path, "accent", 5
+        if self.page == "calendar":
+            path.addRoundedRect(QRectF(29, 24, 42, 36), 7, 7)
+            for x in (40, 60):
+                path.moveTo(x, 19)
+                path.lineTo(x, 28)
+            font = QFont(self.font())
+            font.setFamilies(DISPLAY_FONTS)
+            font.setPixelSize(19)
+            day = str(datetime.now().day)
+            path.addText(50 - QFontMetricsF(font).horizontalAdvance(day) / 2, 52, font, day)
+            return path, "antigravity", 1.6
+        if self.page == "todo":
+            for y in (29, 41, 53):
+                path.moveTo(31, y)
+                path.lineTo(34, y + 3)
+                path.lineTo(39, y - 3)
+                path.moveTo(46, y)
+                path.lineTo(69, y)
+            return path, "codex", 3
+        path.moveTo(32, 33)
+        path.lineTo(32, 23)
+        path.lineTo(41, 27)
+        path.cubicTo(47, 25, 53, 25, 59, 27)
+        path.lineTo(68, 23)
+        path.lineTo(68, 33)
+        path.cubicTo(74, 47, 62, 51, 55, 51)
+        path.cubicTo(58, 53, 58, 57, 58, 62)
+        path.lineTo(43, 62)
+        path.cubicTo(43, 57, 43, 53, 46, 51)
+        path.cubicTo(33, 51, 27, 43, 32, 33)
+        path.moveTo(45, 56)
+        path.cubicTo(31, 59, 35, 48, 28, 48)
+        return path, "copilot", 2.2
+
+    def paint_neon(self, p, box):
+        lit = self.underMouse() or self.isDown() or self.isChecked()
+        p.setPen(QPen(QColor(self.colors["accent"] if lit else self.colors["border"]), 1))
+        p.setBrush(QColor(self.colors["card"]))
+        p.drawRoundedRect(box, 16, 16)
+        path, token, width = self.glyph()
+        neon_tube(p, path, QColor(self.colors[token]), width, 1.0 if lit else .8)
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -281,6 +748,23 @@ class AppIconButton(QToolButton):
         p.scale(self.scale, self.scale)
         p.translate(-50, -40)
         box = QRectF(18, 8, 64, 64)
+        if self.colors["glow"]:
+            self.paint_neon(p, box)
+        else:
+            self.paint_tile(p, box)
+        if self.hasFocus() and self.testAttribute(Qt.WA_KeyboardFocusChange):
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(self.colors["accent"]), 2, Qt.DashLine))
+            p.drawRoundedRect(box.adjusted(-4, -4, 4, 4), 20, 20)
+        p.resetTransform()
+        font = QFont(self.font())
+        font.setPixelSize(12)
+        font.setWeight(QFont.Medium)
+        p.setFont(font)
+        p.setPen(QColor(self.colors["text"]))
+        p.drawText(QRectF(0, 81, 100, 20), Qt.AlignCenter, self.text())
+
+    def paint_tile(self, p, box):
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 35))
         p.drawRoundedRect(box.translated(0, 3), 16, 16)
@@ -344,18 +828,6 @@ class AppIconButton(QToolButton):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 25))
             p.drawRoundedRect(box, 16, 16)
-        if self.hasFocus() and self.testAttribute(Qt.WA_KeyboardFocusChange):
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(self.colors["antigravity"]), 2,
-                          Qt.DashLine if self.hasFocus() else Qt.SolidLine))
-            p.drawRoundedRect(box.adjusted(-4, -4, 4, 4), 20, 20)
-        p.resetTransform()
-        font = QFont(self.font())
-        font.setPixelSize(12)
-        font.setWeight(QFont.Medium)
-        p.setFont(font)
-        p.setPen(QColor(self.colors["text"]))
-        p.drawText(QRectF(0, 81, 100, 20), Qt.AlignCenter, self.text())
 
 
 class CircleButton(AppIconButton):
@@ -415,6 +887,20 @@ class CircleButton(AppIconButton):
         p.scale(self.scale, self.scale)
         radius = center - 3
         rect = QRectF(-radius, -radius, radius * 2, radius * 2)
+        colors = theme_colors(self)
+        if colors["glow"]:
+            # A small neon ring with a lit dash.
+            p.setPen(QPen(QColor(colors["accent"] if self.underMouse() or self.isDown() else colors["border"]), 1.2))
+            p.setBrush(QColor(colors["selected"] if self.isDown() else colors["control"]))
+            p.drawEllipse(rect)
+            dash = QPainterPath(QPointF(-3.5, 0))
+            dash.lineTo(3.5, 0)
+            neon_tube(p, dash, QColor(colors["accent"]), 1.8, .8)
+            if self.hasFocus() and self.testAttribute(Qt.WA_KeyboardFocusChange):
+                p.setPen(QPen(QColor(colors["accent"]), 1.5))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(rect.adjusted(-1.5, -1.5, 1.5, 1.5))
+            return
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 35))
         p.drawEllipse(rect.translated(0, 2))
@@ -477,8 +963,9 @@ class PetBubble(QWidget):
         changed_style = getattr(self, "presentation_style", None) != style
         if changed_style:
             self.presentation_style = style
-            self.layout().setContentsMargins(22, 12 if compact else 16, 22, 12 if compact else 16)
-            self.text.setFixedWidth(208)
+            # Extra room around the body keeps the neon edge's halo inside the window.
+            self.layout().setContentsMargins(24, 17 if compact else 21, 22, 19 if compact else 23)
+            self.text.setFixedWidth(214)
             self.text.setStyleSheet(f"background: transparent; color: {colors['text']}; font-size: 11px;")
         text = pet.owner.pet_summary() if content is None else content
         if changed_style or self.text.text() != text:
@@ -504,18 +991,30 @@ class PetBubble(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        body = QRectF(10, 3, self.width() - 20, self.height() - 8)
+        body = QRectF(12, 8, self.width() - 22, self.height() - 16)
         colors = THEMES[self.parentWidget().owner.theme]
         path = QPainterPath()
         path.addRoundedRect(body, 16, 16)
         tail = QPainterPath()
         x = body.left() if self.on_right else body.right()
-        tip = 1 if self.on_right else self.width() - 1
+        tip = 4 if self.on_right else self.width() - 4
         tail.moveTo(x, self.tail_y - 6)
         tail.lineTo(tip, self.tail_y)
         tail.lineTo(x, self.tail_y + 6)
         tail.closeSubpath()
         path = path.united(tail)
+        if colors["glow"]:
+            # Neon outline: halo first, then the dark body covers its inner half, then the bright tube line.
+            neon = QColor(colors['warning'] if self.waiting else colors['accent'])
+            glow_strokes(p, path, neon, .8)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(colors['card']))
+            p.drawPath(path)
+            neon.setAlpha(225)
+            p.setPen(QPen(neon, 1.3))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+            return
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(0, 0, 0, 45))
         p.drawPath(path.translated(0, 3))
@@ -564,26 +1063,43 @@ class ComputerPet(CircleButton):
             return
         if self.owner.agent_activity:
             colors = THEMES[self.owner.theme]
+            metrics = self.fontMetrics()
             rows = []
             for index, task in enumerate(self.owner.agent_activity[:4]):
-                key, status = task['agent'], task['label']
-                suffix = '.png' if key == 'antigravity' else '-white.svg' if self.owner.theme == 'dark' else '.svg'
-                asset = Path(__file__).parent / 'assets' / (key + suffix)
-                name = 'Codex' if key == 'codex' else SERVICES[key][0]
-                short_status = self.fontMetrics().elidedText(status, Qt.ElideRight, 166)
-                color = colors['warning'] if task['status'] == 'waiting' else colors['muted']
-                minutes, seconds = divmod(task['elapsed'], 60)
+                key, status = task.get('agent'), task.get('label', '')
+                asset = logo_asset(key, self.owner.theme == 'dark')
+                name = 'Codex' if key == 'codex' else service_info(key)[0]
+                title = session_title(task)
+                head = name if title == service_info(key)[0] else title
+                color = colors['warning'] if task.get('status') == 'waiting' else colors['muted']
+                minutes, seconds = divmod(task.get('elapsed', 0), 60)
                 elapsed = f'{minutes}분 {seconds:02d}초' if minutes else f'{seconds}초'
                 if minutes >= 60:
                     elapsed = f'{minutes // 60}시간 {minutes % 60}분'
-                elapsed = ('감지 후 ' if task['estimated'] else '') + elapsed
-                rows.append(f'<tr><td width="27" valign="middle"><a href="{index}"><img src="{asset.as_uri()}" width="20" height="20"></a></td>'
-                            f'<td><a href="{index}" style="color:{colors["text"]}; text-decoration:none;"><b>{escape(name)}</b></a><br>'
-                            f'<a href="{index}" style="color:{color}; text-decoration:none; font-size:10px;">{escape(short_status)}</a><br>'
-                            f'<a href="{index}" style="color:{colors["muted"]}; font-size:9px; text-decoration:none;">{elapsed} 경과</a></td></tr>')
+                elapsed = ('감지 후 ' if task.get('estimated') else '') + elapsed
+
+                def line(text, style, index=index):
+                    return (f'<br><a href="{index}" style="{style} text-decoration:none;">'
+                            f'{escape(metrics.elidedText(text, Qt.ElideRight, 176))}</a>')
+                lines = line(status if head == name else f'{name} · {status}', f'color:{color}; font-size:10px;')
+                done, total = todo_progress(task)
+                current = task.get('current_task')
+                if current or total:
+                    lines += line(f'▸ {current or "할 일"}' + (f' · {done}/{total}' if total else ''),
+                                  f'color:{colors["text"]}; font-size:10px;')
+                helpers = [agent for agent in task.get('subagents') or () if isinstance(agent, dict)]
+                if helpers:
+                    models = dict.fromkeys(str(agent.get('model') or agent.get('type') or 'agent') for agent in helpers)
+                    lines += line(f'서브에이전트 {len(helpers)} · ' + ', '.join(models), f'color:{colors["accent"]}; font-size:10px;')
+                lines += line(f'{elapsed} 경과' + (f' · {model_text(task)}' if model_text(task) else ''),
+                              f'color:{colors["muted"]}; font-size:9px;')
+                image = f'<a href="{index}"><img src="{asset.as_uri()}" width="20" height="20"></a>' if asset.exists() else ''
+                rows.append(f'<tr><td width="27" valign="top">{image}</td>'
+                            f'<td><a href="{index}" style="color:{colors["text"]}; text-decoration:none;">'
+                            f'<b>{escape(metrics.elidedText(head, Qt.ElideRight, 170))}</b></a>{lines}</td></tr>')
             if len(self.owner.agent_activity) > 4:
-                rows.append('<tr><td colspan="2"><a href="more">전체 작업 보기</a></td></tr>')
-            self.bubble.present(self, '<qt><table width="100%" cellspacing="3" cellpadding="0">' + ''.join(rows) + '</table></qt>')
+                rows.append(f'<tr><td colspan="2"><a href="more" style="color:{colors["accent"]};">전체 작업 보기</a></td></tr>')
+            self.bubble.present(self, '<qt><table width="100%" cellspacing="4" cellpadding="0">' + ''.join(rows) + '</table></qt>')
         else:
             self.bubble.hide()
 
@@ -710,7 +1226,7 @@ class HomeButton(AppIconButton):
         p.setRenderHint(QPainter.Antialiasing)
         p.translate(20, 18)
         p.scale(self.scale, self.scale)
-        p.setPen(QPen(QColor(self.colors["antigravity"] if self.hasFocus() else self.colors["border"]), 1))
+        p.setPen(QPen(QColor(self.colors["accent"] if self.hasFocus() or self.underMouse() else self.colors["border"]), 1))
         p.setBrush(QColor(self.colors["selected"] if self.isDown() else self.colors["control"]))
         p.drawRoundedRect(QRectF(-19, -17, 38, 34), 10, 10)
         self.icon().paint(p, -11, -11, 22, 22)
@@ -797,14 +1313,15 @@ class ResizeGrip(QSizeGrip):
         painter.drawLine(11, 14, 14, 11)
 
 
-class Card(QWidget):
+class Card(GlowFrame):
     billing_requested = Signal(str)
     remove_requested = Signal(str)
+    radius = 18
 
     def __init__(self, account):
         super().__init__()
         kind = account["kind"]
-        _, subtitle, _, url = SERVICES[kind]
+        _, subtitle, _, url = service_info(kind)
         title = account_title(account)
         self.key = account["id"]
         self.kind = kind
@@ -815,26 +1332,27 @@ class Card(QWidget):
         layout.setContentsMargins(18, 16, 18, 14)
         layout.setSpacing(10)
         heading = QHBoxLayout()
-        heading.setSpacing(10)
-        badge = QPushButton() if kind == "codex" else label("", "badge")
-        badge.setObjectName("badge")
-        badge.setFixedSize(34, 34)
-        asset = logo_asset(kind)
+        heading.setSpacing(12)
         if kind == "codex":
-            badge.setIcon(QIcon(str(asset)))
-            badge.setIconSize(QSize(26, 26))
+            badge = LogoButton(kind, 36)
             badge.setCursor(Qt.PointingHandCursor)
             badge.setAccessibleName("ChatGPT 프로그램 열기")
             badge.setToolTip("ChatGPT 열기")
             badge.clicked.connect(self.open_chatgpt)
         else:
-            badge.setAlignment(Qt.AlignCenter)
-            set_logo(badge, kind, 26)
+            badge = LogoBadge(kind, 36)
             badge.setAccessibleName(title + " 로고")
-        heading.addWidget(badge)
+        heading.addWidget(badge, 0, Qt.AlignTop)
         titles = QVBoxLayout()
         titles.setSpacing(2)
-        titles.addWidget(label(title, "serviceTitle"))
+        name_row = self.name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+        name_row.addWidget(label(title, "serviceTitle"))
+        self.plan_badge = PlanBadge()
+        self.plan_badge.hide()
+        name_row.addWidget(self.plan_badge, 0, Qt.AlignVCenter)
+        name_row.addStretch(1)
+        titles.addLayout(name_row)
         self.plan = label("플랜 확인 중", "caption")
         titles.addWidget(self.plan)
         heading.addLayout(titles, 1)
@@ -844,29 +1362,28 @@ class Card(QWidget):
         link.setAccessibleName(title + " 서비스 페이지 열기")
         link.setToolTip(title + " 서비스 페이지 열기")
         link.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(url)))
-        heading.addWidget(link)
+        heading.addWidget(link, 0, Qt.AlignTop)
         self.menu_button = QToolButton()
+        self.menu_button.setObjectName("cardMenu")
         self.menu_button.setText("⋯")
+        self.menu_button.setFixedSize(28, 28)
         self.menu_button.setAccessibleName(title + " 계정 메뉴")
         self.menu_button.setPopupMode(QToolButton.InstantPopup)
         menu = QMenu(self.menu_button)
         menu.addAction("계정 제거…").triggered.connect(lambda: self.remove_requested.emit(self.key))
         self.menu_button.setMenu(menu)
-        heading.addWidget(self.menu_button)
+        heading.addWidget(self.menu_button, 0, Qt.AlignTop)
         layout.addLayout(heading)
         summary = QHBoxLayout()
         summary.setSpacing(12)
         self.summary_label = label(subtitle, "secondary")
         summary.addWidget(self.summary_label, 1)
-        self.amount = label("—", "amount")
-        self.amount.setWordWrap(False)
+        self.amount = GlowLabel("—")
+        self.amount.setObjectName("amount")
+        self.amount.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         summary.addWidget(self.amount)
         layout.addLayout(summary)
-        self.bar = QProgressBar()
-        self.bar.setRange(0, 1000)
-        self.bar.setValue(0)
-        self.bar.setTextVisible(False)
-        self.bar.setFixedHeight(6)
+        self.bar = NeonBar(6)
         layout.addWidget(self.bar)
         foot = QHBoxLayout()
         self.reset = label("로그인된 계정에서 조회 중", "caption")
@@ -879,21 +1396,11 @@ class Card(QWidget):
         layout.addLayout(foot)
         if kind not in PROVIDERS:
             self.amount.setText("—")
+            for item in (self.summary_label, self.amount):
+                item.hide()
             self.bar.hide()
             self.details_button.hide()
             self.reset.setText("이 에이전트는 사용량 한도를 제공하지 않습니다")
-        self.next_reset = label("", "caption")
-        self.next_reset.hide()
-        layout.addWidget(self.next_reset)
-        billing_row = QHBoxLayout()
-        self.billing = label("다음 결제일 미설정", "caption")
-        billing_row.addWidget(self.billing, 1)
-        self.billing_button = QPushButton("결제일 설정")
-        self.billing_button.setObjectName("detailsButton")
-        self.billing_button.setAccessibleName(title + " 결제일 설정")
-        self.billing_button.clicked.connect(lambda: self.billing_requested.emit(self.key))
-        billing_row.addWidget(self.billing_button)
-        layout.addLayout(billing_row)
         self.details = QWidget()
         self.rows = QVBoxLayout(self.details)
         self.rows.setContentsMargins(0, 2, 0, 0)
@@ -904,10 +1411,43 @@ class Card(QWidget):
         self.status = label("", "status")
         self.status.hide()
         layout.addWidget(self.status)
+        # A card stretched to its grid row keeps the footer at the bottom, level with its neighbor.
+        layout.addStretch(1)
+        divider = QFrame()
+        divider.setObjectName("divider")
+        divider.setFixedHeight(1)
+        layout.addWidget(divider)
+        # Footer: price and next payment side by side, then the nearest quota reset.
+        facts = QGridLayout()
+        facts.setHorizontalSpacing(16)
+        facts.setVerticalSpacing(1)
+        facts.addWidget(label("요금", "factKey"), 0, 0)
+        facts.addWidget(label("다음 결제", "factKey"), 0, 1)
+        self.price = label("요금 미확인", "factValue")
+        facts.addWidget(self.price, 1, 0)
+        self.billing = label("미설정", "factValue")
+        facts.addWidget(self.billing, 1, 1)
+        self.billing_button = QPushButton("설정")
+        self.billing_button.setObjectName("factButton")
+        self.billing_button.setAccessibleName(title + " 결제일 설정")
+        self.billing_button.setToolTip("결제일·요금 설정")
+        self.billing_button.clicked.connect(lambda: self.billing_requested.emit(self.key))
+        facts.addWidget(self.billing_button, 0, 2, 2, 1, Qt.AlignRight | Qt.AlignVCenter)
+        facts.setColumnStretch(0, 1)
+        facts.setColumnStretch(1, 1)
+        layout.addLayout(facts)
+        self.next_reset = label("", "caption")
+        self.next_reset.hide()
+        layout.addWidget(self.next_reset)
         self.last_success = None
         self.data = []
         self.captions = []
         self.error = ""
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # A narrow card puts the plan pill under the name instead of squeezing both.
+        self.name_row.setDirection(QBoxLayout.TopToBottom if self.width() < 340 else QBoxLayout.LeftToRight)
 
     def open_chatgpt(self):
         started, _ = QProcess.startDetached("chatgpt", [])
@@ -975,11 +1515,8 @@ class Card(QWidget):
             line.addWidget(value)
             stack.addLayout(line)
             if remaining is not None:
-                bar = QProgressBar()
-                bar.setRange(0, 1000)
+                bar = NeonBar(4)
                 bar.setValue(round(remaining * 10))
-                bar.setTextVisible(False)
-                bar.setFixedHeight(4)
                 bar.setAccessibleName(row["label"] + " " + amount)
                 set_risk(bar, risk_level(remaining))
                 stack.addWidget(bar)
@@ -1008,8 +1545,9 @@ class Card(QWidget):
         self.show_next_reset(now)
 
 
-class QuotaRow(QFrame):
+class QuotaRow(GlowFrame):
     activated = Signal(str)
+    radius = 14
 
     def __init__(self, account):
         super().__init__()
@@ -1025,22 +1563,15 @@ class QuotaRow(QFrame):
         stack.setSpacing(4)
         line = QHBoxLayout()
         line.setSpacing(10)
-        logo = label("", "badge")
-        logo.setFixedSize(26, 26)
-        logo.setAlignment(Qt.AlignCenter)
-        set_logo(logo, account["kind"], 20)
-        line.addWidget(logo)
+        line.addWidget(LogoBadge(account["kind"], 28))
         line.addWidget(label(self.title, "serviceTitle"), 1)
-        self.amount = label("—", "quotaAmount")
-        self.amount.setWordWrap(False)
+        self.amount = GlowLabel("—")
+        self.amount.setObjectName("quotaAmount")
         line.addWidget(self.amount)
         stack.addLayout(line)
         self.caption = label("", "caption")
         stack.addWidget(self.caption)
-        self.bar = QProgressBar()
-        self.bar.setRange(0, 1000)
-        self.bar.setTextVisible(False)
-        self.bar.setFixedHeight(4)
+        self.bar = NeonBar(4)
         policy = self.bar.sizePolicy()
         policy.setRetainSizeWhenHidden(True)
         self.bar.setSizePolicy(policy)
@@ -1084,7 +1615,7 @@ class ActivityFetch(QThread):
     result = Signal(list)
 
     def run(self):
-        self.result.emit(read_activity(detailed=True))
+        self.result.emit(read_activity(detailed=True, extra_agents=True))
 
 
 class Widget(QWidget):
@@ -1128,6 +1659,7 @@ class Widget(QWidget):
         outer.setContentsMargins(12, 12, 12, 12)
         self.surface = QFrame()
         self.surface.setObjectName("surface")
+        # The only graphics effect: nested effects break painting, so other glows are painted.
         shadow = QGraphicsDropShadowEffect(self.surface)
         shadow.setBlurRadius(24)
         shadow.setOffset(0, 4)
@@ -1229,7 +1761,7 @@ class Widget(QWidget):
         segment_layout.setSpacing(2)
         self.theme_group = QButtonGroup(self)
         self.theme_buttons = {}
-        for key, text in (("light", "라이트"), ("dark", "다크")):
+        for key, text in (("light", "라이트"), ("dark", "네온")):
             button = QPushButton(text)
             button.setObjectName("themeButton")
             button.setCheckable(True)
@@ -1240,7 +1772,7 @@ class Widget(QWidget):
             segment_layout.addWidget(button)
         title.insertWidget(0, segment)
         layout.addLayout(appearance)
-        self.page_heading = label("", "pageHeading")
+        self.page_heading = NeonSign("", 28)
         layout.addWidget(self.page_heading)
         self.pages = QStackedWidget()
         self.page_opacity = PageFade(self.pages)
@@ -1283,10 +1815,6 @@ class Widget(QWidget):
         empty_layout = QVBoxLayout(self.empty_state)
         empty_layout.setContentsMargins(18, 16, 18, 16)
         empty_layout.addWidget(label("등록된 에이전트가 없습니다.\n사용 중인 AI 에이전트 계정을 추가하면 남은 한도를 표시합니다.", "secondary"))
-        empty_add = QPushButton("+ 에이전트 추가")
-        empty_add.setAccessibleName("에이전트 추가")
-        empty_add.clicked.connect(self.add_account)
-        empty_layout.addWidget(empty_add, 0, Qt.AlignLeft)
         quota_layout.addWidget(self.empty_state)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -1297,6 +1825,9 @@ class Widget(QWidget):
         self.card_layout = QVBoxLayout(content)
         self.card_layout.setContentsMargins(0, 0, 2, 0)
         self.card_layout.setSpacing(12)
+        self.add_tile = AddTile()
+        self.add_tile.clicked.connect(self.add_account)
+        self.card_layout.addWidget(self.add_tile)
         self.card_layout.addStretch()
         self.calendar = CalendarPanel(self)
         self.calendar.activity.connect(self.restore_button.set_status)
@@ -1334,7 +1865,7 @@ class Widget(QWidget):
         self.dock = QFrame()
         self.dock.setObjectName("navigationDock")
         dock_layout = QGridLayout(self.dock)
-        dock_layout.setContentsMargins(12, 24, 12, 22)
+        dock_layout.setContentsMargins(12, 14, 12, 12)
         dock_layout.setHorizontalSpacing(24)
         dock_layout.setVerticalSpacing(20)
         dock_layout.setColumnStretch(0, 1)
@@ -1363,10 +1894,20 @@ class Widget(QWidget):
                 dock_layout.addWidget(button, index // 2, index % 2 + 1)
         self.home_page = QWidget()
         home_layout = QVBoxLayout(self.home_page)
-        home_layout.setContentsMargins(0, 12, 0, 0)
+        home_layout.setContentsMargins(0, 0, 0, 0)
+        home_layout.setSpacing(0)
         home_layout.addStretch(1)
+        self.home_sign = NeonSign(APP_NAME, 34, brand=True)
+        home_layout.addWidget(self.home_sign, 0, Qt.AlignHCenter)
         home_layout.addWidget(self.dock)
         home_layout.addStretch(2)
+        self.neon_signs = [self.home_sign, self.page_heading]
+        # One-time "turn-on" flicker when the window first opens; skipped with reduced motion.
+        self.neon_motion = QVariantAnimation(self)
+        self.neon_motion.setDuration(900)
+        for step, value in ((0, 0.0), (.1, .85), (.16, .15), (.3, 1.0), (.36, .4), (.5, 1.0), (1, 1.0)):
+            self.neon_motion.setKeyValueAt(step, value)
+        self.neon_motion.valueChanged.connect(lambda value: [sign.set_lit(value) for sign in self.neon_signs])
         self.pages.addWidget(self.home_page)
         self.todo_scroll = QScrollArea()
         self.todo_scroll.setWidgetResizable(True)
@@ -1425,6 +1966,13 @@ class Widget(QWidget):
         if not smoke:
             QTimer.singleShot(0, self.calendar.refresh)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "neon_started", False):
+            self.neon_started = True
+            if not self.smoke and not self.reduce_motion.isChecked() and THEMES[self.theme]["glow"]:
+                self.neon_motion.start()
+
     def refresh_activity(self):
         if self.activity_job is not None:
             return
@@ -1438,9 +1986,9 @@ class Widget(QWidget):
         for item in notices:
             if item['status'] == 'waiting':
                 if self.settings.value("notify/agents/waiting", True, type=bool):
-                    self.send_notification(SERVICES[item['agent']][0] + ' · 승인·입력 대기', item['label'])
+                    self.send_notification(service_info(item['agent'])[0] + ' · 승인·입력 대기', item['label'])
                 continue
-            self.send_notification(SERVICES[item['agent']][0] + (' · 작업 실패' if item['status'] == 'failed' else ' · 작업 완료'), item['label'])
+            self.send_notification(service_info(item['agent'])[0] + (' · 작업 실패' if item['status'] == 'failed' else ' · 작업 완료'), item['label'])
             self.restore_button.set_status(5 if item['status'] == 'failed' else 8)
         if self.restore_button.isVisible():
             if animation_row(self.restore_button) != self.restore_button.animation_state:
@@ -1452,7 +2000,7 @@ class Widget(QWidget):
         tasks = list(self.agent_activity)
         if link == 'more':
             menu = QMenu(self)
-            choices = {menu.addAction(SERVICES[t['agent']][0] + ' · ' + t['label']): i for i, t in enumerate(tasks)}
+            choices = {menu.addAction(service_info(t['agent'])[0] + ' · ' + t['label']): i for i, t in enumerate(tasks)}
             action = menu.exec(self.restore_button.bubble.pos())
             if action not in choices:
                 return
@@ -1550,15 +2098,15 @@ class Widget(QWidget):
         self.update_quota_list()
 
     def layout_cards(self):
-        self.insert_missing(self.card_layout, self.cards)
+        self.insert_missing(self.card_layout, self.cards, 2)
         self.insert_missing(self.list_layout, self.quota_rows)
 
     @staticmethod
-    def insert_missing(layout, items):
-        # New accounts are appended, so only new widgets need inserting before the stretch.
+    def insert_missing(layout, items, tail=1):
+        # New accounts are appended, so only new widgets need inserting before the trailing items.
         for item in items.values():
             if layout.indexOf(item) < 0:
-                layout.insertWidget(layout.count() - 1, item)
+                layout.insertWidget(layout.count() - tail, item)
 
     def rebuild_alert_menus(self):
         for menu in self.quota_alert_menus:
@@ -1584,7 +2132,7 @@ class Widget(QWidget):
     def new_label(self, kind):
         # A second account of the same agent needs a distinguishable title.
         count = sum(account["kind"] == kind for account in self.accounts)
-        return f"{SERVICES[kind][0]} {count + 1}" if count else ""
+        return f"{service_info(kind)[0]} {count + 1}" if count else ""
 
     def add_account(self):
         dialog = AddAccountDialog(self, self.accounts)
@@ -1692,13 +2240,15 @@ class Widget(QWidget):
         rows = []
         for account in self.accounts:
             value = self.pet_quotas.get(account["id"], "조회 전")
-            rows.append(f'<tr><td>{escape(account_title(account))}</td><td align="right"><b>{escape(value)}</b></td></tr>')
+            color = colors["warning"] if value == "조회 실패" else colors["text"]
+            rows.append(f'<tr><td>{escape(account_title(account))}</td>'
+                        f'<td align="right" style="color:{color};"><b>{escape(value)}</b></td></tr>')
         if not rows:
             rows.append('<tr><td>등록된 에이전트 없음</td></tr>')
-        return (f'<qt><span style="color:{colors["antigravity"]}; font-size:11px;">MY DESK</span>'
+        return (f'<qt><span style="color:{colors["accent"]}; font-size:11px;">MY DESK</span>'
                 '<br><span style="font-size:16px;"><b>오늘 한눈에</b></span>'
-                f'<p><span style="color:{colors["antigravity"]};">다가오는 일정</span><br>' + schedule + '</p>'
-                f'<p><span style="color:{colors["antigravity"]};">AI 남은 한도</span></p>'
+                f'<p><span style="color:{colors["accent"]};">다가오는 일정</span><br>' + schedule + '</p>'
+                f'<p><span style="color:{colors["accent"]};">AI 남은 한도</span></p>'
                 '<table width="100%" cellspacing="0" cellpadding="4">' + ''.join(rows) + '</table>'
                 f'<p style="color:{colors["muted"]}; font-size:10px;">클릭: 열기 · 드래그: 이동<br>우클릭: 빠른 일정 입력</p></qt>')
 
@@ -1712,6 +2262,9 @@ class Widget(QWidget):
         if not self.smoke:
             self.settings.setValue("reduce_motion", enabled)
         if enabled:
+            self.neon_motion.stop()
+            for sign in self.neon_signs:
+                sign.set_lit(1.0)
             self.fold_transition.finish()
             self.setWindowOpacity(1 if self.collapsed else 1 - self.opacity_slider.value() / 100)
             self.page_motion.stop()
@@ -1803,88 +2356,118 @@ class Widget(QWidget):
         self.theme_buttons[theme].setChecked(True)
         if not self.smoke:
             self.settings.setValue("theme", theme)
+        neon = bool(colors["glow"])
+        effect = self.surface.graphicsEffect()
+        if effect is not None:
+            # The window's one shadow becomes a faint orange bloom on the dark wall.
+            effect.setColor(QColor(255, 106, 26, 38) if neon else QColor(0, 0, 0, 65))
+            effect.setBlurRadius(28 if neon else 24)
+            effect.setOffset(0, 0 if neon else 4)
+        accent, soft = colors["accent"], colors["accent_soft"]
+        primary = (f"background:{rgba(accent, .1)}; border:1px solid {accent}; color:{colors['core']}; font-weight:650;"
+                   if neon else f"background:{accent}; border:1px solid {accent}; color:{colors['card']}; font-weight:700;")
+        primary_hover = f"background:{rgba(accent, .22)};" if neon else f"background:{mix(accent, '#000000', .12).name()};"
+        hover_border = rgba(accent, .65) if neon else colors["border"]
         self.setStyleSheet(f"""
             QWidget {{color:{colors['text']}; font-size:12px; background:transparent;}}
-            QFrame#surface {{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {colors['background']},stop:1 {colors['card']}); border:1px solid {colors['border']}; border-radius:32px;}}
-            QWidget#card {{background:{colors['card']}; border:1px solid {colors['border']}; border-radius:22px;}}
-            QLabel#pageHeading {{font-size:28px; font-weight:700; letter-spacing:-1px; padding:2px 0 6px 0;}}
+            QFrame#surface {{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {colors['background']},stop:1 {colors['sidebar'] if neon else colors['card']}); border:1px solid {colors['border']}; border-radius:32px;}}
+            QWidget#card {{background:{colors['card']}; border:1px solid {colors['border']}; border-radius:18px;}}
             QFrame#navigationDock {{background:transparent; border:0;}}
-            QLabel#clock {{font-size:20px; font-weight:600;}}
+            QLabel#clock {{font-family:{DISPLAY_CSS}; font-size:20px; font-weight:500; letter-spacing:.5px;}}
             QLabel#serviceTitle {{font-size:14px; font-weight:700;}}
             QLabel#secondary {{color:{colors['muted']}; font-size:11px;}}
             QLabel#caption, QLabel#status {{color:{colors['muted']}; font-size:11px;}}
+            QFrame#divider {{background:{colors['border']}; border:0;}}
+            QLabel#factKey {{color:{colors['muted']}; font-size:10px;}}
+            QLabel#factValue {{font-size:12px; font-weight:650;}}
             QLabel#calendarListing {{font-size:13px; padding:12px 2px;}}
             QLabel#todoCount {{font-size:14px; font-weight:650; padding:8px 2px 2px 2px;}}
             QLabel#todoMessage {{color:{colors['warning']}; font-size:11px;}}
             QFrame#todoItem {{background:{colors['card']}; border:1px solid {colors['border']}; border-radius:14px;}}
             QLabel#todoText[completed='true'] {{color:{colors['muted']};}}
-            QPushButton#todoAdd {{background:{colors['antigravity']}; color:{colors['card']}; font-weight:700;}}
-            QPushButton#todoDelete {{background:transparent; color:{colors['muted']}; font-size:18px; padding:0;}}
+            QPushButton#todoAdd {{{primary}}}
+            QPushButton#todoDelete {{background:transparent; border:0; color:{colors['muted']}; font-size:18px; padding:0;}}
             QWidget#eventCard {{background:{colors['background']}; border:1px solid {colors['border']}; border-radius:14px;}}
-            QWidget#eventCard[current='true'] {{border:1px solid {colors['antigravity']};}}
-            QLabel#eventTime {{color:{colors['antigravity']}; font-size:12px; font-weight:600;}}
+            QWidget#eventCard[current='true'] {{border:1px solid {accent};}}
+            QLabel#eventTime {{color:{accent}; font-size:12px; font-weight:600;}}
             QLabel#success {{color:{colors['codex']}; padding:8px; font-weight:600;}}
             QComboBox {{background:{colors['control']}; border:1px solid {colors['border']}; border-radius:8px; padding:8px;}}
-            QComboBox QAbstractItemView {{background:{colors['card']}; color:{colors['text']}; selection-background-color:{colors['selected']};}}
-            QLabel#amount {{font-family:'DejaVu Sans'; font-size:26px; font-weight:600; letter-spacing:-2px;}}
-            QLabel#quotaAmount {{font-family:'DejaVu Sans'; font-size:18px; font-weight:600;}}
+            QComboBox QAbstractItemView {{background:{colors['card']}; color:{colors['text']}; selection-background-color:{soft};}}
+            QLabel#amount {{font-family:{DISPLAY_CSS}; font-size:26px; font-weight:600; color:{colors['core']};}}
+            QLabel#quotaAmount {{font-family:{DISPLAY_CSS}; font-size:18px; font-weight:600; color:{colors['core']};}}
             QFrame#quotaRow {{background:{colors['card']}; border:1px solid {colors['border']}; border-radius:14px;}}
-            QFrame#quotaRow:hover, QFrame#quotaRow:focus {{border-color:{colors['antigravity']};}}
+            QFrame#quotaRow:hover, QFrame#quotaRow:focus {{border-color:{accent};}}
             QLabel#rowTitle {{font-size:11px;}}
             QLabel#rowValue {{font-size:10px; font-weight:600;}}
-            QLabel#badge {{border-radius:11px; background:#ffffff;}}
-            QPushButton#badge {{border-radius:11px; background:#ffffff; padding:0;}}
-            QPushButton, QToolButton {{border:1px solid transparent; border-radius:10px; padding:5px 9px; background:{colors['control']}; font-size:11px;}}
-            QPushButton:hover, QToolButton:hover {{border-color:{colors['border']};}}
+            QPushButton, QToolButton {{border:1px solid {colors['border'] if neon else 'transparent'}; border-radius:10px; padding:5px 10px; background:{colors['control']}; font-size:11px;}}
+            QPushButton:hover, QToolButton:hover {{border-color:{hover_border};}}
             QPushButton:pressed, QToolButton:pressed {{background:{colors['selected']};}}
-            QPushButton:focus, QToolButton:focus {{border-color:{colors['antigravity']};}}
+            QPushButton:focus, QToolButton:focus {{border-color:{accent};}}
             QPushButton:disabled {{color:{colors['muted']};}}
-            QPushButton#link {{background:transparent; font-size:17px; padding:0; color:{colors['muted']};}}
-            QPushButton#detailsButton {{background:transparent; color:{colors['muted']}; padding:2px 4px; font-size:10px;}}
-            QFrame#segment {{background:{colors['control']}; border-radius:12px;}}
-            QPushButton#themeButton {{background:transparent; padding:4px 9px; border-radius:9px;}}
-            QPushButton#themeButton:checked {{background:{colors['selected']};}}
+            QPushButton#primaryButton {{{primary} padding:8px 14px; font-size:12px;}}
+            QPushButton#primaryButton:hover, QPushButton#todoAdd:hover, QPushButton#eventSubmit:hover, QPushButton#calendarAdd:hover {{{primary_hover}}}
+            QPushButton#primaryButton:disabled {{background:{colors['control']}; border-color:{colors['border']}; color:{colors['muted']};}}
+            QPushButton#link {{background:transparent; border:0; font-size:17px; padding:0; color:{colors['muted']};}}
+            QPushButton#link:hover {{color:{accent};}}
+            QToolButton#cardMenu {{background:transparent; border:0; padding:0; color:{colors['muted']}; font-size:15px;}}
+            QToolButton#cardMenu:hover {{color:{accent};}}
+            QToolButton#cardMenu::menu-indicator {{image:none; width:0;}}
+            QPushButton#detailsButton {{background:transparent; border:0; color:{colors['muted']}; padding:2px 4px; font-size:10px;}}
+            QPushButton#detailsButton:hover, QPushButton#detailsButton:checked {{color:{accent};}}
+            QPushButton#factButton {{background:transparent; border:1px solid {colors['border']}; border-radius:9px; color:{colors['muted']}; padding:3px 10px; font-size:11px;}}
+            QPushButton#factButton:hover, QPushButton#factButton:focus {{border-color:{accent}; color:{accent};}}
+            QFrame#segment {{background:{colors['control']}; border:1px solid {colors['border'] if neon else colors['control']}; border-radius:12px;}}
+            QPushButton#themeButton {{background:transparent; border:0; padding:4px 10px; border-radius:9px;}}
+            QPushButton#themeButton:checked {{background:{soft if neon else colors['selected']}; color:{accent if neon else colors['text']}; font-weight:650;}}
             QProgressBar {{background:{colors['track']}; border:0; border-radius:3px;}}
             QProgressBar::chunk {{border-radius:3px;}}
+            QProgressBar#todoProgress::chunk {{background:{accent};}}
             QScrollArea {{border:0;}}
             QScrollBar:vertical {{width:4px; background:transparent; margin:0;}}
             QScrollBar::handle:vertical {{background:{colors['border']}; border-radius:2px; min-height:24px;}}
+            QScrollBar::handle:vertical:hover {{background:{accent};}}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{height:0;}}
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{background:transparent;}}
             QMenu {{background:{colors['card']}; border:1px solid {colors['border']}; padding:6px;}}
             QDialog, QCalendarWidget {{background:{colors['card']};}}
-            QLabel#eventHeading {{font-size:22px; font-weight:700;}}
+            QLabel#eventHeading {{font-family:{DISPLAY_CSS}; font-size:22px; font-weight:600; color:{colors['core'] if neon else colors['text']};}}
+            QListWidget#agentKinds {{background:{colors['background'] if neon else colors['control']}; border:1px solid {colors['border']}; border-radius:12px; padding:5px; outline:0;}}
+            QListWidget#agentKinds::item {{padding:6px 8px; border-radius:8px; border:1px solid transparent;}}
+            QListWidget#agentKinds::item:hover {{background:{colors['control'] if neon else colors['card']};}}
+            QListWidget#agentKinds::item:selected {{background:{soft}; color:{colors['text']}; border:1px solid {rgba(accent, .55)};}}
+            QListWidget#agentKinds::item:disabled {{color:{colors['muted']};}}
             QPushButton#keywordButton {{padding:7px 5px; border:1px solid {colors['border']}; border-radius:8px;}}
-            QPushButton#keywordButton:checked {{background:{colors['selected']}; border-color:{colors['antigravity']}; color:{colors['antigravity']}; font-weight:600;}}
-            QPushButton#eventSubmit {{background:{colors['antigravity']}; color:{colors['card']}; font-size:13px; font-weight:700;}}
-            QPushButton#eventSubmit:disabled {{background:{colors['control']}; color:{colors['muted']};}}
-            QPushButton#calendarAdd {{background:{colors['antigravity']}; color:{colors['card']}; font-weight:700;}}
-            QPushButton#calendarAdd:disabled {{background:{colors['control']}; color:{colors['muted']};}}
+            QPushButton#keywordButton:checked {{background:{soft}; border-color:{accent}; color:{accent}; font-weight:600;}}
+            QPushButton#eventSubmit {{{primary} font-size:13px;}}
+            QPushButton#eventSubmit:disabled {{background:{colors['control']}; border-color:{colors['border']}; color:{colors['muted']};}}
+            QPushButton#calendarAdd {{{primary}}}
+            QPushButton#calendarAdd:disabled {{background:{colors['control']}; border-color:{colors['border']}; color:{colors['muted']};}}
             QCalendarWidget {{border:1px solid {colors['border']}; border-radius:12px; padding:8px;}}
             QCalendarWidget QWidget#qt_calendar_navigationbar {{background:{colors['control']}; border-radius:8px; padding:4px;}}
-            QCalendarWidget QToolButton {{background:transparent; font-size:14px; font-weight:600; padding:7px; border-radius:6px;}}
+            QCalendarWidget QToolButton {{background:transparent; border:0; font-size:14px; font-weight:600; padding:7px; border-radius:6px;}}
             QCalendarWidget QToolButton:hover {{background:{colors['selected']};}}
-            QCalendarWidget QAbstractItemView {{background:{colors['card']}; alternate-background-color:{colors['control']}; color:{colors['text']}; selection-background-color:{colors['antigravity']}; selection-color:{colors['card']}; font-size:14px; border:0; outline:0;}}
+            QCalendarWidget QAbstractItemView {{background:{colors['card']}; alternate-background-color:{colors['control']}; color:{colors['text']}; selection-background-color:{accent}; selection-color:{colors['card']}; font-size:14px; border:0; outline:0;}}
             QCalendarWidget QSpinBox {{background:{colors['control']}; color:{colors['text']}; font-size:14px; border:1px solid {colors['border']}; padding:4px;}}
             QLineEdit, QDateTimeEdit, QDateEdit {{background:{colors['control']}; border:1px solid {colors['border']}; border-radius:10px; padding:8px;}}
-            QLineEdit:focus, QDateTimeEdit:focus, QDateEdit:focus {{border-color:{colors['antigravity']};}}
+            QLineEdit:focus, QDateTimeEdit:focus, QDateEdit:focus {{border-color:{accent};}}
             QCheckBox::indicator {{width:14px; height:14px; border:1px solid {colors['muted']}; border-radius:3px; background:{colors['control']};}}
-            QCheckBox::indicator:checked {{background:{colors['antigravity']};}}
+            QCheckBox::indicator:checked {{background:{accent}; border-color:{accent};}}
             QMenu::item {{padding:8px 20px; border-radius:6px;}}
-            QMenu::item:selected {{background:{colors['control']};}}
+            QMenu::item:selected {{background:{soft if neon else colors['control']};}}
             QSlider::groove:horizontal {{height:5px; background:{colors['track']}; border-radius:2px;}}
-            QSlider::sub-page:horizontal {{background:{colors['antigravity']}; border-radius:2px;}}
-            QSlider::handle:horizontal {{background:{colors['text']}; width:16px; margin:-6px 0; border-radius:8px;}}
-            QSlider:focus {{border:1px solid {colors['antigravity']}; border-radius:4px;}}
+            QSlider::sub-page:horizontal {{background:{accent}; border-radius:2px;}}
+            QSlider::handle:horizontal {{background:{colors['core'] if neon else colors['text']}; width:16px; margin:-6px 0; border-radius:8px;}}
+            QSlider:focus {{border:1px solid {accent}; border-radius:4px;}}
             QToolTip {{background:{colors['card']}; color:{colors['text']}; border:1px solid {colors['border']}; padding:6px;}}
         """ + "\n".join(
-            f"QWidget[service='{key}'] QLabel#badge, QWidget[service='{key}'] QLabel#rowValue {{color:{colors[key]};}} "
+            f"QWidget[service='{key}'] QLabel#rowValue {{color:{colors[key]};}} "
             f"QWidget[service='{key}'] QProgressBar::chunk {{background:{colors[key]};}}"
             for key in SERVICES
         ) + f"\nQWidget[warning='true'] QLabel#status {{color:{colors['warning']};}}" + "\n".join(
             # Per-service selectors are needed to outrank the service-colored chunk and rowValue rules.
             f"QProgressBar[risk='{risk}']::chunk, QWidget[service='{key}'] QProgressBar[risk='{risk}']::chunk {{background:{colors[token]};}} "
-            f"QLabel[risk='{risk}'], QWidget[service='{key}'] QLabel#rowValue[risk='{risk}'] {{color:{colors[token]};}}"
+            f"QLabel[risk='{risk}'], QLabel#amount[risk='{risk}'], QLabel#quotaAmount[risk='{risk}'], "
+            f"QWidget[service='{key}'] QLabel#rowValue[risk='{risk}'] {{color:{colors[token]};}}"
             for risk, token in (("low", "warning"), ("critical", "danger")) for key in SERVICES
         ))
         self.update_page_icons()
@@ -1927,11 +2510,11 @@ class Widget(QWidget):
         self.billing_day = datetime.now().date()
         for key, card in self.cards.items():
             manual, record = self.billing_record(key), self.payment_record(key)
-            card.billing.setText(payment_summary(record, self.billing_day) + "\n"
-                                 + price_summary(self.price_override(key), self.plan_price(key)))
+            card.billing.setText(payment_summary(record, self.billing_day))
+            card.price.setText(price_summary(self.price_override(key), self.plan_price(key)))
             card.billing.setToolTip("이 카드에 직접 설정한 결제 예정일" if manual else
                                     "ChatGPT 로그인 정보의 구독 만료일" if record else "서비스에서 확인한 결제일을 직접 설정하세요")
-            card.billing_button.setText("수정" if manual or self.price_override(key) is not None else "결제일 설정")
+            card.billing_button.setText("수정" if manual or self.price_override(key) is not None else "설정")
 
     def edit_billing(self, key):
         dialog = BillingDialog(self, account_title(self.account(key)), self.billing_record(key),
@@ -1954,29 +2537,44 @@ class Widget(QWidget):
             self.settings.setValue("billing/" + key, json.dumps(record))
         self.update_billing()
 
-    def plan_text(self, key):
+    def plan_name(self, key):
+        """Short plan name for the card badge ("" when unknown) and whether the user typed it."""
         kind = self.account(key)["kind"]
         meta = self.meta.get(key, {})
         manual = self.settings.value("antigravity_plan", "") if kind == "antigravity" else ""
-        raw = meta.get("plan")
         if manual:
-            return f"플랜 · {manual} (직접 설정)"
+            return manual, True
+        raw = meta.get("plan")
         if not (isinstance(raw, str) and raw.strip()):
-            return "플랜 정보 미제공" if kind not in ("claude", "codex", "copilot") else "플랜 확인 안 됨"
+            return "", False
         name = PLAN_NAMES.get(kind, {}).get(raw, raw)
         tier = meta.get("tier") if isinstance(meta.get("tier"), str) else ""
         if kind == "claude" and raw == "max":
             name += next((" " + size for size in ("20x", "5x") if size in tier), "")
-        return "플랜 · " + " · ".join(v for v in (name, meta.get("org")) if v)
+        return name, False
+
+    def plan_text(self, key):
+        name, manual = self.plan_name(key)
+        if manual:
+            return f"플랜 · {name} (직접 설정)"
+        if not name:
+            return "플랜 정보 미제공" if self.account(key)["kind"] not in ("claude", "codex", "copilot") else "플랜 확인 안 됨"
+        return "플랜 · " + " · ".join(v for v in (name, self.meta.get(key, {}).get("org")) if v)
 
     def show_plan(self, key):
         meta = self.meta.get(key, {})
-        account = meta.get("account") if isinstance(meta.get("account"), str) else ""
+        account, org = (meta.get(name) if isinstance(meta.get(name), str) else "" for name in ("account", "org"))
+        name, manual = self.plan_name(key)
         card = self.cards[key]
-        card.plan.setText(self.plan_text(key) + ("\n" + account if account else ""))
+        card.plan_badge.setText(name)
+        card.plan_badge.setVisible(bool(name))
+        status = "직접 설정한 플랜" if manual else "" if name else self.plan_text(key)
+        card.plan.setText(" · ".join(v for v in (status, account, org) if v))
+        card.plan.setVisible(bool(card.plan.text()))
         raw = meta.get("plan")
-        card.plan.setToolTip("사용자가 입력한 플랜" if "(직접 설정)" in card.plan.text() else
-                             f"서비스 응답: {raw}" if raw else "한도만으로 플랜을 추정하지 않습니다.")
+        tip = "사용자가 입력한 플랜" if manual else f"서비스 응답: {raw}" if raw else "한도만으로 플랜을 추정하지 않습니다."
+        card.plan.setToolTip(tip)
+        card.plan_badge.setToolTip(tip)
 
     def edit_antigravity_plan(self):
         value, accepted = QInputDialog.getText(
