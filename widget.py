@@ -17,7 +17,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSettings, QUrl, QSize, QRectF, QPointF, QVariantAnimation, QEasingCurve, QProcess, QProcessEnvironment
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSettings, QUrl, QSize, QRectF, QPointF, QVariantAnimation, QEasingCurve, QProcess
 from PySide6.QtGui import QDesktopServices, QFont, QIcon, QColor, QPainter, QPen, QPalette, QPixmap, QLinearGradient, QPainterPath
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -26,10 +26,12 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                                QGraphicsDropShadowEffect, QSlider, QWidgetAction,
                                QInputDialog, QMessageBox, QStackedWidget, QSizePolicy, QGridLayout)
 
-from providers import PROVIDERS, QuotaError, executable, claude_max_dir, claude_environment
+from providers import PROVIDERS, QuotaError
+from accounts import (AddAccountDialog, Login, confirm_remove, cleanup_pending, link as link_account,
+                      load as load_accounts, save as save_accounts, unregister)
 from calendar_panel import CalendarPanel
 from todo import TodoPanel
-from billing import BillingDialog, payment_summary, next_payment
+from billing import BillingDialog, payment_summary, next_payment, list_price, parse_price, price_summary
 from notifications import Notifications
 from agent_activity import read_activity, ActivityTracker
 from agent_windows import XWindows
@@ -43,23 +45,27 @@ WEB_APPS = {
     "github": ("GitHub", "https://github.com/"),
 }
 
+# Per agent kind; cards are per registered account (see accounts.py).
 SERVICES = {
     "codex": ("GPT / Codex", "ChatGPT 구독 · Codex 한도", "#74d9b3", "https://chatgpt.com/codex/settings/usage"),
-    "claude": ("Claude Code", "기본 CLI 계정 · 세션·주간 잔여량", "#d97757", "https://claude.ai/settings/usage"),
-    "claude_max": ("Claude · Max 5x", "개인 구독 · 별도 계정", "#d97757", "https://claude.ai/settings/usage"),
+    "claude": ("Claude Code", "세션·주간 잔여량", "#d97757", "https://claude.ai/settings/usage"),
     "antigravity": ("Antigravity", "모델 그룹별 사용한도", "#94b8ff", "https://antigravity.google/"),
     "copilot": ("GitHub Copilot", "크레딧·요청 잔여량", "#cfacff", "https://github.com/settings/copilot"),
+    "cursor": ("Cursor", "한도 조회 미지원", "#c8c8d0", "https://cursor.com/dashboard"),
+    "opencode": ("opencode", "한도 정보 없음", "#c8c8d0", "https://opencode.ai/"),
 }
 
 THEMES = {
     "dark": {"background": "#171b24", "card": "#252c38", "text": "#f5f5f7",
              "muted": "#aeaeb8", "track": "#414146", "control": "#363639",
              "selected": "#485364", "border": "#384353", "warning": "#ffb970", "danger": "#ff8a80",
-             "codex": "#66dfb5", "antigravity": "#91bcff", "copilot": "#d4b3ff", "claude": "#f29c7b", "claude_max": "#f29c7b"},
+             "codex": "#66dfb5", "antigravity": "#91bcff", "copilot": "#d4b3ff", "claude": "#f29c7b",
+             "cursor": "#c8c8d0", "opencode": "#c8c8d0"},
     "light": {"background": "#f2f2f7", "card": "#ffffff", "text": "#1c1c1e",
               "muted": "#62626c", "track": "#e6e6ec", "control": "#e4e4eb",
               "selected": "#ffffff", "border": "#d3d3dd", "warning": "#a04a00", "danger": "#c62828",
-              "codex": "#087e61", "antigravity": "#185ec7", "copilot": "#7b3bb4", "claude": "#a34224", "claude_max": "#a34224"},
+              "codex": "#087e61", "antigravity": "#185ec7", "copilot": "#7b3bb4", "claude": "#a34224",
+              "cursor": "#55555f", "opencode": "#55555f"},
 }
 
 PLAN_NAMES = {
@@ -113,9 +119,27 @@ def set_risk(item, level):
         item.style().polish(item)
 
 
-def logo_asset(key):
-    asset_key = "claude" if key == "claude_max" else key
-    return Path(__file__).parent / "assets" / (asset_key + (".png" if key == "antigravity" else ".svg"))
+def logo_asset(kind):
+    return Path(__file__).parent / "assets" / (kind + (".png" if kind == "antigravity" else ".svg"))
+
+
+def set_logo(badge, kind, size):
+    asset = logo_asset(kind)
+    if asset.exists():
+        badge.setPixmap(QIcon(str(asset)).pixmap(QSize(size, size), badge.devicePixelRatioF()))
+    else:
+        # Cursor and opencode have no bundled logo.
+        badge.setText(kind[0].upper())
+
+
+def account_title(account):
+    return account["label"] or SERVICES[account["kind"]][0]
+
+
+def nearest_reset(rows, now=None):
+    now = time.time() if now is None else now
+    upcoming = [row for row in rows if isinstance(row.get("reset_at"), (int, float)) and row["reset_at"] > now]
+    return min(upcoming, key=lambda row: row["reset_at"], default=None)
 
 
 def motion_curve():
@@ -747,13 +771,14 @@ def listen_for_activation(widget, socket_path, mode="compact"):
 class Fetch(QThread):
     result = Signal(str, object, str)
 
-    def __init__(self, key, parent):
+    def __init__(self, account, parent):
         super().__init__(parent)
-        self.key = key
+        self.account = dict(account)
+        self.key = account["id"]
 
     def run(self):
         try:
-            self.result.emit(self.key, PROVIDERS[self.key](), "")
+            self.result.emit(self.key, PROVIDERS[self.account["kind"]](self.account), "")
         except QuotaError as error:
             self.result.emit(self.key, None, str(error))
         except Exception:
@@ -774,12 +799,16 @@ class ResizeGrip(QSizeGrip):
 
 class Card(QWidget):
     billing_requested = Signal(str)
+    remove_requested = Signal(str)
 
-    def __init__(self, key):
+    def __init__(self, account):
         super().__init__()
-        title, subtitle, _, url = SERVICES[key]
-        self.key = key
-        self.setProperty("service", key)
+        kind = account["kind"]
+        _, subtitle, _, url = SERVICES[kind]
+        title = account_title(account)
+        self.key = account["id"]
+        self.kind = kind
+        self.setProperty("service", kind)
         self.setObjectName("card")
         self.setAttribute(Qt.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
@@ -787,11 +816,11 @@ class Card(QWidget):
         layout.setSpacing(10)
         heading = QHBoxLayout()
         heading.setSpacing(10)
-        badge = QPushButton() if key == "codex" else label("", "badge")
+        badge = QPushButton() if kind == "codex" else label("", "badge")
         badge.setObjectName("badge")
         badge.setFixedSize(34, 34)
-        asset = logo_asset(key)
-        if key == "codex":
+        asset = logo_asset(kind)
+        if kind == "codex":
             badge.setIcon(QIcon(str(asset)))
             badge.setIconSize(QSize(26, 26))
             badge.setCursor(Qt.PointingHandCursor)
@@ -800,7 +829,7 @@ class Card(QWidget):
             badge.clicked.connect(self.open_chatgpt)
         else:
             badge.setAlignment(Qt.AlignCenter)
-            badge.setPixmap(QIcon(str(asset)).pixmap(QSize(26, 26), self.devicePixelRatioF()))
+            set_logo(badge, kind, 26)
             badge.setAccessibleName(title + " 로고")
         heading.addWidget(badge)
         titles = QVBoxLayout()
@@ -816,6 +845,14 @@ class Card(QWidget):
         link.setToolTip(title + " 서비스 페이지 열기")
         link.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(url)))
         heading.addWidget(link)
+        self.menu_button = QToolButton()
+        self.menu_button.setText("⋯")
+        self.menu_button.setAccessibleName(title + " 계정 메뉴")
+        self.menu_button.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self.menu_button)
+        menu.addAction("계정 제거…").triggered.connect(lambda: self.remove_requested.emit(self.key))
+        self.menu_button.setMenu(menu)
+        heading.addWidget(self.menu_button)
         layout.addLayout(heading)
         summary = QHBoxLayout()
         summary.setSpacing(12)
@@ -834,18 +871,20 @@ class Card(QWidget):
         foot = QHBoxLayout()
         self.reset = label("로그인된 계정에서 조회 중", "caption")
         foot.addWidget(self.reset, 1)
-        if key == "claude_max":
-            self.login_button = QPushButton("계정 로그인")
-            self.login_button.setAccessibleName("Claude Max 5x 계정 별도 로그인")
-            self.login_button.setToolTip("브라우저에서 개인 Max 계정으로 로그인한 뒤 새로고침하세요")
-            self.login_button.clicked.connect(self.open_claude_login)
-            foot.addWidget(self.login_button)
         self.details_button = QPushButton("상세")
         self.details_button.setObjectName("detailsButton")
         self.details_button.setCheckable(True)
         self.details_button.setAccessibleName(title + " 기간별 한도 펼치기")
         foot.addWidget(self.details_button)
         layout.addLayout(foot)
+        if kind not in PROVIDERS:
+            self.amount.setText("—")
+            self.bar.hide()
+            self.details_button.hide()
+            self.reset.setText("이 에이전트는 사용량 한도를 제공하지 않습니다")
+        self.next_reset = label("", "caption")
+        self.next_reset.hide()
+        layout.addWidget(self.next_reset)
         billing_row = QHBoxLayout()
         self.billing = label("다음 결제일 미설정", "caption")
         billing_row.addWidget(self.billing, 1)
@@ -869,30 +908,6 @@ class Card(QWidget):
         self.data = []
         self.captions = []
         self.error = ""
-
-    def open_claude_login(self):
-        try:
-            profile = claude_max_dir()
-            profile.mkdir(mode=0o700, parents=True, exist_ok=True)
-            profile.chmod(0o700)
-            env = QProcessEnvironment()
-            for name, value in claude_environment(profile).items():
-                env.insert(name, value)
-            process = QProcess(self)
-            process.setProcessEnvironment(env)
-            process.setWorkingDirectory(str(profile))
-            process.setProgram(executable("terminator"))
-            process.setArguments(["--no-dbus", "--title", "Claude Max 5x 로그인", "-x",
-                                  executable("rtk"), "proxy", executable("claude"), "auth", "login"])
-            result = process.startDetached()
-            started = result[0] if isinstance(result, tuple) else result
-            process.deleteLater()
-            if not started:
-                raise OSError("terminal launch failed")
-            self.status.setText("브라우저에서 Max 계정 로그인 후 새로고침해 주세요")
-            self.status.show()
-        except (OSError, QuotaError):
-            QMessageBox.warning(self, "Claude Max 로그인", "로그인 터미널을 열지 못했습니다. Claude Code와 Terminator 설치를 확인해 주세요.")
 
     def open_chatgpt(self):
         started, _ = QProcess.startDetached("chatgpt", [])
@@ -977,21 +992,30 @@ class Card(QWidget):
         self.status.hide()
         self.details.setToolTip("마지막 갱신 " + self.last_success)
         self.setToolTip("")
+        self.show_next_reset()
+
+    def show_next_reset(self, now=None):
+        row = nearest_reset(self.data, now)
+        self.next_reset.setVisible(row is not None)
+        if row is not None:
+            self.next_reset.setText(f"가장 가까운 초기화 · {row['label']} · {time_left(row['reset_at'], now)}")
 
     def refresh_countdown(self, now=None):
         if self.data and self.data[0]["remaining"] is not None:
             self.reset.setText(reset_line(self.data[0], now))
         for caption, row in self.captions:
             caption.setText(reset_line(row, now))
+        self.show_next_reset(now)
 
 
 class QuotaRow(QFrame):
     activated = Signal(str)
 
-    def __init__(self, key):
+    def __init__(self, account):
         super().__init__()
-        self.key = key
-        self.setProperty("service", key)
+        self.key = account["id"]
+        self.title = account_title(account)
+        self.setProperty("service", account["kind"])
         self.setObjectName("quotaRow")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1004,9 +1028,9 @@ class QuotaRow(QFrame):
         logo = label("", "badge")
         logo.setFixedSize(26, 26)
         logo.setAlignment(Qt.AlignCenter)
-        logo.setPixmap(QIcon(str(logo_asset(key))).pixmap(QSize(20, 20), self.devicePixelRatioF()))
+        set_logo(logo, account["kind"], 20)
         line.addWidget(logo)
-        line.addWidget(label(SERVICES[key][0], "serviceTitle"), 1)
+        line.addWidget(label(self.title, "serviceTitle"), 1)
         self.amount = label("—", "quotaAmount")
         self.amount.setWordWrap(False)
         line.addWidget(self.amount)
@@ -1042,7 +1066,7 @@ class QuotaRow(QFrame):
             # A failed lookup with nothing to show is flagged like a low quota.
             set_risk(item, "low" if card.error and not rows else risk_level(remaining))
         self.setToolTip("\n".join(([card.error] if card.error else []) + tip))
-        self.setAccessibleName(f"{SERVICES[self.key][0]} {amount} · 카드로 자세히 보기")
+        self.setAccessibleName(f"{self.title} {amount} · 카드로 자세히 보기")
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
@@ -1084,8 +1108,12 @@ class Widget(QWidget):
         self.activity_job = None
         self.collapsed = False
         self.fold_transition = FoldTransition(self)
-        self.api_plans = {}
-        self.account_names = {}
+        # Last successful snapshot per account without its rows: plan, account, org, tier, renews.
+        self.meta = {}
+        self.accounts = load_accounts(self.settings)
+        self.logins = []
+        if not smoke:
+            cleanup_pending()
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon.fromTheme("utilities-system-monitor"))
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
@@ -1138,16 +1166,8 @@ class Widget(QWidget):
             action.setChecked(self.settings.value("notify/calendar", 10, type=int) == minutes)
             action.triggered.connect(lambda checked=False, m=minutes: self.set_reminder(m))
             self.reminder_actions.append((minutes, action))
-        for key, service in SERVICES.items():
-            if key not in PROVIDERS:
-                continue
-            group = alerts.addMenu(service[0])
-            for threshold in (20, 10):
-                action = group.addAction(f"잔여 {threshold}% 이하")
-                action.setCheckable(True)
-                setting = f"notify/{key}/{threshold}"
-                action.setChecked(self.settings.value(setting, True, type=bool))
-                action.toggled.connect(lambda enabled, name=setting: self.settings.setValue(name, enabled))
+        self.alerts = alerts
+        self.quota_alert_menus = []
         self.waiting_action = alerts.addAction("에이전트 승인 대기")
         self.waiting_action.setCheckable(True)
         self.waiting_action.setChecked(self.settings.value("notify/agents/waiting", True, type=bool))
@@ -1248,38 +1268,48 @@ class Widget(QWidget):
             self.quota_view_group.addButton(button)
             self.quota_view_buttons[view] = button
             switch_layout.addWidget(button)
-        quota_layout.addWidget(self.quota_view_switch, 0, Qt.AlignLeft)
+        quota_header = QHBoxLayout()
+        quota_header.addWidget(self.quota_view_switch)
+        quota_header.addStretch(1)
+        self.add_button = QPushButton("+ 추가")
+        self.add_button.setAccessibleName("에이전트 추가")
+        self.add_button.setToolTip("AI 에이전트 계정 추가")
+        self.add_button.clicked.connect(self.add_account)
+        quota_header.addWidget(self.add_button)
+        quota_layout.addLayout(quota_header)
+        self.empty_state = QFrame()
+        self.empty_state.setObjectName("card")
+        self.empty_state.setAttribute(Qt.WA_StyledBackground, True)
+        empty_layout = QVBoxLayout(self.empty_state)
+        empty_layout.setContentsMargins(18, 16, 18, 16)
+        empty_layout.addWidget(label("등록된 에이전트가 없습니다.\n사용 중인 AI 에이전트 계정을 추가하면 남은 한도를 표시합니다.", "secondary"))
+        empty_add = QPushButton("+ 에이전트 추가")
+        empty_add.setAccessibleName("에이전트 추가")
+        empty_add.clicked.connect(self.add_account)
+        empty_layout.addWidget(empty_add, 0, Qt.AlignLeft)
+        quota_layout.addWidget(self.empty_state)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.viewport().setAutoFillBackground(False)
         content = QWidget()
         content.setObjectName("content")
-        cards = QVBoxLayout(content)
-        cards.setContentsMargins(0, 0, 2, 0)
-        cards.setSpacing(12)
+        self.card_layout = QVBoxLayout(content)
+        self.card_layout.setContentsMargins(0, 0, 2, 0)
+        self.card_layout.setSpacing(12)
+        self.card_layout.addStretch()
         self.calendar = CalendarPanel(self)
         self.calendar.activity.connect(self.restore_button.set_status)
-        self.cards = {key: Card(key) for key in SERVICES}
-        self.show_plan("antigravity")
-        for card in self.cards.values():
-            cards.addWidget(card)
-            card.billing_requested.connect(self.edit_billing)
-        self.update_billing()
-        cards.addStretch()
         self.scroll.setWidget(content)
         quota_layout.addWidget(self.scroll, 1)
         self.quota_list = QWidget()
-        list_layout = QVBoxLayout(self.quota_list)
-        list_layout.setContentsMargins(0, 0, 2, 0)
-        list_layout.setSpacing(8)
-        self.quota_rows = {key: QuotaRow(key) for key in SERVICES}
-        for key, row in self.quota_rows.items():
-            row.activated.connect(self.show_card)
-            row.update_card(self.cards[key])
-            list_layout.addWidget(row)
-        list_layout.addStretch()
+        self.list_layout = QVBoxLayout(self.quota_list)
+        self.list_layout.setContentsMargins(0, 0, 2, 0)
+        self.list_layout.setSpacing(8)
+        self.list_layout.addStretch()
         quota_layout.addWidget(self.quota_list, 1)
+        self.cards, self.quota_rows = {}, {}
+        self.sync_accounts()
         footer = QHBoxLayout()
         self.refresh_button = QPushButton("새로고침")
         self.refresh_button.clicked.connect(self.refresh)
@@ -1491,6 +1521,123 @@ class Widget(QWidget):
         for key, row in self.quota_rows.items():
             row.update_card(self.cards[key])
 
+    def sync_accounts(self):
+        """Create or drop cards so they match the registered accounts, in order."""
+        ids = [account["id"] for account in self.accounts]
+        for key in [key for key in self.cards if key not in ids]:
+            for item in (self.cards.pop(key), self.quota_rows.pop(key)):
+                item.setParent(None)
+                item.deleteLater()
+            for store in (self.meta, self.pet_quotas, self.pet_low):
+                store.pop(key, None)
+        for account in self.accounts:
+            key = account["id"]
+            if key in self.cards:
+                continue
+            card = Card(account)
+            card.billing_requested.connect(self.edit_billing)
+            card.remove_requested.connect(self.remove_account)
+            row = QuotaRow(account)
+            row.activated.connect(self.show_card)
+            self.cards[key], self.quota_rows[key] = card, row
+            if account["kind"] not in PROVIDERS:
+                self.pet_quotas[key] = "한도 정보 없음"
+            self.show_plan(key)
+        self.layout_cards()
+        self.empty_state.setVisible(not self.accounts)
+        self.rebuild_alert_menus()
+        self.update_billing()
+        self.update_quota_list()
+
+    def layout_cards(self):
+        self.insert_missing(self.card_layout, self.cards)
+        self.insert_missing(self.list_layout, self.quota_rows)
+
+    @staticmethod
+    def insert_missing(layout, items):
+        # New accounts are appended, so only new widgets need inserting before the stretch.
+        for item in items.values():
+            if layout.indexOf(item) < 0:
+                layout.insertWidget(layout.count() - 1, item)
+
+    def rebuild_alert_menus(self):
+        for menu in self.quota_alert_menus:
+            self.alerts.removeAction(menu.menuAction())
+            menu.deleteLater()
+        self.quota_alert_menus = []
+        for account in self.accounts:
+            if account["kind"] not in PROVIDERS:
+                continue
+            group = QMenu(account_title(account), self.alerts)
+            for threshold in (20, 10):
+                action = group.addAction(f"잔여 {threshold}% 이하")
+                action.setCheckable(True)
+                setting = f"notify/{account['id']}/{threshold}"
+                action.setChecked(self.settings.value(setting, True, type=bool))
+                action.toggled.connect(lambda enabled, name=setting: self.settings.setValue(name, enabled))
+            self.alerts.insertMenu(self.waiting_action, group)
+            self.quota_alert_menus.append(group)
+
+    def account(self, key):
+        return next((account for account in self.accounts if account["id"] == key), None)
+
+    def new_label(self, kind):
+        # A second account of the same agent needs a distinguishable title.
+        count = sum(account["kind"] == kind for account in self.accounts)
+        return f"{SERVICES[kind][0]} {count + 1}" if count else ""
+
+    def add_account(self):
+        dialog = AddAccountDialog(self, self.accounts)
+        choice = dialog.choice if dialog.exec() == AddAccountDialog.Accepted else None
+        dialog.deleteLater()
+        if not choice:
+            return
+        action, value = choice
+        if action == "link":
+            self.account_added(link_account(self.settings, self.accounts, value, self.new_label(value["kind"])))
+            return
+        login = Login(value, self)
+        try:
+            login.start()
+        except (OSError, QuotaError):
+            login.deleteLater()
+            QMessageBox.warning(self, "에이전트 로그인", "로그인 터미널을 열지 못했습니다. 에이전트 CLI와 터미널 프로그램 설치를 확인해 주세요.")
+            return
+        login.finished.connect(lambda account, job=login: self.login_finished(job, account))
+        self.logins.append(login)
+        self.note.setText("터미널에서 로그인을 마치면 카드가 추가됩니다 · 최대 10분 대기")
+        self.note.show()
+
+    def login_finished(self, login, account):
+        self.logins.remove(login)
+        login.deleteLater()
+        if account is None:
+            self.note.setText("로그인이 확인되지 않아 계정을 추가하지 않았습니다")
+            return
+        account["label"] = self.new_label(account["kind"])
+        self.accounts.append(account)
+        save_accounts(self.settings, self.accounts)
+        self.note.hide()
+        self.account_added(account)
+
+    def account_added(self, account):
+        self.sync_accounts()
+        self.fetch_account(account)
+        self.show_card(account["id"])
+
+    def remove_account(self, key):
+        account = self.account(key)
+        if account is None:
+            return
+        confirmed, delete_profile = confirm_remove(self, account_title(account), account)
+        if not confirmed:
+            return
+        try:
+            unregister(self.settings, self.accounts, key, delete_profile)
+        except OSError:
+            QMessageBox.warning(self, "계정 제거", "계정은 목록에서 제거했지만 프로필 폴더를 삭제하지 못했습니다.\n" + account["profile_dir"])
+        self.sync_accounts()
+
     def set_quota_view(self, view, persist=True):
         view = view if view in ("cards", "list") else "cards"
         self.scroll.setVisible(view == "cards")
@@ -1503,7 +1650,8 @@ class Widget(QWidget):
         self.set_quota_view("cards")
         card = self.cards[key]
         # The cards were laid out while hidden; scroll once the page has been re-laid out.
-        QTimer.singleShot(0, lambda: self.scroll.ensureWidgetVisible(card, 0, 12))
+        # Bound to the card: the call is dropped if the card or window is deleted first.
+        QTimer.singleShot(0, card, lambda: self.scroll.ensureWidgetVisible(card, 0, 12))
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -1542,9 +1690,11 @@ class Widget(QWidget):
                 lines.append("조회된 다음 시간 지정 일정 없음")
         schedule = "<br>".join(escape(line).replace("\n", "<br>") for line in lines)
         rows = []
-        for key, info in SERVICES.items():
-            value = self.pet_quotas.get(key, "조회 전")
-            rows.append(f'<tr><td>{escape(info[0])}</td><td align="right"><b>{escape(value)}</b></td></tr>')
+        for account in self.accounts:
+            value = self.pet_quotas.get(account["id"], "조회 전")
+            rows.append(f'<tr><td>{escape(account_title(account))}</td><td align="right"><b>{escape(value)}</b></td></tr>')
+        if not rows:
+            rows.append('<tr><td>등록된 에이전트 없음</td></tr>')
         return (f'<qt><span style="color:{colors["antigravity"]}; font-size:11px;">MY DESK</span>'
                 '<br><span style="font-size:16px;"><b>오늘 한눈에</b></span>'
                 f'<p><span style="color:{colors["antigravity"]};">다가오는 일정</span><br>' + schedule + '</p>'
@@ -1757,19 +1907,45 @@ class Widget(QWidget):
             return None
         return record if next_payment(record) else None
 
+    def payment_record(self, key):
+        """The manual renewal date, else the paid-until date read from a Codex login."""
+        record = self.billing_record(key)
+        renews = self.meta.get(key, {}).get("renews")
+        if record is None and isinstance(renews, str) and next_payment({"date": renews, "period": "once"}):
+            record = {"date": renews, "period": "once", "auto": True}
+        return record
+
+    def price_override(self, key):
+        value = self.settings.value("price/" + key)
+        return None if value in (None, "") else parse_price(value)
+
+    def plan_price(self, key):
+        meta = self.meta.get(key, {})
+        return list_price(self.account(key)["kind"], meta.get("plan"), meta.get("tier"))
+
     def update_billing(self):
         self.billing_day = datetime.now().date()
         for key, card in self.cards.items():
-            record = self.billing_record(key)
-            card.billing.setText(payment_summary(record, self.billing_day))
-            card.billing.setToolTip("이 카드에 직접 설정한 결제 예정일" if record else "서비스에서 확인한 결제일을 직접 설정하세요")
-            card.billing_button.setText("수정" if record else "결제일 설정")
+            manual, record = self.billing_record(key), self.payment_record(key)
+            card.billing.setText(payment_summary(record, self.billing_day) + "\n"
+                                 + price_summary(self.price_override(key), self.plan_price(key)))
+            card.billing.setToolTip("이 카드에 직접 설정한 결제 예정일" if manual else
+                                    "ChatGPT 로그인 정보의 구독 만료일" if record else "서비스에서 확인한 결제일을 직접 설정하세요")
+            card.billing_button.setText("수정" if manual or self.price_override(key) is not None else "결제일 설정")
 
     def edit_billing(self, key):
-        dialog = BillingDialog(self, SERVICES[key][0], self.billing_record(key))
+        dialog = BillingDialog(self, account_title(self.account(key)), self.billing_record(key),
+                               self.price_override(key), self.plan_price(key))
         if dialog.exec() == BillingDialog.Accepted:
+            self.save_price(key, dialog.price())
             self.save_billing(key, dialog.selection())
         dialog.deleteLater()
+
+    def save_price(self, key, price):
+        if price is None:
+            self.settings.remove("price/" + key)
+        else:
+            self.settings.setValue("price/" + key, f"{price:g}")
 
     def save_billing(self, key, record):
         if record is None:
@@ -1778,19 +1954,29 @@ class Widget(QWidget):
             self.settings.setValue("billing/" + key, json.dumps(record))
         self.update_billing()
 
-    def show_plan(self, key):
-        manual = self.settings.value("antigravity_plan", "") if key == "antigravity" else ""
-        raw = self.api_plans.get(key)
+    def plan_text(self, key):
+        kind = self.account(key)["kind"]
+        meta = self.meta.get(key, {})
+        manual = self.settings.value("antigravity_plan", "") if kind == "antigravity" else ""
+        raw = meta.get("plan")
         if manual:
-            text = f"플랜 · {manual} (직접 설정)"
-        elif isinstance(raw, str) and raw.strip():
-            text = "플랜 · " + PLAN_NAMES.get("claude" if key == "claude_max" else key, {}).get(raw, raw)
-        else:
-            text = "플랜 정보 미제공" if key == "antigravity" else "플랜 확인 안 됨"
-        account = self.account_names.get(key, "")
-        self.cards[key].plan.setText(text + ("\n" + account if account else ""))
-        self.cards[key].plan.setToolTip("사용자가 입력한 플랜" if manual else
-                                       f"서비스 응답: {raw}" if raw else "한도만으로 플랜을 추정하지 않습니다.")
+            return f"플랜 · {manual} (직접 설정)"
+        if not (isinstance(raw, str) and raw.strip()):
+            return "플랜 정보 미제공" if kind not in ("claude", "codex", "copilot") else "플랜 확인 안 됨"
+        name = PLAN_NAMES.get(kind, {}).get(raw, raw)
+        tier = meta.get("tier") if isinstance(meta.get("tier"), str) else ""
+        if kind == "claude" and raw == "max":
+            name += next((" " + size for size in ("20x", "5x") if size in tier), "")
+        return "플랜 · " + " · ".join(v for v in (name, meta.get("org")) if v)
+
+    def show_plan(self, key):
+        meta = self.meta.get(key, {})
+        account = meta.get("account") if isinstance(meta.get("account"), str) else ""
+        card = self.cards[key]
+        card.plan.setText(self.plan_text(key) + ("\n" + account if account else ""))
+        raw = meta.get("plan")
+        card.plan.setToolTip("사용자가 입력한 플랜" if "(직접 설정)" in card.plan.text() else
+                             f"서비스 응답: {raw}" if raw else "한도만으로 플랜을 추정하지 않습니다.")
 
     def edit_antigravity_plan(self):
         value, accepted = QInputDialog.getText(
@@ -1798,7 +1984,8 @@ class Widget(QWidget):
             text=self.settings.value("antigravity_plan", ""))
         if accepted:
             self.settings.setValue("antigravity_plan", value.strip()[:100])
-            self.show_plan("antigravity")
+            for key in self.cards:
+                self.show_plan(key)
 
     @staticmethod
     def autostart_path():
@@ -1879,17 +2066,26 @@ class Widget(QWidget):
     def refresh(self):
         if self.jobs:
             return
-        self.restore_button.set_status(7)
         self.quota_failed = False
+        for account in self.accounts:
+            self.fetch_account(account)
+        if self.jobs:
+            self.restore_button.set_status(7)
+
+    def fetch_account(self, account):
+        if account["kind"] not in PROVIDERS:
+            return
+        job = Fetch(account, self)
+        job.result.connect(self.received)
+        job.finished.connect(self.finished)
+        self.jobs.append(job)
         self.refresh_button.setEnabled(False)
-        for key in PROVIDERS:
-            job = Fetch(key, self)
-            job.result.connect(self.received)
-            job.finished.connect(self.finished)
-            self.jobs.append(job)
-            job.start()
+        job.start()
 
     def received(self, key, snapshot, error):
+        # A removed account's late result is dropped.
+        if key not in self.cards:
+            return
         self.quota_failed = getattr(self, "quota_failed", False) or bool(error)
         card = self.cards[key]
         card.update_result(snapshot["rows"] if snapshot else None, error)
@@ -1899,10 +2095,10 @@ class Widget(QWidget):
         if not error:
             self.pet_low[key] = any(isinstance(row.get("remaining"), (int, float)) and row["remaining"] <= 20
                                     for row in snapshot["rows"])
-            self.api_plans[key] = snapshot.get("plan")
-            self.account_names[key] = snapshot.get("account", "")
+            self.meta[key] = {name: value for name, value in snapshot.items() if name != "rows"}
             self.updated.setText(datetime.now().strftime("%H:%M 갱신") + " · 3분 간격")
-            self.notifications.quota(key, SERVICES[key][0], snapshot["rows"])
+            self.notifications.quota(key, account_title(self.account(key)), snapshot["rows"])
+            self.update_billing()
         self.show_plan(key)
 
     def finished(self):
@@ -1987,6 +2183,9 @@ class Widget(QWidget):
         self.timer.stop()
         self.clock_timer.stop()
         self.activity_timer.stop()
+        # An unfinished login registers nothing; its pending profile folder is removed.
+        for login in self.logins:
+            login.cancel()
         # Hide and stop answering activations before waiting: a relaunch then waits for the lock.
         # Qt still emits lastWindowClosed once the close is accepted.
         self.hide()
@@ -2013,12 +2212,15 @@ def main():
     args = parser.parse_args()
     if args.check:
         failed = False
-        for key, provider in PROVIDERS.items():
+        for account in load_accounts(QSettings("wego", "ai-quota-widget")):
+            if account["kind"] not in PROVIDERS:
+                continue
+            head = {"account": account["id"], "kind": account["kind"], "label": account_title(account)}
             try:
-                print(json.dumps({"service": key, **provider()}, ensure_ascii=False))
+                print(json.dumps({**head, **PROVIDERS[account["kind"]](account)}, ensure_ascii=False))
             except Exception as error:
                 failed = True
-                print(json.dumps({"service": key, "error": str(error) if isinstance(error, QuotaError) else "Invalid response"},
+                print(json.dumps({**head, "error": str(error) if isinstance(error, QuotaError) else "Invalid response"},
                                  ensure_ascii=False))
         return int(failed)
     app = QApplication(sys.argv[:1])
