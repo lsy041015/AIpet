@@ -516,6 +516,16 @@ class WidgetAccountTests(Isolated):
             window.finished()
         self.assertFalse(profile.exists())
 
+    def test_new_titles_reuse_the_smallest_free_number(self):
+        self.settings.setValue("accounts", json.dumps([record("codex", "c1"), record("codex", "c3", "/p3", "GPT / Codex 3")]))
+        window = self.window()
+        self.assertEqual(window.new_label("codex"), "GPT / Codex 2")
+        window.accounts.insert(1, record("codex", "c2", "/p2", "GPT / Codex 2"))
+        self.assertEqual(window.new_label("codex"), "GPT / Codex 4")
+        del window.accounts[0]
+        self.assertEqual(window.new_label("codex"), "")
+        self.assertEqual(window.new_label("claude"), "")
+
     def test_unsupported_agents_show_no_quota_and_are_not_fetched(self):
         self.settings.setValue("accounts", json.dumps([record("opencode")]))
         window = self.window()
