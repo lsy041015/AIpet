@@ -268,7 +268,7 @@ class DesktopWindow(Widget):
         # Keep the alpha surface created by Widget; X11 cannot add it after show().
         self.setMinimumSize(820, 620)
         self.layout().setContentsMargins(0, 0, 0, 0)
-        self.surface.setGraphicsEffect(None)
+        self.shadow = None
         self.retired_controls = QWidget(self)
         self.retired_controls.hide()
         theme_segment = self.theme_buttons["light"].parentWidget()

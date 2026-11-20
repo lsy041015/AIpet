@@ -27,10 +27,14 @@ class Notifications:
                 self.state = {}
         except (ValueError, TypeError):
             self.state = {}
+        self.saved = json.dumps(self.state)
 
     def save(self):
-        if self.persist:
-            self.settings.setValue("notification_state", json.dumps(self.state))
+        # The calendar check runs every 10 s; rewriting unchanged state replaced the settings file each time.
+        data = json.dumps(self.state)
+        if self.persist and data != self.saved:
+            self.settings.setValue("notification_state", data)
+            self.saved = data
 
     def quota(self, service, title, rows):
         for row in rows:
