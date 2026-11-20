@@ -180,6 +180,59 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual([row["reset_at"] for row in rows], [None, None])
         self.assertIn("reset_at", parse_claude({"is_error": False, "result": "Current session: 1% used · resets Oct 6, 2pm (Asia/Seoul)"})[0])
 
+    def test_time_only_reset_is_never_in_the_past(self):
+        from notifications import same_window
+        seoul = ZoneInfo("Asia/Seoul")
+        late, after_midnight = datetime(2026, 11, 20, 23, 30, tzinfo=seoul), datetime(2026, 11, 21, 0, 10, tzinfo=seoul)
+        expected = datetime(2026, 11, 21, 1, tzinfo=seoul)
+        self.assertEqual(claude_reset_moment("1am (Asia/Seoul)", late), expected)
+        self.assertEqual(claude_reset_moment("1am (Asia/Seoul)", after_midnight), expected)
+        self.assertTrue(same_window(claude_reset("1am (Asia/Seoul)", late), claude_reset("1am (Asia/Seoul)", after_midnight)))
+        self.assertEqual(claude_reset_moment("11pm (Asia/Seoul)", late), datetime(2026, 11, 21, 23, tzinfo=seoul))
+
+    def test_copilot_odd_bucket_does_not_fail_the_account(self):
+        rows = parse_copilot({"quota_snapshots": {
+            "chat": {"percent_remaining": 100.4}, "completions": {"entitlement": 0},
+            "premium_interactions": {"percent_remaining": -12.5, "entitlement": 300, "quota_remaining": -37},
+            "odd": {"percent_remaining": "n/a"}}})
+        self.assertEqual([(r["label"], r["remaining"]) for r in rows], [("채팅", 100), ("프리미엄", 0)])
+        self.assertEqual(rows[1]["detail"], "초과 사용")
+        with self.assertRaises(QuotaError):
+            parse_copilot({"quota_snapshots": {"chat": {"percent_remaining": None}}})
+
+    def test_claude_usage_tolerates_indent_and_case(self):
+        rows = parse_claude({"is_error": False, "result": "  Current Session: 1% Used · Resets Oct 6, 2pm (Asia/Seoul)\n"
+                                                          "\tcurrent week (All Models): 40 % used · resets Oct 9, 2pm (Asia/Seoul)"})
+        self.assertEqual([(r["label"], r["remaining"]) for r in rows], [("현재 세션", 99), ("이번 주 · 전체 모델", 60)])
+        self.assertTrue(all(r["reset_at"] for r in rows))
+
+    def test_codex_ignores_server_requests_with_reply_ids(self):
+        bucket = {"primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 1790000000}, "planType": "plus"}
+        replies = [{"id": 1, "method": "item/approval", "params": {}}, {"id": 1, "result": {}},
+                   {"id": 2, "method": "account/updated", "params": {}}, {"method": "note"},
+                   {"id": 2, "result": {"rateLimits": bucket}}]
+        sent = []
+
+        class Pipe:
+            def __init__(self, data=b""):
+                self.data = data
+            def write(self, chunk):
+                sent.append(json.loads(chunk))
+            def flush(self):
+                pass
+            def fileno(self):
+                return 0
+            def close(self):
+                pass
+        process = type("Process", (), {"stdin": Pipe(), "stdout": Pipe()})()
+        chunks = [b"".join(json.dumps(r).encode() + b"\n" for r in replies), b""]
+        selector = type("Selector", (), {"register": lambda *a: None, "select": lambda *a: True, "close": lambda *a: None})
+        with patch("providers.start", return_value=process), patch("providers.stop"), \
+             patch("providers.selectors.DefaultSelector", selector), patch("providers.os.read", side_effect=chunks):
+            snapshot = providers.codex({"kind": "codex", "use_default": True, "profile_dir": ""})
+        self.assertEqual((snapshot["plan"], snapshot["rows"][0]["remaining"]), ("plus", 90))
+        self.assertEqual([m.get("method") for m in sent], ["initialize", "initialized", "account/rateLimits/read"])
+
 
 if __name__ == "__main__":
     unittest.main()
