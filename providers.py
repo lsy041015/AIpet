@@ -337,9 +337,10 @@ KINDS = {
               "login": ["codex", "login"], "default": ".codex/auth.json"},
     "copilot": {"name": "GitHub Copilot", "binary": "gh", "env": "GH_CONFIG_DIR",
                 "login": ["gh", "auth", "login", "--web", "--hostname", "github.com"], "default": None},
-    # agy has no login command or profile variable; its login lives under ~/.gemini.
-    "antigravity": {"name": "Antigravity", "binary": "agy", "env": None, "login": None,
-                    "default": ".gemini/antigravity-cli"},
+    # agy has no login subcommand or profile variable: the user types /login inside agy, and the
+    # single login lives in the system keyring, so a login replaces this PC's account.
+    "antigravity": {"name": "Antigravity", "binary": "agy", "env": None, "login": ["agy"],
+                    "default": ".gemini/antigravity-cli", "switch": ".gemini/google_accounts.json"},
     # Cursor's profile folder is not configurable, so its login is the default one.
     "cursor": {"name": "Cursor", "binary": "cursor-agent", "env": None,
                "login": ["cursor-agent", "login"], "default": ".cursor"},
@@ -392,6 +393,18 @@ def claude_profile_ok(auth, account):
     return isinstance(actual, str) and Path(actual).resolve() == Path(account["profile_dir"]).resolve()
 
 
+def active_login(kind):
+    """The signed-in account marker for agents whose login replaces the PC's account, or None."""
+    switch = KINDS[kind].get("switch")
+    if not switch:
+        return None
+    try:
+        active = json.loads((Path.home() / switch).read_text()).get("active")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return active if isinstance(active, str) and active else None
+
+
 def logged_in(account):
     """Whether the account's own CLI profile holds a login. Runs status commands only."""
     kind, env = account["kind"], environment(account)
@@ -406,6 +419,8 @@ def logged_in(account):
         elif kind == "opencode":
             # Only the size is read: the file holds provider credentials.
             return (opencode_data(account) / "opencode/auth.json").stat().st_size > 2
+        elif kind == "antigravity":
+            return bool(active_login("antigravity"))
         elif kind == "cursor":
             # shortcut: wording unverified (cursor-agent not installed here); check once it is.
             return "not logged in" not in output(["cursor-agent", "status"], env=env, timeout=10).lower()

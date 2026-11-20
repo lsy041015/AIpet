@@ -69,7 +69,7 @@ cd ~/ai-quota-widget
 python3 widget.py                      # 위젯 실행
 python3 widget.py --desktop            # 넓은 앱 화면
 python3 widget.py --check              # 창 없이 등록된 계정의 실제 한도만 조회
-QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 테스트 164개
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 테스트 167개
 QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme light   # 화면을 이미지로 렌더링
 ```
 
@@ -80,7 +80,7 @@ QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme li
 ## 아쉬운 점
 
 X11 전용이라 Wayland, Windows, macOS에서는 안 돌아가요. Copilot 한도는 공식 확장이 쓰는 내부 API에 기대고 있어서
-응답 형식이 바뀌면 고쳐야 할 수 있어요. Antigravity(`agy`)는 로그인 명령이 없고(앱 안의 `/login`만 있음) 로그인 정보를 시스템 키링에 하나만 저장해서, 이 PC의 기존 로그인 연결만 돼요. Cursor·opencode는 한도를
+응답 형식이 바뀌면 고쳐야 할 수 있어요. Antigravity(`agy`)는 로그인 명령이 없고(앱 안의 `/login`만 있음) 로그인 정보를 시스템 키링에 하나만 저장해요. 그래서 **Antigravity 계정 바꾸기**를 누르면 터미널에 `agy`가 열리고, `/login`을 마치면 계정이 추가되는 게 아니라 이 PC의 Antigravity 계정이 바뀌어요. Cursor·opencode는 한도를
 못 읽어요. Claude Team 좌석 요금은 구분이 안 돼서 직접 입력해야 하고, 로그인이 만료된 계정은 지우고 다시 추가해야 해요.
 
 서비스 로고는 식별용으로만 써요([assets/SOURCES.md](assets/SOURCES.md)). 펫은 Anthropic의 Claude 마스코트를 참고해서

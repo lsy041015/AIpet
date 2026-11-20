@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                                QGraphicsDropShadowEffect, QSlider, QWidgetAction,
                                QInputDialog, QMessageBox, QStackedWidget, QSizePolicy, QGridLayout)
 
-from providers import PROVIDERS, QuotaError
+from providers import KINDS, PROVIDERS, QuotaError
 from accounts import (AddAccountDialog, Login, confirm_remove, cleanup_pending, link as link_account,
                       load as load_accounts, logo_asset, save as save_accounts, unregister)
 from calendar_panel import CalendarPanel
@@ -2153,7 +2153,8 @@ class Widget(QWidget):
             return
         login.finished.connect(lambda account, job=login: self.login_finished(job, account))
         self.logins.append(login)
-        self.note.setText("터미널에서 로그인을 마치면 카드가 추가됩니다 · 최대 10분 대기")
+        self.note.setText("터미널의 agy에서 /login을 마치면 카드가 갱신됩니다 · 최대 10분 대기"
+                          if KINDS[value].get("switch") else "터미널에서 로그인을 마치면 카드가 추가됩니다 · 최대 10분 대기")
         self.note.show()
 
     def login_finished(self, login, account):
@@ -2161,6 +2162,13 @@ class Widget(QWidget):
         login.deleteLater()
         if account is None:
             self.note.setText("로그인이 확인되지 않아 계정을 추가하지 않았습니다")
+            return
+        existing = next((a for a in self.accounts if account["use_default"] and a["use_default"]
+                         and a["kind"] == account["kind"]), None)
+        if existing is not None:
+            # A PC-wide login (agy) was switched: refresh the card instead of adding a duplicate.
+            self.note.hide()
+            self.account_added(existing)
             return
         account["label"] = self.new_label(account["kind"])
         self.accounts.append(account)
