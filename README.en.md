@@ -6,77 +6,57 @@
 
 # AIpet (check AI)
 
-> **A tiny pixel computer on your desktop that tells you how much AI quota is left, what your agents are doing, and what is next on your calendar.**
+A tiny pixel computer on my desktop that tells me how much AI quota is left, what my agents are doing, and what's next on my calendar.
 
-A PySide6 desktop widget for Ubuntu GNOME (X11). It reads Codex, Antigravity and GitHub Copilot quotas through the CLIs you are
-already logged in to, shows running agent tasks as speech bubbles, and manages your primary Google Calendar.
+I switch between Codex, Antigravity and Copilot, and I kept opening windows just to check quotas, see whether an agent was
+still working, or find my next meeting. So I put all three in one widget. It's a PySide6 app for Ubuntu GNOME (X11), and it
+runs on my desktop every day.
 
-> **Status: private personal project**, used daily on the author's Ubuntu GNOME X11 desktop. 54 tests in 5 files.
+What it does:
 
-## Why
+- **AI quotas** — remaining share and reset time per service, refreshed every 3 minutes. It stores no tokens; it just calls the
+  `codex`, `agy` and `gh` CLIs you're already logged in to, read-only.
+- **Agent bubbles** — reads local Codex, Copilot and Antigravity logs every 5 seconds and shows things like "editing files" or
+  "running a command". Click one to jump to that agent's window. A running process alone never counts as "working".
+- **Google Calendar** — today, tomorrow and the next 7 days; add, edit, delete; Korean quick-add like `내일 오후 3시 회의`
+  ("meeting tomorrow 3 pm"). The parser is a small regex grammar, not an LLM, and always shows a preview before saving.
+- **Notifications** — 10 minutes before an event, and at 20% / 10% quota left. Never twice for the same thing.
+- **The pet** — folds into a small always-on-top circle and plays 9 animations depending on state. Light/dark theme and
+  transparency are adjustable too.
 
-When you use three AI coding tools, you keep checking three things: how much quota each service has left, whether an agent is
-editing, waiting for approval or already done, and when your next meeting starts. check AI puts all three in one widget:
-quotas every 3 minutes, agent tasks every 5 seconds, calendar every 5 minutes.
+Hover over the folded pet and a bubble shows your next event and the last quota check. A blue clock appears when an event
+starts within 10 minutes, and an orange badge when a service is at 20% or less. Right-click for an animation preview and quick-add.
 
-- **No stored tokens**: quotas are read by calling each CLI, which uses its own login (`providers.py`).
-- **Nothing leaves the machine**: agent bubbles read local session logs only.
-- **Read-only quota checks**: no reset credits are spent. Only Google Calendar needs a separate sign-in.
+A few things I cared about while building it:
 
-## What it does
-
-| Feature | Details |
-|---|---|
-| AI quotas | Remaining share and reset time per service; the lowest item as a big number; per-model and per-window detail. Keeps the last value and shows the error when a check fails. |
-| Agent bubbles | Reads local Codex, Copilot and Antigravity logs and shows "editing files / reading / running a command / writing a reply" with elapsed time. Click a bubble to jump to that agent's window (X11, by process tree). |
-| Calendar | Today, tomorrow and the next 7 days of your primary calendar; add, edit, delete; Korean quick-add such as `내일 오후 3시 회의` ("meeting tomorrow 3 pm"). |
-| Notifications | Events 10 minutes ahead (5 or off), quota at 20% and 10% left, never twice for the same thing. |
-| Pet | The Codex `tiny-crt` pet sprite (8×9 frames of 192×208) with 9 animations tied to the widget's state; folds into a small always-on-top circle. |
-| Window | Light/dark, 0–70% transparency, resize and presets, autostart, single instance. |
-
-## Services
-
-| Service | Query | Login |
-|---|---|---|
-| Codex | `codex app-server` → `account/rateLimits/read` | `codex login` |
-| Antigravity | `agy --print /usage --print-timeout 20s` | in `agy` |
-| GitHub Copilot | `gh api /copilot_internal/user` (internal API used by the official extension) | `gh auth login` |
+- If an event insert gets no response and you click again, it reuses the same event id. A 409 means it already exists, so the widget re-reads it instead of making a duplicate.
+- The pet sprite file is untouched. Colors are swapped only while drawing (beige to white, green to sky blue).
+- A file lock plus a local socket keeps it to one instance. Clicking the shortcut again brings the running window forward instead of opening a new one.
 
 ## Run
 
 Needs Ubuntu GNOME (X11), Python 3, PySide6 and logged-in `codex`, `agy`, `gh`. The Google OAuth helpers are vendored in `vendor/`.
 
 ```bash
-git clone https://github.com/lsy041015/AIpet.git ~/ai-quota-widget && cd ~/ai-quota-widget
+git clone https://github.com/lsy041015/AIpet.git ~/ai-quota-widget
+cd ~/ai-quota-widget
+
 python3 widget.py                      # run the widget
 python3 widget.py --check              # read live quotas without opening a window
-QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v
-QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme light
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 54 tests
+QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme light   # render the UI to an image
 ```
 
-To connect Google Calendar, create a **Desktop app** OAuth client in a Google Cloud project with the Calendar API enabled,
-download its JSON, and pick it in the widget's **Google 연결** dialog. The token is stored with mode `0600`; only the
-`calendar.events.owned` scope is requested.
+For the calendar, enable the Calendar API in a Google Cloud project, download a **Desktop app** OAuth client JSON, and pick it
+in the widget's **Google 연결** dialog. It only asks for the `calendar.events.owned` scope and keeps the token locally with mode `0600`.
 
-## Design notes
+## Rough edges
 
-- Retrying an event insert reuses the same event id; a 409 means "already created", so the widget re-reads it instead of duplicating it.
-- The Korean quick-add parser is a small regex grammar, not an LLM, and always shows a preview before saving.
-- The pet sprite file is never modified; colors are swapped only while drawing.
-- A file lock plus a user-only local socket keeps one instance: a second launch brings the running window forward and exits.
-- A running agent process alone never counts as "working"; bubbles hide after 2 minutes without new log entries.
+X11 only, so no Wayland, Windows or macOS. The Copilot quota relies on an internal API the official extension uses, so it may
+break if the response changes. Approval screens that aren't logged and shared calendars aren't handled yet.
 
-## Limits
+Service logos are used only to identify each service ([assets/SOURCES.md](assets/SOURCES.md)). The pet isn't my art: it's a
+copy of the Codex CLI `tiny-crt` pet by OpenAI ([assets/TINY-CRT-SOURCE.md](assets/TINY-CRT-SOURCE.md)). It's a personal
+project, so there's no license file.
 
-X11 only (`fcntl`, `/proc`, `libX11`); no Wayland-only sessions, Windows or macOS. The Copilot quota relies on an internal API.
-Approval screens that are not logged, terminal tabs and panes, shared calendars and Google Tasks are out of scope.
-
-## Credits
-
-Service logos (OpenAI Codex, Google Antigravity, GitHub Primer Octicons, MIT) are used only to identify each service; see
-[assets/SOURCES.md](assets/SOURCES.md). The pet sprite is a copy of the Codex CLI `tiny-crt` pet by OpenAI, not original art; see
-[assets/TINY-CRT-SOURCE.md](assets/TINY-CRT-SOURCE.md). This private project has no license file.
-
----
-
-<p align="center"><sub>LSY.KOR · <a href="https://github.com/lsy041015">More projects</a></sub></p>
+<sub>[More projects](https://github.com/lsy041015)</sub>
