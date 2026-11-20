@@ -45,7 +45,7 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(self.window.current_page, "home")
         size = self.window.size()
         self.assertGreaterEqual(size.width(), 900)
-        for key in ("quota", "calendar", "agents", "billing", "home"):
+        for key in ("quota", "calendar", "todo", "agents", "billing", "home"):
             QTest.mouseClick(self.window.nav_buttons[key], Qt.LeftButton)
             self.assertEqual(self.window.current_page, key)
             self.assertEqual(self.window.size(), size)
@@ -53,6 +53,14 @@ class DesktopTests(unittest.TestCase):
         self.assertIn("80%", self.window.overview_quotas["codex"].text())
         self.window.received("codex", None, "네트워크 오류")
         self.assertIn("조회 실패", self.window.overview_quotas["codex"].text())
+
+    def test_desktop_todo_uses_the_same_saved_list(self):
+        self.window.set_page("todo")
+        self.assertTrue(self.window.todo_scroll.isVisible())
+        self.assertFalse(self.window.quick_add.isVisible())
+        self.window.todo.input.setText("전화하기")
+        QTest.keyClick(self.window.todo.input, Qt.Key_Return)
+        self.assertEqual(self.window.todo.items[0]["text"], "전화하기")
 
     def test_billing_is_independent_persistent_and_survives_quota_failure(self):
         from billing import BillingDialog

@@ -810,6 +810,18 @@ class WidgetTests(unittest.TestCase):
         self.assertFalse(self.window.calendar.isVisible())
         self.assertTrue(self.window.refresh_button.isVisible())
 
+    def test_todo_icon_opens_only_the_local_list_and_keeps_it_after_navigation(self):
+        self.window.set_page("home")
+        QTest.mouseClick(self.window.page_buttons["todo"], Qt.LeftButton)
+        self.assertTrue(self.window.todo_scroll.isVisible())
+        self.assertFalse(self.window.calendar.isVisible())
+        self.assertFalse(self.window.dock.isVisible())
+        self.window.todo.input.setText("보고서 작성")
+        QTest.keyClick(self.window.todo.input, Qt.Key_Return)
+        self.window.set_page("home")
+        self.window.set_page("todo")
+        self.assertEqual(self.window.todo.items[0]["text"], "보고서 작성")
+
     def test_long_calendar_list_scrolls_above_fixed_navigation(self):
         self.window.set_page("calendar")
         self.window.resize(360, 580)
@@ -837,7 +849,7 @@ class WidgetTests(unittest.TestCase):
         self.window.set_page("home")
         self.window.resize(360, 580)
         self.app.processEvents()
-        self.assertEqual(set(self.window.page_buttons), {"quota", "calendar", "github"})
+        self.assertEqual(set(self.window.page_buttons), {"quota", "calendar", "todo", "github"})
         with patch("widget.QDesktopServices.openUrl", return_value=True) as open_url:
             button = self.window.page_buttons["github"]
             self.assertTrue(button.isVisible())

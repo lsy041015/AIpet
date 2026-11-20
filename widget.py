@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
 
 from providers import PROVIDERS, QuotaError, executable, claude_max_dir, claude_environment
 from calendar_panel import CalendarPanel
+from todo import TodoPanel
 from billing import BillingDialog, payment_summary, next_payment
 from notifications import Notifications
 from agent_activity import read_activity, ActivityTracker
@@ -265,6 +266,9 @@ class AppIconButton(QToolButton):
         if self.page == "github":
             gradient.setColorAt(0, QColor("#39414b"))
             gradient.setColorAt(1, QColor("#15191e"))
+        elif self.page == "todo":
+            gradient.setColorAt(0, QColor("#65dccd"))
+            gradient.setColorAt(1, QColor("#168b9e"))
         p.setBrush(gradient)
         p.drawRoundedRect(box, 16, 16)
         p.setBrush(Qt.NoBrush)
@@ -286,6 +290,12 @@ class AppIconButton(QToolButton):
             p.setFont(font)
             p.setPen(QColor("#202127"))
             p.drawText(QRectF(18, 28, 64, 39), Qt.AlignCenter, str(datetime.now().day))
+        elif self.page == "todo":
+            p.setPen(QPen(QColor("#ffffff"), 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            for y in (29, 41, 53):
+                p.drawLine(31, y, 34, y + 3)
+                p.drawLine(34, y + 3, 39, y - 3)
+                p.drawLine(46, y, 69, y)
         elif self.page == "github":
             p.setPen(Qt.NoPen)
             p.setBrush(QColor("#ffffff"))
@@ -1301,7 +1311,7 @@ class Widget(QWidget):
         dock_layout.setColumnStretch(3, 1)
         self.page_buttons = {}
         self.page_group = QButtonGroup(self)
-        apps = [("quota", "AI 한도"), ("calendar", "캘린더")]
+        apps = [("quota", "AI 한도"), ("calendar", "캘린더"), ("todo", "할 일")]
         apps.extend((key, value[0]) for key, value in WEB_APPS.items())
         for index, (key, text) in enumerate(apps):
             button = AppIconButton(key, self)
@@ -1328,6 +1338,13 @@ class Widget(QWidget):
         home_layout.addWidget(self.dock)
         home_layout.addStretch(2)
         self.pages.addWidget(self.home_page)
+        self.todo_scroll = QScrollArea()
+        self.todo_scroll.setWidgetResizable(True)
+        self.todo_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.todo_scroll.viewport().setAutoFillBackground(False)
+        self.todo = TodoPanel(self.settings)
+        self.todo_scroll.setWidget(self.todo)
+        self.pages.addWidget(self.todo_scroll)
         bottom = QHBoxLayout()
         self.note = label("", "caption")
         self.note.hide()
@@ -1559,7 +1576,7 @@ class Widget(QWidget):
             QMessageBox.warning(self, name, "브라우저를 열지 못했습니다. 기본 브라우저 설정을 확인해주세요.")
 
     def set_page(self, page, animate=False):
-        index = {"quota": 0, "calendar": 1, "home": 2}[page]
+        index = {"quota": 0, "calendar": 1, "home": 2, "todo": 3}[page]
         changed = self.pages.currentIndex() != index
         if changed and hasattr(self, "feature_size"):
             if page == "home":
@@ -1588,7 +1605,7 @@ class Widget(QWidget):
             selected.setFocus(Qt.OtherFocusReason)
         else:
             self.page_buttons[page].setChecked(True)
-            self.page_heading.setText("AI 한도" if page == "quota" else "일정")
+            self.page_heading.setText({"quota": "AI 한도", "calendar": "일정", "todo": "할 일"}[page])
             self.home_button.setFocus(Qt.OtherFocusReason)
         if hasattr(self, "theme"):
             self.update_page_icons()
@@ -1647,6 +1664,12 @@ class Widget(QWidget):
             QLabel#secondary {{color:{colors['muted']}; font-size:11px;}}
             QLabel#caption, QLabel#status {{color:{colors['muted']}; font-size:11px;}}
             QLabel#calendarListing {{font-size:13px; padding:12px 2px;}}
+            QLabel#todoCount {{font-size:14px; font-weight:650; padding:8px 2px 2px 2px;}}
+            QLabel#todoMessage {{color:{colors['warning']}; font-size:11px;}}
+            QFrame#todoItem {{background:{colors['card']}; border:1px solid {colors['border']}; border-radius:14px;}}
+            QLabel#todoText[completed='true'] {{color:{colors['muted']};}}
+            QPushButton#todoAdd {{background:{colors['antigravity']}; color:{colors['card']}; font-weight:700;}}
+            QPushButton#todoDelete {{background:transparent; color:{colors['muted']}; font-size:18px; padding:0;}}
             QWidget#eventCard {{background:{colors['background']}; border:1px solid {colors['border']}; border-radius:14px;}}
             QWidget#eventCard[current='true'] {{border:1px solid {colors['antigravity']};}}
             QLabel#eventTime {{color:{colors['antigravity']}; font-size:12px; font-weight:600;}}
