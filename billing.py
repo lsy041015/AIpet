@@ -40,8 +40,8 @@ def parse_price(text):
 
 def price_summary(manual, listed):
     if manual is not None:
-        return f"월 ${manual:g} · 직접 입력"
-    return f"월 ${listed:g} · 정가 기준" if listed is not None else "요금 미확인"
+        return f"${manual:g}/월 · 직접 입력"
+    return f"${listed:g}/월 · 정가" if listed is not None else "요금 미확인"
 
 
 def next_payment(record, today=None):
@@ -73,10 +73,11 @@ def payment_summary(record, today=None):
     today = today or date.today()
     upcoming = next_payment(record, today)
     if upcoming is None:
-        return "다음 결제일 미설정"
+        return "미설정"
     days = (upcoming - today).days
-    timing = "오늘" if days == 0 else f"{days}일 후" if days > 0 else "확인 필요"
-    return f"다음 결제 · {upcoming:%Y.%m.%d} · {timing}"
+    timing = "오늘" if days == 0 else f"D-{days}" if days > 0 else "확인 필요"
+    day = f"{upcoming:%m.%d}" if upcoming.year == today.year else f"{upcoming:%Y.%m.%d}"
+    return f"{day} · {timing}"
 
 
 class BillingDialog(QDialog):

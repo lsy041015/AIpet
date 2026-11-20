@@ -8,7 +8,8 @@ import time
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal, Qt
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal, Qt, QSize
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
                                QDialogButtonBox, QMessageBox, QCheckBox)
 
@@ -23,6 +24,15 @@ LEGACY_KEYS = ("claude", "codex", "copilot", "antigravity")
 
 def accounts_root():
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wego/check-ai/accounts"
+
+
+def logo_asset(kind, dark=False):
+    """Bundled logo for an agent kind; dark surfaces use the white line variant when one exists."""
+    folder = Path(__file__).parent / "assets"
+    if kind == "antigravity":
+        return folder / "antigravity.png"
+    white = folder / f"{kind}-white.svg"
+    return white if dark and white.exists() else folder / f"{kind}.svg"
 
 
 def valid(account):
@@ -237,9 +247,9 @@ class AddAccountDialog(QDialog):
         self.accounts = accounts
         self.choice = None
         self.setWindowTitle("에이전트 추가")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setContentsMargins(26, 24, 26, 22)
         layout.setSpacing(12)
         heading = QLabel("에이전트 추가")
         heading.setObjectName("eventHeading")
@@ -249,17 +259,23 @@ class AddAccountDialog(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.kinds = QListWidget()
+        self.kinds.setObjectName("agentKinds")
         self.kinds.setAccessibleName("에이전트 목록")
+        self.kinds.setIconSize(QSize(20, 20))
+        dark = getattr(parent, "theme", "dark") == "dark"
         for kind, info in KINDS.items():
             ready = installed(kind)
-            item = QListWidgetItem(info["name"] + ("" if ready else " · 설치 필요"))
+            item = QListWidgetItem(QIcon(str(logo_asset(kind, dark))), info["name"] + ("" if ready else " · 설치 필요"))
             item.setData(Qt.UserRole, kind)
+            item.setSizeHint(QSize(0, 34))
             if not ready:
                 item.setFlags(item.flags() & ~Qt.ItemIsEnabled & ~Qt.ItemIsSelectable)
             self.kinds.addItem(item)
-        self.kinds.setFixedHeight(self.kinds.sizeHintForRow(0) * len(KINDS) + 8)
+        self.kinds.setFixedHeight(34 * len(KINDS) + 14)
         layout.addWidget(self.kinds)
         self.login_button = QPushButton("새 계정 로그인")
+        self.login_button.setObjectName("primaryButton")
+        self.login_button.setMinimumHeight(36)
         self.login_button.setAccessibleName("새 계정 로그인")
         self.login_button.clicked.connect(lambda: self.choose(("login", self.kind())))
         layout.addWidget(self.login_button)

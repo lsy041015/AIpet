@@ -5,11 +5,11 @@ import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
-from PySide6.QtCore import QSettings, Qt, QEvent, QCoreApplication
+from PySide6.QtCore import QSettings, Qt, QEvent, QCoreApplication, QPoint
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
-from widget import Widget, THEMES
+from PySide6.QtWidgets import QApplication, QLabel
+from widget import Widget, THEMES, NeonBar
 from desktop import DesktopWindow
 from test_widget import seed_accounts
 
@@ -74,10 +74,10 @@ class DesktopTests(unittest.TestCase):
             return BillingDialog.Accepted
         with patch.object(BillingDialog, "exec", save):
             self.window.edit_billing("claude_max")
-        self.assertIn("10일 후", self.window.cards["claude_max"].billing.text())
+        self.assertIn("D-10", self.window.cards["claude_max"].billing.text())
         self.assertIn("미설정", self.window.cards["claude"].billing.text())
         self.window.received("claude_max", None, "로그인 필요")
-        self.assertIn("10일 후", self.window.cards["claude_max"].billing.text())
+        self.assertIn("D-10", self.window.cards["claude_max"].billing.text())
         restored = DesktopWindow()
         self.assertEqual(restored.cards["claude_max"].billing.text(), self.window.cards["claude_max"].billing.text())
         restored.close()
@@ -125,12 +125,59 @@ class DesktopTests(unittest.TestCase):
         self.window.received_activity([task])
         self.window.set_page("agents")
         self.assertEqual(len(self.window.task_buttons), 1)
-        self.assertIn("승인 대기", self.window.task_buttons[0].text())
-        self.assertIn("3분", self.window.task_buttons[0].text())
+        self.assertIn("승인 대기", self.window.task_buttons[0].accessibleName())
+        self.assertIn("3분", self.window.task_buttons[0].accessibleName())
         with patch("widget.XWindows") as windows:
             windows.return_value.candidates.return_value=[(123,"Claude terminal")]
             QTest.mouseClick(self.window.task_buttons[0], Qt.LeftButton)
             windows.return_value.activate.assert_called_once_with(123)
+
+    def test_session_cards_show_title_model_todos_and_subagents(self):
+        from desktop import SessionCard
+        now = datetime.now().timestamp()
+        task = dict(id="s1", agent="claude", label="파일 수정 중", status="running", started=now - 600, updated=now,
+                    target="/tmp/s1", title="<네온> 리디자인", model="opus 5.5", effort="high",
+                    current_task="세션 카드 그리기",
+                    todos=[{"text": "토큰", "status": "completed"}, {"text": "세션 카드 그리기", "status": "in_progress"},
+                           {"text": "README", "status": "pending"}],
+                    subagents=[{"type": "Explore", "description": "find", "model": "haiku 5.5", "effort": "low", "status": "running"},
+                               {"type": "reviewer", "model": "opus 5.5", "effort": None, "status": "running"}])
+        unknown = dict(id="u1", agent="gemini", label="작업 중", status="waiting", started=now - 60, updated=now, target="/tmp/u1")
+        self.window.received_activity([task, unknown])
+        self.window.set_page("agents")
+        self.app.processEvents()
+        card, other = self.window.task_buttons
+        texts = [item.text() for item in card.findChildren(QLabel)]
+        self.assertIn("<네온> 리디자인", texts)
+        self.assertIn("opus 5.5 · high", texts)
+        self.assertIn("● 작업 중", texts)
+        self.assertIn("▸ 세션 카드 그리기", texts)
+        self.assertTrue(any("Explore · haiku 5.5 · low" in text for text in texts))
+        self.assertTrue(any("reviewer · opus 5.5" in text for text in texts))
+        self.assertEqual(card.toggle.text(), "할 일 1/3 ▾")
+        self.assertTrue(card.todo_list.isHidden())
+        probe = SessionCard(dict(task, todos=[{"text": "<b>", "status": "pending"}]), THEMES["dark"])
+        self.assertIn("&lt;b&gt;", probe.todo_list.text())
+        probe.deleteLater()
+        card.toggle.click()
+        self.assertTrue(card.todo_list.isVisible())
+        self.assertIn("<s>토큰</s>", card.todo_list.text())
+        self.assertEqual(card.findChild(NeonBar, "todoProgress").value(), 333)
+        self.assertIn("● 승인·입력 대기", [item.text() for item in other.findChildren(QLabel)])
+        self.assertIn("gemini", other.accessibleName())
+        # A refresh with new data rebuilds the cards but keeps the opened todo list.
+        self.window.received_activity([dict(task, current_task="README"), unknown])
+        self.app.processEvents()
+        self.assertTrue(self.window.task_buttons[0].todo_list.isVisible())
+        self.assertEqual(self.window.overview_sessions.count(), 2)
+        for theme in ("dark", "light"):
+            self.window.set_theme(theme)
+            self.app.processEvents()
+            self.assertFalse(self.window.task_buttons[0].grab().isNull())
+        with patch("widget.XWindows") as windows:
+            windows.return_value.candidates.return_value = [(7, "Claude terminal")]
+            QTest.mouseClick(self.window.task_buttons[0], Qt.LeftButton, pos=QPoint(8, 8))
+            windows.return_value.candidates.assert_called_once_with("claude", "/tmp/s1")
 
     def test_opening_existing_app_preserves_maximized_window(self):
         self.window.showMaximized()

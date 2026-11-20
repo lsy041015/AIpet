@@ -257,8 +257,8 @@ class BillingInfoTests(Isolated):
         for (kind, plan, tier), price in cases.items():
             self.assertEqual(list_price(kind, plan, tier), price, (kind, plan, tier))
         self.assertEqual([parse_price(v) for v in ("$25", "19.5", " 0 ", "-1", "nan", "abc", "")], [25, 19.5, 0, None, None, None, None])
-        self.assertEqual(price_summary(None, 20), "월 $20 · 정가 기준")
-        self.assertEqual(price_summary(25, 20), "월 $25 · 직접 입력")
+        self.assertEqual(price_summary(None, 20), "$20/월 · 정가")
+        self.assertEqual(price_summary(25, 20), "$25/월 · 직접 입력")
         self.assertEqual(price_summary(None, None), "요금 미확인")
         dialog = BillingDialog(None, "Claude", None, 25, 20)
         self.assertEqual(dialog.price(), 25)
@@ -365,25 +365,27 @@ class WidgetAccountTests(Isolated):
                                         {"label": "Codex · 5시간", "remaining": 90, "reset": "곧", "reset_at": soon}],
                                "plan": "plus", "renews": "2099-02-03"}, "")
         card = window.cards["cx"]
-        self.assertIn("2099.02.03", card.billing.text())
-        self.assertIn("월 $20 · 정가 기준", card.billing.text())
+        self.assertIn("2099.02.03 · D-", card.billing.text())
+        self.assertEqual(card.price.text(), "$20/월 · 정가")
         self.assertIn("Codex · 5시간 · 2시간 후", card.next_reset.text())
         self.assertFalse(card.next_reset.isHidden())
         window.received("cl", {"rows": [{"label": "현재 세션", "remaining": 50, "reset": ""}], "plan": "max",
                                "tier": "max_20x", "org": "Home", "account": "me@example.test"}, "")
-        self.assertEqual(window.cards["cl"].plan.text(), "플랜 · Max 20x · Home\nme@example.test")
-        self.assertIn("월 $200", window.cards["cl"].billing.text())
+        self.assertEqual(window.cards["cl"].plan_badge.text(), "Max 20x")
+        self.assertEqual(window.cards["cl"].plan.text(), "me@example.test · Home")
+        self.assertEqual(window.plan_text("cl"), "플랜 · Max 20x · Home")
+        self.assertIn("$200/월", window.cards["cl"].price.text())
 
         def save(dialog):
             dialog.price_input.setText("180")
             return BillingDialog.Accepted
         with patch.object(BillingDialog, "exec", save):
             window.edit_billing("cl")
-        self.assertIn("월 $180 · 직접 입력", window.cards["cl"].billing.text())
+        self.assertEqual(window.cards["cl"].price.text(), "$180/월 · 직접 입력")
         self.assertEqual(self.settings.value("price/cl"), "180")
         with patch.object(BillingDialog, "exec", lambda dialog: (dialog.remove(), BillingDialog.Accepted)[1]):
             window.edit_billing("cl")
-        self.assertIn("월 $200 · 정가 기준", window.cards["cl"].billing.text())
+        self.assertEqual(window.cards["cl"].price.text(), "$200/월 · 정가")
 
     def test_desktop_pages_follow_account_changes(self):
         from desktop import DesktopWindow
@@ -396,7 +398,7 @@ class WidgetAccountTests(Isolated):
         self.assertIs(window.cards["cx"].parent(), window.quota_content)
         self.assertTrue(window.overview_empty.isHidden())
         window.received("cx", {"rows": [{"label": "Codex · 주간", "remaining": 30, "reset": ""}], "plan": "pro"}, "")
-        self.assertEqual(window.billing_prices["cx"].text(), "월 $200 · 정가 기준")
+        self.assertEqual(window.billing_prices["cx"].text(), "$200/월 · 정가")
         self.assertEqual(window.metric_notes["lowest"].text(), "GPT / Codex · Codex · 주간")
         with patch("widget.confirm_remove", return_value=(True, False)):
             window.remove_account("cx")
