@@ -8,6 +8,8 @@
 
 A tiny pixel mascot on my desktop that tells me how much AI quota is left, what my agents are doing, and what's next on my calendar.
 
+<p align="center"><img src="docs/screenshots/mascot.gif" alt="Claude pixel mascot animation" width="144"></p>
+
 I switch between Claude Code, Codex, Antigravity and Copilot, and I kept opening windows just to check quotas, see whether an
 agent was still working, or find my next meeting. So I put it all in one widget. It's a PySide6 app for Ubuntu GNOME (X11), it
 runs on my desktop every day, and it's styled like an orange neon sign on a dark wall.
@@ -40,6 +42,22 @@ A few things I cared about while building it:
 - The neon glow is painted directly instead of stacking graphics effects, so it stays light.
 - A file lock plus a local socket keeps it to one instance. Clicking the shortcut again brings the running window forward.
 
+## Screens
+
+Rendered with sample data.
+
+| Dashboard | AI quotas |
+|---|---|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![AI quotas](docs/screenshots/quota.png) |
+| **Agent sessions** | **Billing** |
+| ![Agents](docs/screenshots/agents.png) | ![Billing](docs/screenshots/billing.png) |
+
+| Compact widget | Pet bubble | Add an agent |
+|---|---|---|
+| <img src="docs/screenshots/compact.png" width="260"> | <img src="docs/screenshots/pet-bubble.png" width="220"> | <img src="docs/screenshots/add-account.png" width="260"> |
+
+Light theme: [docs/screenshots/light-dashboard.png](docs/screenshots/light-dashboard.png)
+
 A screen-by-screen guide (Korean) is in [docs/GUIDE.md](docs/GUIDE.md).
 
 ## Run
@@ -64,7 +82,7 @@ in the widget's **Google 연결** dialog. It only asks for the `calendar.events.
 ## Rough edges
 
 X11 only, so no Wayland, Windows or macOS. The Copilot quota relies on an internal API the official extension uses, so it may
-break if the response changes. Antigravity has no login command, so it can only link an existing login; Cursor and opencode show
+break if the response changes. Antigravity (`agy`) has no login command (only the in-app `/login`) and keeps a single login in the system keyring, so it can only link this PC's existing login; Cursor and opencode show
 no quota. Claude Team seat prices can't be told apart, so enter yours by hand, and an expired login means removing and re-adding the account.
 
 Service logos are used only to identify each service ([assets/SOURCES.md](assets/SOURCES.md)). The pet is drawn in code,
