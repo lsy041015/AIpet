@@ -2220,9 +2220,14 @@ class Widget(QWidget):
         return next((account for account in self.accounts if account["id"] == key), None)
 
     def new_label(self, kind):
-        # A second account of the same agent needs a distinguishable title.
-        count = sum(account["kind"] == kind for account in self.accounts)
-        return f"{service_info(kind)[0]} {count + 1}" if count else ""
+        # A second account of the same agent needs a distinguishable title: the smallest unused number.
+        titles, base = {account_title(account) for account in self.accounts}, service_info(kind)[0]
+        if base not in titles:
+            return ""
+        number = 2
+        while f"{base} {number}" in titles:
+            number += 1
+        return f"{base} {number}"
 
     def add_account(self):
         dialog = AddAccountDialog(self, self.accounts)
