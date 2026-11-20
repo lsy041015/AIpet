@@ -716,13 +716,20 @@ class WidgetTests(unittest.TestCase):
         from agent_windows import agent_pids
         self.assertEqual(service_info("gemini")[0], "gemini")
         self.assertEqual(service_info(None)[0], "에이전트")
-        home = "-".join(("", *Path.home().parts[1:]))
+        from agent_activity import claude_project
+        home = claude_project(str(Path.home()))
         self.assertEqual(session_title({"agent": "claude", "target": f"/x/.claude/projects/{home}-my-app/s.jsonl"}), "my-app")
         self.assertEqual(session_title({"agent": "claude", "title": " 리뷰 ", "target": ""}), "리뷰")
         self.assertEqual(session_title({"agent": "codex", "target": "/tmp/r.jsonl"}), "GPT / Codex")
         with patch("widget.read_activity", return_value=[]) as read:
             ActivityFetch().run()
         read.assert_called_once_with(detailed=True, extra_agents=True)
+        job = ActivityFetch()
+        received = []
+        job.result.connect(received.append)
+        with patch("widget.read_activity", side_effect=TypeError("bad log")), patch("sys.stderr"):
+            job.run()
+        self.assertEqual(received, [])
         self.assertEqual(agent_pids("gemini", "/nonexistent"), set())
         self.window.toggle_collapsed()
         pet = self.window.restore_button

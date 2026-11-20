@@ -5,6 +5,7 @@ from functools import lru_cache
 import os
 import re
 import sqlite3
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,7 @@ def timestamp(value):
 
 
 def tool_label(name):
-    name = name.lower()
+    name = name.lower() if isinstance(name, str) else ''
     for words, label in ((('patch', 'edit', 'write_file'), '파일 수정 중'),
                          (('search', 'find', 'web', 'read'), '자료 확인 중'),
                          (('exec', 'shell', 'terminal', 'bash'), '명령 실행 중')):
@@ -52,7 +53,8 @@ def update_plan(todos, data):
     if isinstance(data.get('items'), list):
         return plan_items(data['items'], 'content')
     todos = [dict(item) for item in todos or ()]
-    for index in data.get('done') or ():
+    done = data.get('done')
+    for index in done if isinstance(done, list) else (done,):
         if isinstance(index, int) and 0 < index <= len(todos):
             todos[index - 1]['status'] = 'completed'
     if data.get('advance'):
@@ -64,6 +66,10 @@ def update_plan(todos, data):
     if isinstance(start, int) and 0 < start <= len(todos):
         todos[start - 1]['status'] = 'in_progress'
     return todos
+
+
+# Logs that failed to parse, reported once each.
+SKIPPED = set()
 
 
 NOTIFIED = re.compile(r'<(?:tool-use-id|task-id)>([^<]+)</')
@@ -204,7 +210,9 @@ def _session_state(path, agent, version, span=262144):
             continue
         moment = timestamp(event.get('timestamp'))
         if kind == 'turn_context':
-            settings = (data.get('collaboration_mode') or {}).get('settings') or {}
+            mode = data.get('collaboration_mode')
+            settings = (mode.get('settings') if isinstance(mode, dict) else None) or {}
+            settings = settings if isinstance(settings, dict) else {}
             state['model'] = short_model(data.get('model') or settings.get('model')) or state['model']
             state['effort'] = data.get('effort') or settings.get('reasoning_effort') or state['effort']
         elif kind == 'assistant.message':
@@ -624,6 +632,10 @@ def read_activity(home=None, now=None, detailed=False, extra_agents=False):
                         result.append(state)
                 except OSError:
                     continue
+                except Exception as error:  # one malformed log must not hide every other agent
+                    if path not in SKIPPED:
+                        SKIPPED.add(path)
+                        print(f'agent activity: skipped {path}: {type(error).__name__}: {error}', file=sys.stderr)
         except OSError:
             pass
     titles = codex_titles(home) if any(item['agent'] == 'codex' for item in result) else {}
