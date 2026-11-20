@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 from datetime import datetime, timezone
-from agent_activity import read_activity, session_state, ActivityTracker, timestamp, live_agent_files, claude_project
+from agent_activity import read_activity, session_state, ActivityTracker, timestamp, live_agent_files, claude_project, short_model
 from agent_windows import agent_pids
 
 
@@ -336,6 +336,117 @@ class ActivityTests(unittest.TestCase):
             with patch('agent_windows.Path', side_effect=lambda value: real(fake) if value == '/proc' else real(value)), \
                     patch('agent_windows.os.getpid', return_value=100):
                 self.assertEqual(agent_pids('claude', '/home/u/.claude/projects/-work-my-proj/s.jsonl'), {102, 50})
+
+    def claude_rows(self, root, events, **extra):
+        path = root / '.claude/projects/-tmp/s.jsonl'
+        self.write_claude(path, events)
+        for name, content in extra.items():
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        return [row for row in read_activity(root, detailed=True) if row['agent'] == 'claude']
+
+    def test_claude_title_model_and_todos(self):
+        self.assertEqual([short_model(m) for m in ('claude-opus-5-5', 'claude-haiku-5-5[1m]', 'claude-sonnet-4-20250514', 'opus', 'inherit', 'gpt-6.2-sol')],
+                         ['opus 5.5', 'haiku 5.5', 'sonnet 4', 'opus', None, 'gpt-6.2-sol'])
+        start = {'type': 'user', 'message': {'content': 'start'}}
+        ai = {'type': 'ai-title', 'aiTitle': 'AI name'}
+        custom = {'type': 'custom-title', 'customTitle': 'My name'}
+        todo = {'type': 'assistant', 'effort': 'xhigh', 'message': {'model': 'claude-opus-5-5', 'content': [{'type': 'tool_use', 'id': 't', 'name': 'TodoWrite', 'input': {'todos': [
+            {'content': 'Read code', 'status': 'completed', 'activeForm': 'Reading'},
+            {'content': 'Write tests', 'status': 'in_progress', 'activeForm': 'Writing'}]}}]}}
+        sidechain = {'type': 'assistant', 'isSidechain': True, 'effort': 'low', 'message': {'model': 'claude-haiku-5-5', 'content': []}}
+        with tempfile.TemporaryDirectory() as directory:
+            row, = self.claude_rows(Path(directory), [start, custom, ai, todo, sidechain])
+            self.assertEqual((row['title'], row['model'], row['effort']), ('My name', 'opus 5.5', 'xhigh'))
+            self.assertEqual(row['todos'], [{'text': 'Read code', 'status': 'completed'}, {'text': 'Write tests', 'status': 'in_progress'}])
+            self.assertEqual((row['current_task'], row['subagents']), ('Write tests', []))
+            self.assertEqual(self.claude_rows(Path(directory), [start, ai])[0]['title'], 'AI name')
+            self.assertEqual(self.claude_rows(Path(directory), [start, ai], **{'.claude/projects/-tmp/s/custom-title.json': '{"customTitle": "Saved"}'})[0]['title'], 'Saved')
+            plan = lambda **data: {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': 'p', 'name': 'mcp__ccd_turn__update_plan', 'input': data}]}}
+            row, = self.claude_rows(Path(directory), [start, plan(items=[{'content': 'A', 'status': 'in_progress'}, {'content': 'B', 'status': 'pending'}]), plan(advance=True)])
+            self.assertEqual(([t['status'] for t in row['todos']], row['current_task']), (['completed', 'in_progress'], 'B'))
+            self.assertIsNone(self.claude_rows(Path(directory), [start])[0]['todos'])
+
+    def test_claude_running_subagents(self):
+        agent = lambda tool_id, **data: {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': tool_id, 'name': 'Agent', 'input': data}]}}
+        result = lambda tool_id, **extra: dict({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': tool_id}]}}, **extra)
+        events = [{'type': 'user', 'message': {'content': 'start'}},
+                  {'type': 'assistant', 'message': {'model': 'claude-opus-5-5', 'content': []}},
+                  agent('given', subagent_type='scout', description='Find files', model='haiku', effort='low'),
+                  agent('logged', subagent_type='general-purpose', description='From log'),
+                  agent('defined', subagent_type='reviewer', description='From md'),
+                  agent('sync-done', subagent_type='scout', description='Finished'), result('sync-done'),
+                  agent('async', subagent_type='scout', description='Background'),
+                  result('async', toolUseResult={'status': 'async_launched', 'agentId': 'b1', 'resolvedModel': 'claude-haiku-5-5'}),
+                  {'type': 'queue-operation', 'operation': 'enqueue', 'content': '<task-notification>\n<task-id>b1</task-id>\n</task-notification>'}]
+        files = {'.claude/projects/-tmp/s/subagents/agent-l1.meta.json': json.dumps({'agentType': 'general-purpose', 'toolUseId': 'logged'}),
+                 '.claude/projects/-tmp/s/subagents/agent-l1.jsonl': json.dumps({'type': 'user', 'message': {'content': 'go'}}) + '\n' + json.dumps(
+                     {'type': 'assistant', 'effort': 'medium', 'message': {'model': 'claude-sonnet-5-5', 'content': []}}) + '\n',
+                 '.claude/agents/reviewer.md': '---\nname: reviewer\nmodel: opus\neffort: high\n---\nReview.\n'}
+        with tempfile.TemporaryDirectory() as directory:
+            row, = self.claude_rows(Path(directory), events, **files)
+            self.assertEqual(row['subagents'], [
+                dict(type='scout', description='Find files', model='haiku', effort='low', status='running'),
+                dict(type='general-purpose', description='From log', model='sonnet 5.5', effort='medium', status='running'),
+                dict(type='reviewer', description='From md', model='opus', effort='high', status='running')])
+            # A background agent launched before the parsed tail is found by its unfinished metadata and fresh log.
+            files = {'.claude/projects/-tmp/s/subagents/agent-old.meta.json': json.dumps({'agentType': 'scout', 'description': 'Old', 'toolUseId': 'gone', 'effort': 'low'}),
+                     '.claude/projects/-tmp/s/subagents/agent-old.jsonl': json.dumps({'type': 'assistant', 'message': {'model': 'claude-haiku-5-5'}}) + '\n',
+                     '.claude/projects/-tmp/s/subagents/agent-l1.meta.json': json.dumps({'toolUseId': 'logged', 'finished': True})}
+            row, = self.claude_rows(Path(directory), events[:3] + events[4:], **files)
+            self.assertEqual([(s['description'], s['model'], s['effort']) for s in row['subagents']],
+                             [('Find files', 'haiku', 'low'), ('From md', 'opus', 'high'), ('Old', 'haiku 5.5', 'low')])
+            stale = Path(directory) / '.claude/projects/-tmp/s/subagents/agent-old.jsonl'
+            os.utime(stale, (time.time() - 1000,) * 2)
+            self.assertEqual(len(self.claude_rows(Path(directory), events[:3] + events[4:])[0]['subagents']), 2)
+
+    def test_codex_detail_and_linked_subagents(self):
+        line = lambda kind, **payload: json.dumps({'type': kind, 'payload': payload})
+        plan = json.dumps({'plan': [{'step': 'Inspect', 'status': 'completed'}, {'step': 'Patch', 'status': 'in_progress'}]})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / '.codex/sessions/2026/11/20'
+            sessions.mkdir(parents=True)
+            (sessions / 'rollout-parent.jsonl').write_text('\n'.join([
+                line('session_meta', id='p1', source='cli'), line('event_msg', type='task_started'),
+                line('turn_context', model='gpt-6.2-sol', effort='medium'),
+                line('response_item', type='function_call', name='update_plan', arguments=plan, call_id='c1')]) + '\n')
+            spawn = {'subagent': {'thread_spawn': {'parent_thread_id': 'p1', 'agent_role': 'scout', 'agent_nickname': 'Darwin'}}}
+            (sessions / 'rollout-child.jsonl').write_text('\n'.join([
+                line('session_meta', id='c1', source=spawn), line('event_msg', type='task_started'),
+                line('turn_context', collaboration_mode={'settings': {'model': 'gpt-6.1-terra', 'reasoning_effort': 'low'}})]) + '\n')
+            (root / '.codex/session_index.jsonl').write_text(json.dumps({'id': 'p1', 'thread_name': 'Fix the widget'}) + '\n')
+            row, = read_activity(root, detailed=True)
+            self.assertEqual((row['title'], row['model'], row['effort'], row['current_task']), ('Fix the widget', 'gpt-6.2-sol', 'medium', 'Patch'))
+            self.assertEqual(row['todos'], [{'text': 'Inspect', 'status': 'completed'}, {'text': 'Patch', 'status': 'in_progress'}])
+            self.assertEqual(row['subagents'], [dict(type='scout', description='Darwin', model='gpt-6.1-terra', effort='low', status='running')])
+            self.assertNotIn('_thread', row)
+
+    def test_opencode_sessions_need_a_live_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / '.local/share/opencode/opencode.db'
+            database.parent.mkdir(parents=True)
+            now = time.time()
+            with sqlite3.connect(database) as connection:
+                connection.executescript('CREATE TABLE session (id, parent_id, title, agent, model, time_updated, time_archived);'
+                                         'CREATE TABLE message (session_id, time_created, time_updated, data);'
+                                         'CREATE TABLE todo (session_id, content, status, position);')
+                model = json.dumps({'id': 'deepseek-v4.1', 'variant': 'high'})
+                connection.executemany('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, NULL)', [
+                    ('s1', None, 'Build viewer', 'build', model, now * 1000), ('s2', 's1', 'Find f', 'scout', json.dumps({'id': 'gemini-3-flash', 'variant': 'default'}), now * 1000)])
+                connection.executemany('INSERT INTO message VALUES (?, ?, ?, ?)', [
+                    ('s1', now * 1000 - 5, now * 1000, json.dumps({'role': 'user'})),
+                    ('s1', now * 1000, now * 1000, json.dumps({'role': 'assistant', 'modelID': 'deepseek-v4.1', 'variant': 'high', 'time': {}})),
+                    ('s2', now * 1000, now * 1000, json.dumps({'role': 'assistant', 'time': {}}))])
+                connection.execute("INSERT INTO todo VALUES ('s1', 'Scaffold', 'in_progress', 0)")
+            self.assertEqual(read_activity(root, detailed=True, extra_agents=True), [])
+            with patch('agent_activity.live_agent_files', return_value={str(database)}):
+                self.assertEqual(read_activity(root, detailed=True), [])
+                row, = read_activity(root, detailed=True, extra_agents=True, now=now)
+            self.assertEqual((row['status'], row['title'], row['model'], row['effort'], row['current_task']), ('running', 'Build viewer', 'deepseek-v4.1', 'high', 'Scaffold'))
+            self.assertEqual(row['subagents'], [dict(type='scout', description='Find f', model='gemini-3-flash', effort=None, status='running')])
 
     def test_max_profile_huge_newest_line_and_short_timestamp_fraction(self):
         with tempfile.TemporaryDirectory() as directory:
