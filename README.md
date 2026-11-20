@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/aipet-banner.png" alt="AIpet — AI 한도, 에이전트 작업, 캘린더를 알려 주는 데스크톱 펫" width="100%">
+  <img src="assets/aipet-banner.png" alt="AIpet — AI 한도, 에이전트 작업, 캘린더를 알려 주는 데스크톱 펫" width="560">
 </p>
 
 <p align="center"><b>한국어</b> · <a href="README.en.md">English</a></p>
