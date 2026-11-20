@@ -8,6 +8,8 @@
 
 바탕화면에 사는 작은 도트 마스코트가 AI 한도, 돌아가는 에이전트, 다음 일정을 알려 줘요.
 
+<p align="center"><img src="docs/screenshots/mascot.gif" alt="Claude 도트 마스코트 애니메이션" width="144"></p>
+
 Claude Code, Codex, Antigravity, Copilot을 번갈아 쓰다 보니 한도가 얼마 남았는지, 에이전트가 아직 일하는 중인지, 다음 회의가 언제인지
 확인하려고 창을 계속 열게 되더라고요. 그래서 위젯 하나에 모았어요. Ubuntu GNOME(X11)에서 PySide6로 만들었고,
 제 데스크톱에서 매일 켜 두고 씁니다. 화면은 어두운 벽에 켜진 주황 네온사인 느낌으로 꾸몄어요.
@@ -37,6 +39,22 @@ Claude Code, Codex, Antigravity, Copilot을 번갈아 쓰다 보니 한도가 �
 - 네온 발광은 그래픽 효과를 겹치지 않고 직접 그려서 가볍게 유지했어요.
 - 파일 잠금과 로컬 소켓으로 한 번만 실행돼요. 바로가기를 또 누르면 새 창 대신 떠 있는 창을 앞으로 가져와요.
 
+## 화면
+
+예시 데이터로 렌더링한 화면이에요.
+
+| 대시보드 | AI 한도 |
+|---|---|
+| ![대시보드](docs/screenshots/dashboard.png) | ![AI 한도](docs/screenshots/quota.png) |
+| **에이전트 세션** | **구독·결제** |
+| ![에이전트](docs/screenshots/agents.png) | ![구독·결제](docs/screenshots/billing.png) |
+
+| 작은 위젯 | 펫 말풍선 | 에이전트 추가 |
+|---|---|---|
+| <img src="docs/screenshots/compact.png" width="260"> | <img src="docs/screenshots/pet-bubble.png" width="220"> | <img src="docs/screenshots/add-account.png" width="260"> |
+
+라이트 테마: [docs/screenshots/light-dashboard.png](docs/screenshots/light-dashboard.png)
+
 자세한 화면별 설명은 [docs/GUIDE.md](docs/GUIDE.md)에 있어요.
 
 ## 실행
@@ -62,7 +80,7 @@ QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme li
 ## 아쉬운 점
 
 X11 전용이라 Wayland, Windows, macOS에서는 안 돌아가요. Copilot 한도는 공식 확장이 쓰는 내부 API에 기대고 있어서
-응답 형식이 바뀌면 고쳐야 할 수 있어요. Antigravity는 로그인 명령이 없어서 기존 로그인 연결만 되고, Cursor·opencode는 한도를
+응답 형식이 바뀌면 고쳐야 할 수 있어요. Antigravity(`agy`)는 로그인 명령이 없고(앱 안의 `/login`만 있음) 로그인 정보를 시스템 키링에 하나만 저장해서, 이 PC의 기존 로그인 연결만 돼요. Cursor·opencode는 한도를
 못 읽어요. Claude Team 좌석 요금은 구분이 안 돼서 직접 입력해야 하고, 로그인이 만료된 계정은 지우고 다시 추가해야 해요.
 
 서비스 로고는 식별용으로만 써요([assets/SOURCES.md](assets/SOURCES.md)). 펫은 Anthropic의 Claude 마스코트를 참고해서
