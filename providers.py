@@ -64,11 +64,11 @@ def stop(process):
             stream.close()
 
 
-def output(args, env=None, timeout=30):
+def output(args, env=None, timeout=30, check=True):
     process = start(args, env=env)
     try:
         raw, _ = process.communicate(timeout=timeout)
-        if process.returncode:
+        if check and process.returncode:
             raise QuotaError(f"{args[0]} 조회 실패 · 로그인·네트워크 확인")
         return raw.decode("utf-8")
     except subprocess.TimeoutExpired:
@@ -428,6 +428,9 @@ def environment(account):
         env.pop(key, None)
     variable = KINDS[account["kind"]]["env"]
     if variable and not account.get("use_default"):
+        # The CLIs recreate a missing profile folder, which would bring a removed account back.
+        if not Path(account["profile_dir"]).is_dir():
+            raise QuotaError("프로필 폴더 없음 · 계정을 다시 추가해 주세요")
         env[variable] = str(account["profile_dir"])
     elif variable and variable != "XDG_DATA_HOME":
         # A default account is the default CLI login, even if the shell selected another profile.
@@ -474,8 +477,9 @@ def active_login(kind):
 
 def logged_in(account):
     """Whether the account's own CLI profile holds a login. Runs status commands only."""
-    kind, env = account["kind"], environment(account)
+    kind = account["kind"]
     try:
+        env = environment(account)
         if kind == "claude":
             auth = json.loads(output(["claude", "auth", "status", "--json"], env=env, timeout=10))
             return claude_profile_ok(auth, account)
@@ -499,15 +503,13 @@ def logged_in(account):
 
 
 def claude(account):
-    isolated = not account.get("use_default")
-    if isolated and not Path(account["profile_dir"]).is_dir():
-        raise QuotaError("프로필 폴더 없음 · 계정을 다시 추가해 주세요")
     env = environment(account)
-    login_message = "Claude 로그인 필요 · 계정을 다시 추가해 주세요" if isolated else "Claude 로그인 필요 · claude auth login 확인"
+    login_message = "로그인 만료 · 카드 메뉴에서 다시 로그인"
     try:
-        auth = json.loads(output(["claude", "auth", "status", "--json"], env=env, timeout=5))
-    except QuotaError:
-        raise QuotaError(login_message) from None
+        # A logged-out status exits non-zero but still prints its JSON; only a timeout or crash has none.
+        auth = json.loads(output(["claude", "auth", "status", "--json"], env=env, timeout=5, check=False))
+    except (QuotaError, ValueError):
+        raise QuotaError("상태 확인 실패 · 잠시 후 다시 시도") from None
     if not claude_profile_ok(auth, dict(account, use_default=True)):
         raise QuotaError(login_message)
     if not claude_profile_ok(auth, account):
