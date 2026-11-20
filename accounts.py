@@ -13,7 +13,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
                                QDialogButtonBox, QMessageBox, QCheckBox)
 
-from providers import KINDS, QuotaError, active_login, claude_max_dir, default_login, environment, executable, logged_in
+from providers import KINDS, QuotaError, active_login, claude_max_dir, cli, default_login, environment, executable, logged_in
 
 
 PENDING = ".check-ai-pending"
@@ -154,7 +154,10 @@ def unregister(settings, accounts, account_id, delete_profile=False):
 
 
 def terminal_command(title, args):
-    command = [executable("rtk"), "proxy", executable(args[0]), *args[1:]]
+    try:
+        command = cli(args)
+    except QuotaError:
+        raise QuotaError(f"{args[0]} 명령 없음 · CLI 설치 확인") from None
     for name, options in (("terminator", ["--no-dbus", "--title", title, "-x"]),
                           ("x-terminal-emulator", ["-e"]),
                           ("gnome-terminal", ["--title", title, "--"])):

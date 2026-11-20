@@ -63,7 +63,8 @@ Claude Code, Codex, Antigravity, Copilot을 번갈아 쓰다 보니 한도가 �
 ## 실행
 
 필요한 것: Ubuntu GNOME(X11), Python 3, PySide6, 그리고 쓰려는 에이전트 CLI(`claude`, `codex`, `gh`, `agy`, `opencode` 등).
-Google OAuth 라이브러리는 `vendor/`에 넣어 뒀어요.
+Google OAuth 라이브러리는 `vendor/`에 넣어 뒀어요. 로그인 터미널을 띄우려면 `terminator`, `x-terminal-emulator`, `gnome-terminal` 중 하나가 필요해요.
+`rtk`는 선택 사항이에요. 설치돼 있으면 CLI를 `rtk proxy`로 감싸 실행하고, 없으면 CLI를 바로 실행해요.
 
 ```bash
 git clone https://github.com/lsy041015/AIpet.git ~/ai-quota-widget

@@ -31,9 +31,18 @@ def executable(name):
     return path
 
 
+def cli(args):
+    """The CLI command line, wrapped in `rtk proxy` only when rtk is installed (optional)."""
+    command = [executable(args[0]), *args[1:]]
+    try:
+        return [executable("rtk"), "proxy", *command]
+    except QuotaError:
+        return command
+
+
 def start(args, env=None):
     return subprocess.Popen(
-        [executable("rtk"), "proxy", executable(args[0]), *args[1:]],
+        cli(args),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         start_new_session=True, env=env,
     )
