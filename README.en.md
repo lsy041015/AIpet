@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/aipet-banner.png" alt="AIpet — a desktop pet for AI quotas, agent status and your calendar" width="100%">
+  <img src="assets/aipet-banner.png" alt="AIpet — a desktop pet for AI quotas, agent status and your calendar" width="560">
 </p>
 
 <p align="center"><a href="README.md">한국어</a> · <b>English</b></p>
