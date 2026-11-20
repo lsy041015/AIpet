@@ -810,13 +810,13 @@ class DesktopWindow(Widget):
         self.task_buttons = []
         for index, task in enumerate(self.agent_activity):
             card = SessionCard(task, colors, str(task.get("id")) in self.expanded_sessions)
-            card.activated.connect(lambda item=index: self.open_activity(str(item)))
+            card.activated.connect(lambda key=task.get("id"): self.open_activity(key))
             card.expanded_changed.connect(self.remember_expanded)
             self.task_layout.addWidget(card)
             self.task_buttons.append(card)
             if index < 3:
                 summary = SessionCard(task, colors, compact=True)
-                summary.activated.connect(lambda item=index: self.open_activity(str(item)))
+                summary.activated.connect(lambda key=task.get("id"): self.open_activity(key))
                 self.overview_sessions.addWidget(summary)
         self.agents_empty.setVisible(not self.task_buttons)
         extra = len(self.agent_activity) - 3

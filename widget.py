@@ -260,31 +260,36 @@ def logo_icon(path):
     return QIcon(path)
 
 
-def paint_logo(self, event):
+def draw_logo(p, rect, kind, colors, font, fill):
     """Logo tile: dark tile and white line logo in the neon theme, white tile in the light theme."""
-    colors = theme_colors(self)
-    dark = bool(colors["glow"])
-    p = QPainter(self)
-    p.setRenderHint(QPainter.Antialiasing)
-    p.setRenderHint(QPainter.SmoothPixmapTransform)
-    rect = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
     radius = rect.height() * .3
-    down = isinstance(self, QPushButton) and self.isDown()
     p.setPen(QPen(QColor(colors["border"]), 1))
-    p.setBrush(QColor(colors["selected"] if down else colors["control"] if dark else "#ffffff"))
+    p.setBrush(QColor(fill))
     p.drawRoundedRect(rect, radius, radius)
-    asset = logo_asset(self.kind, dark)
+    asset = logo_asset(kind, bool(colors["glow"]))
     side = round(rect.width() * .64)
     target = QRect(round(rect.center().x() - side / 2), round(rect.center().y() - side / 2), side, side)
     if asset.exists():
         logo_icon(str(asset)).paint(p, target)
     else:
-        font = QFont(self.font())
+        font = QFont(font)
         font.setFamilies(DISPLAY_FONTS)
         font.setPixelSize(round(side * .8))
         p.setFont(font)
-        p.setPen(QColor(colors.get(self.kind, colors["text"])))
-        p.drawText(target, Qt.AlignCenter, str(self.kind or "?")[:1].upper())
+        p.setPen(QColor(colors.get(kind, colors["text"])))
+        p.drawText(target, Qt.AlignCenter, str(kind or "?")[:1].upper())
+    return radius
+
+
+def paint_logo(self, event):
+    colors = theme_colors(self)
+    p = QPainter(self)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+    rect = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
+    down = isinstance(self, QPushButton) and self.isDown()
+    radius = draw_logo(p, rect, self.kind, colors, self.font(),
+                       colors["selected"] if down else colors["control"] if colors["glow"] else "#ffffff")
     if self.hasFocus() and self.testAttribute(Qt.WA_KeyboardFocusChange):
         p.setPen(QPen(QColor(colors["accent"]), 1.5))
         p.setBrush(Qt.NoBrush)
@@ -971,57 +976,209 @@ class CircleButton(AppIconButton):
             p.drawEllipse(rect.adjusted(-1.5, -1.5, 1.5, 1.5))
 
 
+BUBBLE_WIDTH = 316
+FINISHED = ('done', 'completed', 'failed', 'cancelled')
+
+
+def elapsed_text(task):
+    minutes, seconds = divmod(int(task.get('elapsed') or 0), 60)
+    text = (f'{minutes // 60}시간 {minutes % 60}분' if minutes >= 60 else
+            f'{minutes}분 {seconds:02d}초' if minutes else f'{seconds}초')
+    return ('감지 후 ' if task.get('estimated') else '') + text + ' 경과'
+
+
+def activity_row(task, show_models):
+    """What one session row of the pet's activity bubble shows."""
+    key = task.get('agent')
+    title = session_title(task)
+    if key == 'codex' and title == service_info(key)[0]:
+        title = 'Codex'
+    helpers = [agent for agent in task.get('subagents') or () if isinstance(agent, dict)]
+    busy = sum(agent.get('status') not in FINISHED for agent in helpers)
+    status = task.get('status')
+    pill = ({'waiting': '승인 대기', 'done': '완료', 'failed': '실패'}.get(status)
+            or (f'서브 {busy}개' if busy else '작업 중'))
+    done, total = todo_progress(task)
+    current = task.get('current_task')
+    chips = []
+    if show_models:
+        groups = {}
+        for agent in helpers:
+            model = " ".join(str(v) for v in (agent.get('model'), agent.get('effort')) if v)
+            text = " · ".join(v for v in (str(agent.get('type') or 'agent'), model) if v)
+            groups[text] = groups.get(text, 0) + 1
+        chips = [text + (f' ×{count}' if count > 1 else '') for text, count in list(groups.items())[:3]]
+        hidden = sum(list(groups.values())[3:])
+        if hidden:
+            chips.append(f'+{hidden}')
+    return dict(id=task.get('id'), kind=key, title=title, status=status, pill=pill,
+                current=f'▸ {current}' if current else str(task.get('label') or ''), done=done, total=total,
+                model=model_text(task) if show_models else '', chips=chips, elapsed=elapsed_text(task))
+
+
 class PetBubble(QWidget):
-    """Non-interactive speech bubble; never takes focus from the desktop."""
+    """Speech bubble beside the folded pet: painted agent sessions, or the hover summary label.
+
+    It never takes focus from the desktop. Background opacity (pet/bubble_opacity) only fades the fills,
+    so text and neon lines stay fully readable."""
     def __init__(self, pet):
         super().__init__(pet, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowDoesNotAcceptFocus | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setMouseTracking(True)
         self.on_right = True
         self.tail_y = 40
         self.waiting = False
+        self.rows = []
+        self.extra = 0
+        self.footer = None
+        self.hover = None
         self.placement_anchor = None
         self.placement_area = None
+        self.pulse_timer = QTimer(self)
+        self.pulse_timer.setInterval(90)
+        self.pulse_timer.timeout.connect(self.pulse_tick)
+        base = QFont(self.font())
+        self.fonts = {}
+        for name, size, weight in (("head", 12, QFont.Bold), ("title", 12, QFont.DemiBold), ("body", 11, QFont.Normal),
+                                   ("small", 10, QFont.Normal), ("pill", 10, QFont.DemiBold)):
+            font = QFont(base)
+            font.setPixelSize(size)
+            font.setWeight(weight)
+            self.fonts[name] = font
+        self.metrics = {name: QFontMetricsF(font) for name, font in self.fonts.items()}
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 20, 28, 20)
+        layout.setContentsMargins(24, 21, 22, 23)
         self.text = QLabel(self)
         self.text.setTextFormat(Qt.RichText)
-        self.text.setTextInteractionFlags(Qt.LinksAccessibleByMouse)
-        self.text.setOpenExternalLinks(False)
-        self.text.linkActivated.connect(pet.owner.open_activity)
+        self.text.setTextInteractionFlags(Qt.NoTextInteraction)
         self.text.setWordWrap(True)
-        self.text.setFixedWidth(260)
-        self.text.setStyleSheet("background: transparent; font-size: 12px;")
+        self.text.setFixedWidth(214)
         layout.addWidget(self.text)
+
+    def owner(self):
+        return self.parentWidget().owner
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
+        self.set_hover(None)
         QTimer.singleShot(160, self.parentWidget().restore_activity)
 
+    def hit(self, pos):
+        for index, row in enumerate(self.rows):
+            if row['rect'].contains(pos):
+                return index
+        return 'more' if self.footer is not None and self.footer.contains(pos) else None
+
+    def set_hover(self, target):
+        if target != self.hover:
+            self.hover = target
+            self.setCursor(Qt.PointingHandCursor if target is not None else Qt.ArrowCursor)
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        self.set_hover(self.hit(event.position()))
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and len(self.parentWidget().owner.agent_activity) == 1:
-            self.parentWidget().owner.open_activity('0')
+        if event.button() == Qt.LeftButton:
+            target = self.hit(event.position())
+            tasks = self.owner().agent_activity
+            if target == 'more':
+                self.owner().open_activity(None)
+            elif target is not None:
+                self.owner().open_activity(self.rows[target]['id'])
+            elif len(tasks) == 1:
+                self.owner().open_activity(tasks[0].get('id'))
         super().mouseReleaseEvent(event)
 
-    def present(self, pet, content=None):
-        colors = THEMES[pet.owner.theme]
-        compact = content is not None
-        self.waiting = compact and any(t['status'] == 'waiting' for t in pet.owner.agent_activity)
-        style = (pet.owner.theme, compact)
-        changed_style = getattr(self, "presentation_style", None) != style
-        if changed_style:
-            self.presentation_style = style
-            # Extra room around the body keeps the neon edge's halo inside the window.
-            self.layout().setContentsMargins(24, 17 if compact else 21, 22, 19 if compact else 23)
-            self.text.setFixedWidth(214)
-            self.text.setStyleSheet(f"background: transparent; color: {colors['text']}; font-size: 11px;")
-        text = pet.owner.pet_summary() if content is None else content
-        if changed_style or self.text.text() != text:
-            self.text.setText(text)
-            self.adjustSize()
+    def present(self, pet, tasks=None):
+        """Show the summary label (tasks None) or the painted rows of up to four agent sessions."""
+        owner = pet.owner
+        colors = THEMES[owner.theme]
+        self.hover = None
+        if tasks is None:
+            self.rows, self.extra, self.footer, self.waiting = [], 0, None, False
+            if getattr(self, "presentation_style", None) != owner.theme:
+                self.presentation_style = owner.theme
+                self.text.setStyleSheet(f"background: transparent; color: {colors['text']}; font-size: 11px;")
+            text = owner.pet_summary()
+            if self.text.isHidden() or self.text.text() != text:
+                self.text.setText(text)
+                self.text.show()
+                self.adjustSize()
+            self.setAccessibleDescription(self.text.text())
+        else:
+            show_models = owner.settings.value("pet/show_models", True, type=bool)
+            self.rows = [activity_row(task, show_models) for task in tasks[:4]]
+            self.extra = max(0, len(tasks) - 4)
+            self.counts = (sum(t.get('status') == 'running' for t in tasks), sum(t.get('status') == 'waiting' for t in tasks))
+            self.waiting = bool(self.counts[1])
+            self.text.hide()
+            self.layout().activate()  # drop the summary label's minimum height before shrinking
+            self.resize(BUBBLE_WIDTH, self.layout_rows())
+            self.setAccessibleDescription("\n".join(
+                " · ".join(v for v in (row['title'], row['pill'], row['current'], row['model'], *row['chips'], row['elapsed']) if v)
+                for row in self.rows))
         # Place it while hidden: showing first would flash the previous position.
         self.reposition()
         self.show()
+        self.sync_pulse()
+
+    def layout_rows(self):
+        """Card, pill and chip rectangles of the rows; returns the bubble height."""
+        m = self.metrics
+        left, right = 26, BUBBLE_WIDTH - 24
+        y = 8 + 14 + 18 + 11
+        for row in self.rows:
+            top = y
+            text_x = left + 9 + 28 + 10
+            text_right = right - 10
+            pill = m['pill'].horizontalAdvance(row['pill']) + 24
+            row['pill_rect'] = QRectF(text_right - pill, top + 9, pill, 18)
+            row['title_rect'] = QRectF(text_x, top + 9, text_right - pill - 6 - text_x, 18)
+            row['current_rect'] = QRectF(text_x, top + 30, text_right - text_x, 16)
+            y = top + 46
+            if row['total']:
+                row['bar_rect'] = QRectF(text_x, y + 4, text_right - text_x, 3)
+                y += 7
+            chips, x, line = [], text_x, y + 7
+            for text, main in ([(row['model'], True)] if row['model'] else []) + [(text, False) for text in row['chips']]:
+                text = m['small'].elidedText(text, Qt.ElideRight, text_right - text_x - 14)
+                width = m['small'].horizontalAdvance(text) + 14
+                if x > text_x and x + width > text_right:
+                    x, line = text_x, line + 22
+                chips.append((QRectF(x, line, width, 18), text, main))
+                x += width + 5
+            row['chips_placed'] = chips
+            if chips:
+                y = line + 18
+            row['elapsed_rect'] = QRectF(text_x, y + 4, text_right - text_x, 15)
+            y += 4 + 15 + 9
+            row['rect'] = QRectF(left, top, right - left, y - top)
+            y += 6
+        self.footer = None
+        if self.extra:
+            self.footer = QRectF(left, y, right - left, 24)
+            y += 24 + 6
+        return round(y - 6 + 14 + 8)
+
+    def sync_pulse(self):
+        """The waiting dots breathe only while a waiting row is on screen and motion is allowed."""
+        if (self.isVisible() and any(row['status'] == 'waiting' for row in self.rows)
+                and not self.owner().reduce_motion.isChecked()):
+            self.pulse_timer.start()
+        else:
+            self.pulse_timer.stop()
+
+    def pulse_tick(self):
+        for row in self.rows:
+            if row['status'] == 'waiting':
+                self.update(row['pill_rect'].adjusted(-2, -6, 0, 6).toRect())
+
+    def hideEvent(self, event):
+        self.pulse_timer.stop()
+        super().hideEvent(event)
 
     def reposition(self):
         pet = self.parentWidget()
@@ -1039,8 +1196,11 @@ class PetBubble(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
         body = QRectF(12, 8, self.width() - 22, self.height() - 16)
-        colors = THEMES[self.parentWidget().owner.theme]
+        owner = self.owner()
+        colors = THEMES[owner.theme]
+        opacity = owner.bubble_opacity / 100
         path = QPainterPath()
         path.addRoundedRect(body, 16, 16)
         tail = QPainterPath()
@@ -1051,24 +1211,142 @@ class PetBubble(QWidget):
         tail.lineTo(x, self.tail_y + 6)
         tail.closeSubpath()
         path = path.united(tail)
+        fill = QColor(colors['card'])
+        fill.setAlphaF(opacity)
         if colors["glow"]:
             # Neon outline: halo first, then the dark body covers its inner half, then the bright tube line.
             neon = QColor(colors['warning'] if self.waiting else colors['accent'])
             glow_strokes(p, path, neon, .8)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(colors['card']))
+            p.setBrush(fill)
             p.drawPath(path)
             neon.setAlpha(225)
             p.setPen(QPen(neon, 1.3))
             p.setBrush(Qt.NoBrush)
             p.drawPath(path)
-            return
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(0, 0, 0, 45))
-        p.drawPath(path.translated(0, 3))
-        p.setPen(QPen(QColor(colors['warning'] if self.waiting else colors['border']), 1.5 if self.waiting else 1))
-        p.setBrush(QColor(colors['card']))
-        p.drawPath(path)
+        else:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, round(45 * opacity)))
+            # Only the part outside the body: a faded body must not show a dark slab through it.
+            p.drawPath(path.translated(0, 3).subtracted(path))
+            p.setPen(QPen(QColor(colors['warning'] if self.waiting else colors['border']), 1.5 if self.waiting else 1))
+            p.setBrush(fill)
+            p.drawPath(path)
+        if self.rows:
+            self.paint_rows(p, colors, opacity)
+
+    def paint_rows(self, p, colors, opacity):
+        neon = bool(colors["glow"])
+        m = self.metrics
+        left, right = 26, BUBBLE_WIDTH - 24
+
+        def tint(color, alpha):
+            color = QColor(color)
+            color.setAlpha(round(alpha))
+            return color
+
+        def text(rect, value, font, color, align=Qt.AlignLeft | Qt.AlignVCenter, elide=True):
+            p.setFont(self.fonts[font])
+            p.setPen(QColor(color))
+            p.drawText(rect, align, m[font].elidedText(value, Qt.ElideRight, rect.width()) if elide else value)
+
+        # Header: neon title, then running/waiting counts with their dots on the right.
+        head = QRectF(left + 2, 22, right - left - 4, 18)
+        title = "에이전트 작업"
+        text(head, title, "head", colors['accent'], elide=False)
+        count_x = head.left() + m['head'].horizontalAdvance(title)
+        text(QRectF(count_x, head.top(), 40, 18), f" · {len(self.rows) + self.extra}", "head", colors['text'], elide=False)
+        x = head.right()
+        for count, word, color in ((self.counts[1], "대기", colors['warning']), (self.counts[0], "실행", colors['accent'])):
+            if not count:
+                continue
+            label_text = f"{word} {count}"
+            width = m['small'].horizontalAdvance(label_text)
+            text(QRectF(x - width, head.top(), width, 18), label_text, "small", colors['muted'], elide=False)
+            x -= width + 10
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(color))
+            p.drawEllipse(QPointF(x + 4, head.center().y()), 2.6, 2.6)
+            x -= 10
+        line = QLinearGradient(left, 0, right, 0)
+        line.setColorAt(0, tint(colors['accent'], 150 if neon else 90))
+        line.setColorAt(1, tint(colors['accent'], 0))
+        p.fillRect(QRectF(left + 2, 45, right - left - 4, 1), line)
+
+        for index, row in enumerate(self.rows):
+            rect = row['rect']
+            hover = index == self.hover
+            state = colors['warning'] if row['status'] == 'waiting' else colors['danger'] if row['status'] == 'failed' \
+                else colors['codex'] if row['status'] == 'done' else colors['accent']
+            if neon:
+                card = tint(colors['accent'], (30 if hover else 14) * max(opacity, .6))
+                border = tint(state if row['status'] == 'waiting' else colors['accent'], 130 if hover else 60 if row['status'] == 'waiting' else 38)
+            else:
+                card = tint(colors['accent_soft'] if hover else colors['background'], 255 * opacity)
+                border = tint(colors['accent'], 130) if hover else tint(state, 110) if row['status'] == 'waiting' else QColor(colors['border'])
+            p.setPen(QPen(border, 1))
+            p.setBrush(card)
+            p.drawRoundedRect(rect.adjusted(.5, .5, -.5, -.5), 11, 11)
+            draw_logo(p, QRectF(rect.left() + 9, rect.top() + 9, 28, 28), row['kind'], colors, self.font(),
+                      colors['control'] if neon else "#ffffff")
+            text(row['title_rect'], row['title'], "title", colors['text'])
+            # Status pill with a lit dot; a waiting dot breathes while the pulse timer runs.
+            pill = row['pill_rect']
+            p.setPen(QPen(tint(state, 130 if neon else 100), 1))
+            p.setBrush(tint(state, 34 if neon else 26))
+            p.drawRoundedRect(pill.adjusted(.5, .5, -.5, -.5), 9, 9)
+            dot = QPointF(pill.left() + 10, pill.center().y())
+            level = .5 + .5 * math.sin(time.monotonic() * math.tau / 1.6) if self.pulse_timer.isActive() else 1.0
+            p.setPen(Qt.NoPen)
+            if neon:
+                for radius, alpha in ((6.5, 34), (4.5, 70)):
+                    p.setBrush(tint(state, alpha * (.35 + .65 * level)))
+                    p.drawEllipse(dot, radius, radius)
+            p.setBrush(tint(state, 150 + 105 * level))
+            p.drawEllipse(dot, 2.8, 2.8)
+            text(pill.adjusted(17, 0, -6, 0), row['pill'], "pill", mix(state, "#ffffff", .25) if neon else state, elide=False)
+            # Current task, todo count and a thin progress line.
+            current = row['current_rect']
+            count = f"{row['done']}/{row['total']}" if row['total'] else ""
+            count_width = m['small'].horizontalAdvance(count) + 6 if count else 0
+            text(current.adjusted(0, 0, -count_width, 0), row['current'], "body",
+                 colors['warning'] if row['status'] == 'waiting' and not row['current'].startswith('▸') else colors['text'])
+            if count:
+                text(current, count, "small", colors['muted'], Qt.AlignRight | Qt.AlignVCenter, elide=False)
+                bar = row['bar_rect']
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(colors['track']))
+                p.drawRoundedRect(bar, 1.5, 1.5)
+                filled = QRectF(bar.left(), bar.top(), bar.width() * row['done'] / row['total'], bar.height())
+                if filled.width() > 0:
+                    if neon:
+                        p.setBrush(tint(colors['glow'], 70))
+                        p.drawRoundedRect(filled.adjusted(-1, -1.5, 1, 1.5), 2.5, 2.5)
+                    p.setBrush(QColor(colors['accent']))
+                    p.drawRoundedRect(filled, 1.5, 1.5)
+            for chip, value, main in row['chips_placed']:
+                if main:
+                    p.setPen(QPen(tint(colors['accent'], 120 if neon else 90), 1))
+                    p.setBrush(tint(colors['accent'], 30) if neon else QColor(colors['accent_soft']))
+                    color = mix(colors['accent'], "#ffffff", .3) if neon else QColor(colors['accent'])
+                else:
+                    p.setPen(QPen(QColor(colors['border']), 1) if neon else Qt.NoPen)
+                    p.setBrush(QColor(255, 255, 255, 10) if neon else QColor(colors['control']))
+                    color = QColor(colors['muted'])
+                p.drawRoundedRect(chip.adjusted(.5, .5, -.5, -.5), 6, 6)
+                text(chip, value, "small", color, Qt.AlignCenter, elide=False)
+            text(row['elapsed_rect'], row['elapsed'], "small", colors['muted'])
+        if self.footer is not None:
+            hover = self.hover == 'more'
+            if hover:
+                p.setPen(Qt.NoPen)
+                p.setBrush(tint(colors['accent'], 26))
+                p.drawRoundedRect(self.footer, 9, 9)
+            font = QFont(self.fonts['body'])
+            font.setUnderline(hover)
+            p.setFont(font)
+            p.setPen(QColor(colors['accent']))
+            p.drawText(self.footer, Qt.AlignCenter, f"전체 작업 보기 · 외 {self.extra}개  ›")
 
 
 class ComputerPet(CircleButton):
@@ -1138,51 +1416,7 @@ class ComputerPet(CircleButton):
         if not self.isVisible() or self.dragging or self.isDown() or self.underMouse():
             return
         if self.owner.agent_activity:
-            colors = THEMES[self.owner.theme]
-            metrics = self.fontMetrics()
-            rows = []
-            for index, task in enumerate(self.owner.agent_activity[:4]):
-                key, status = task.get('agent'), task.get('label', '')
-                asset = logo_asset(key, self.owner.theme == 'dark')
-                name = 'Codex' if key == 'codex' else service_info(key)[0]
-                title = session_title(task)
-                head = name if title == service_info(key)[0] else title
-                color = colors['warning'] if task.get('status') == 'waiting' else colors['muted']
-                minutes, seconds = divmod(task.get('elapsed', 0), 60)
-                elapsed = f'{minutes}분 {seconds:02d}초' if minutes else f'{seconds}초'
-                if minutes >= 60:
-                    elapsed = f'{minutes // 60}시간 {minutes % 60}분'
-                elapsed = ('감지 후 ' if task.get('estimated') else '') + elapsed
-
-                def line(text, style, index=index):
-                    return (f'<br><a href="{index}" style="{style} text-decoration:none;">'
-                            f'{escape(metrics.elidedText(text, Qt.ElideRight, 176))}</a>')
-                lines = line(status if head == name else f'{name} · {status}', f'color:{color}; font-size:10px;')
-                done, total = todo_progress(task)
-                current = task.get('current_task')
-                if current or total:
-                    lines += line(f'▸ {current or "할 일"}' + (f' · {done}/{total}' if total else ''),
-                                  f'color:{colors["text"]}; font-size:10px;')
-                helpers = [agent for agent in task.get('subagents') or () if isinstance(agent, dict)]
-                show_models = self.owner.settings.value("pet/show_models", True, type=bool)
-                if helpers and show_models:
-                    groups = {}
-                    for agent in helpers:
-                        text = " ".join(str(v) for v in (agent.get('model') or agent.get('type') or 'agent', agent.get('effort')) if v)
-                        groups[text] = groups.get(text, 0) + 1
-                    lines += line(f'서브에이전트 {len(helpers)} · ' + ', '.join(
-                        text + (f' ×{count}' if count > 1 else '') for text, count in groups.items()),
-                        f'color:{colors["accent"]}; font-size:10px;')
-                models = model_text(task) if show_models else ''
-                lines += line(f'{elapsed} 경과' + (f' · {models}' if models else ''),
-                              f'color:{colors["muted"]}; font-size:9px;')
-                image = f'<a href="{index}"><img src="{asset.as_uri()}" width="20" height="20"></a>' if asset.exists() else ''
-                rows.append(f'<tr><td width="27" valign="top">{image}</td>'
-                            f'<td><a href="{index}" style="color:{colors["text"]}; text-decoration:none;">'
-                            f'<b>{escape(metrics.elidedText(head, Qt.ElideRight, 170))}</b></a>{lines}</td></tr>')
-            if len(self.owner.agent_activity) > 4:
-                rows.append(f'<tr><td colspan="2"><a href="more" style="color:{colors["accent"]};">전체 작업 보기</a></td></tr>')
-            self.bubble.present(self, '<qt><table width="100%" cellspacing="4" cellpadding="0">' + ''.join(rows) + '</table></qt>')
+            self.bubble.present(self, list(self.owner.agent_activity))
         else:
             self.bubble.hide()
 
@@ -1240,8 +1474,17 @@ class ComputerPet(CircleButton):
         show_models = menu.addAction("말풍선에 모델·추론강도 표시")
         show_models.setCheckable(True)
         show_models.setChecked(self.owner.settings.value("pet/show_models", True, type=bool))
+        fade = menu.addMenu("말풍선 투명도")
+        opacities = {}
+        for value in (100, 90, 80, 70, 60, 50):
+            choice = fade.addAction(f"{value}%" + (" · 불투명" if value == 100 else ""))
+            choice.setCheckable(True)
+            choice.setChecked(value == self.owner.bubble_opacity)
+            opacities[choice] = value
         chosen = menu.exec(event.globalPos())
-        if chosen == show_models:
+        if chosen in opacities:
+            self.owner.set_bubble_opacity(opacities[chosen])
+        elif chosen == show_models:
             self.owner.settings.setValue("pet/show_models", show_models.isChecked())
             self.show_activity()
         elif chosen == action:
@@ -1821,6 +2064,16 @@ class Widget(QWidget):
         except (TypeError, ValueError):
             transparency = 0
         self.set_transparency(transparency)
+        self.bubble_opacity_text = label("")
+        opacity_layout.addWidget(self.bubble_opacity_text)
+        self.bubble_opacity_slider = QSlider(Qt.Horizontal)
+        self.bubble_opacity_slider.setRange(30, 100)
+        self.bubble_opacity_slider.setSingleStep(5)
+        self.bubble_opacity_slider.setAccessibleName("말풍선 투명도")
+        self.bubble_opacity_slider.setToolTip("펫 말풍선 배경: 100%는 불투명, 30%는 가장 투명 (글자는 그대로)")
+        opacity_layout.addWidget(self.bubble_opacity_slider)
+        self.bubble_opacity_slider.valueChanged.connect(self.set_bubble_opacity)
+        self.set_bubble_opacity(self.settings.value("pet/bubble_opacity", 100))
         self.menu.addSeparator()
         plan_action = self.menu.addAction("Antigravity 플랜 직접 설정…")
         plan_action.triggered.connect(self.edit_antigravity_plan)
@@ -2098,23 +2351,18 @@ class Widget(QWidget):
             self.restore_button.update()
         self.restore_button.show_activity()
 
-    def open_activity(self, link):
+    def open_activity(self, task_id=None):
+        """Focus the window of the session with this id, looked up now since the list may have changed;
+        None asks which session first."""
         tasks = list(self.agent_activity)
-        if link == 'more':
+        if task_id is None:
             menu = QMenu(self)
-            choices = {menu.addAction(service_info(t['agent'])[0] + ' · ' + t['label']): i for i, t in enumerate(tasks)}
-            action = menu.exec(self.restore_button.bubble.pos())
-            if action not in choices:
-                return
-            index = choices[action]
+            choices = {menu.addAction(service_info(t['agent'])[0] + ' · ' + t['label']): t for t in tasks}
+            task = choices.get(menu.exec(self.restore_button.bubble.pos()))
         else:
-            try:
-                index = int(link)
-            except ValueError:
-                return
-        if not 0 <= index < len(tasks):
+            task = next((t for t in tasks if t.get('id') == task_id), None)
+        if task is None:
             return
-        task = tasks[index]
         windows = None
         try:
             windows = XWindows()
@@ -2406,6 +2654,7 @@ class Widget(QWidget):
 
     def set_reduced_motion(self, enabled):
         self.restore_button.sync_animation()
+        self.restore_button.bubble.sync_pulse()
         if not self.smoke:
             self.settings.setValue("reduce_motion", enabled)
         if enabled:
@@ -2627,6 +2876,21 @@ class Widget(QWidget):
         self.setWindowOpacity(1 - value / 100)
         if not self.smoke:
             self.settings.setValue("transparency", value)
+
+    def set_bubble_opacity(self, value):
+        """Background opacity of the pet bubbles in percent (30-100); text stays opaque."""
+        try:
+            value = max(30, min(100, int(value)))
+        except (TypeError, ValueError):
+            value = 100
+        self.bubble_opacity = value
+        self.bubble_opacity_slider.blockSignals(True)
+        self.bubble_opacity_slider.setValue(value)
+        self.bubble_opacity_slider.blockSignals(False)
+        self.bubble_opacity_text.setText(f"말풍선 투명도 · 배경 {value}%" + (" 불투명" if value == 100 else ""))
+        if not self.smoke:
+            self.settings.setValue("pet/bubble_opacity", value)
+        self.restore_button.bubble.update()
 
     def billing_record(self, key):
         try:

@@ -17,6 +17,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QMenu, QProgressBar
 
 from widget import THEMES, Card, Widget, activate_existing, listen_for_activation, risk_level, time_left
+from accounts import logo_asset
 from pixel_pet import (DURATIONS, FIDGETS, GLANCE_L, GLANCE_R, HOP, HOVER_R, HOVER, WORK_BREAKS, WORK_LEAVE,
                        animation_row, display_row)
 
@@ -687,22 +688,32 @@ class WidgetTests(unittest.TestCase):
                      for key, label in [('codex', '파일 수정 중'), ('antigravity', '<회의>'), ('copilot', '승인·입력 대기'), ('claude', '명령 실행 중')]]
             self.window.received_activity(tasks)
             self.assertTrue(pet.bubble.isVisible())
-            self.assertEqual(pet.bubble.text.text().count('<img '), 4)
-            self.assertIn('claude-white.svg', pet.bubble.text.text())
-            self.assertIn('&lt;회의&gt;', pet.bubble.text.text())
+            rows = pet.bubble.rows
+            self.assertEqual([row['kind'] for row in rows], ['codex', 'antigravity', 'copilot', 'claude'])
+            self.assertTrue(all(logo_asset(row['kind'], True).exists() for row in rows))
+            self.assertEqual(logo_asset('claude', True).name, 'claude-white.svg')
+            # Painted as plain text: markup in a label is shown, never interpreted.
+            self.assertEqual(rows[1]['current'], '<회의>')
+            self.assertIn('<회의>', pet.bubble.accessibleDescription())
             self.assertTrue(pet.bubble.waiting)
-            self.assertIn('경과', pet.bubble.text.text())
+            self.assertEqual(rows[2]['pill'], '승인 대기')
+            self.assertTrue(pet.bubble.pulse_timer.isActive())
+            self.assertIn('경과', rows[0]['elapsed'])
+            self.assertFalse(pet.bubble.text.isVisible())
             with patch('widget.XWindows') as windows:
                 windows.return_value.candidates.return_value = [(123, 'Terminator')]
-                pet.bubble.text.linkActivated.emit('1')
+                QTest.mouseClick(pet.bubble, Qt.LeftButton, pos=rows[1]['rect'].center().toPoint())
                 windows.return_value.candidates.assert_called_once_with('antigravity', '/tmp/test')
                 windows.return_value.activate.assert_called_once_with(123)
                 windows.return_value.close.assert_called_once()
             with patch('widget.XWindows') as windows:
                 windows.return_value.candidates.return_value = [(456, 'Claude terminal')]
-                pet.bubble.text.linkActivated.emit('3')
+                QTest.mouseClick(pet.bubble, Qt.LeftButton, pos=rows[3]['rect'].center().toPoint())
                 windows.return_value.candidates.assert_called_once_with('claude', '/tmp/test')
                 windows.return_value.activate.assert_called_once_with(456)
+            self.window.reduce_motion.setChecked(True)
+            self.assertFalse(pet.bubble.pulse_timer.isActive())
+            self.window.reduce_motion.setChecked(False)
             for theme in ('light', 'dark'):
                 self.window.set_theme(theme)
                 pet.bubble.grab().save('/tmp/agent-bubble-' + theme + '.png')
@@ -720,15 +731,87 @@ class WidgetTests(unittest.TestCase):
                     effort='medium', subagents=[sub, dict(sub, type='reviewer')])
         with patch.object(pet, 'underMouse', return_value=False):
             self.window.received_activity([task])
-            text = pet.bubble.text.text()
-            self.assertIn('서브에이전트 2 · opus 5.5 xhigh ×2', text)
-            self.assertIn('opus 5.5 · medium', text)
+            row = pet.bubble.rows[0]
+            self.assertEqual(row['pill'], '서브 2개')
+            self.assertEqual(row['model'], 'opus 5.5 · medium')
+            self.assertEqual(row['chips'], ['implementer-hard · opus 5.5 xhigh', 'reviewer · opus 5.5 xhigh'])
+            self.assertFalse(pet.bubble.waiting)
+            self.assertFalse(pet.bubble.pulse_timer.isActive())
+            many = dict(task, subagents=[sub, sub, dict(sub, type='a'), dict(sub, type='b'), dict(sub, type='c'), dict(sub, type='c')])
+            self.window.received_activity([many])
+            self.assertEqual(pet.bubble.rows[0]['chips'], ['implementer-hard · opus 5.5 xhigh ×2', 'a · opus 5.5 xhigh',
+                                                           'b · opus 5.5 xhigh', '+2'])
             self.window.settings.setValue("pet/show_models", False)
             pet.show_activity()
-            text = pet.bubble.text.text()
+            text = pet.bubble.accessibleDescription()
+            self.assertEqual(pet.bubble.rows[0]['chips'], [])
             self.assertNotIn('xhigh', text)
             self.assertNotIn('medium', text)
             self.window.settings.setValue("pet/show_models", True)
+
+    def test_bubble_click_finds_task_by_id_after_list_changes(self):
+        self.window.toggle_collapsed()
+        pet = self.window.restore_button
+        tasks = [dict(id=key, agent='claude', label='작업 중', status='running', started=1, updated=2, target='/tmp/' + key)
+                 for key in ('a', 'b')]
+        with patch.object(pet, 'underMouse', return_value=False):
+            self.window.received_activity(tasks)
+        first = pet.bubble.rows[0]['rect'].center().toPoint()
+        # The list reorders before the click lands; the painted row still means session "a".
+        self.window.agent_activity = list(reversed(self.window.agent_activity))
+        with patch('widget.XWindows') as windows:
+            windows.return_value.candidates.return_value = [(7, 'a')]
+            QTest.mouseClick(pet.bubble, Qt.LeftButton, pos=first)
+            windows.return_value.candidates.assert_called_once_with('claude', '/tmp/a')
+        self.window.agent_activity = [tasks[1]]
+        with patch('widget.XWindows') as windows:
+            QTest.mouseClick(pet.bubble, Qt.LeftButton, pos=first)
+            windows.assert_not_called()
+        five = [dict(tasks[0], id=str(i)) for i in range(5)]
+        with patch.object(pet, 'underMouse', return_value=False):
+            self.window.received_activity(five)
+        self.assertEqual(len(pet.bubble.rows), 4)
+        self.assertIsNotNone(pet.bubble.footer)
+        with patch.object(self.window, 'open_activity') as open_activity:
+            QTest.mouseClick(pet.bubble, Qt.LeftButton, pos=pet.bubble.footer.center().toPoint())
+            open_activity.assert_called_once_with(None)
+
+    def test_bubble_opacity_setting_persists_and_fades_background_only(self):
+        from PySide6.QtGui import QAction
+        self.assertEqual(self.window.bubble_opacity, 100)
+        self.window.toggle_collapsed()
+        pet = self.window.restore_button
+        with patch.object(pet, 'underMouse', return_value=False):
+            self.window.received_activity([dict(id='x', agent='codex', label='작업 중', status='running',
+                                                started=1, updated=2, target='/tmp/x')])
+        bubble = pet.bubble
+        spot = QPoint(180, 30)  # plain body between the header title and its counts
+        self.assertEqual(bubble.grab().toImage().pixelColor(spot).alpha(), 255)
+        self.window.bubble_opacity_slider.setValue(60)
+        self.assertEqual(self.settings.value("pet/bubble_opacity"), 60)
+        self.assertAlmostEqual(bubble.grab().toImage().pixelColor(spot).alpha(), 153, delta=3)
+        restored = Widget()
+        self.assertEqual(restored.bubble_opacity, 60)
+        self.assertEqual(restored.bubble_opacity_slider.value(), 60)
+        restored.close()
+        restored.deleteLater()
+        for value, expected in ((10, 30), (200, 100), ("bad", 100)):
+            self.window.set_bubble_opacity(value)
+            self.assertEqual(self.window.bubble_opacity, expected)
+        seen = []
+
+        class Menu(QMenu):
+            def exec(self, *args):
+                fade = [a for a in self.findChildren(QAction) if "%" in a.text()]
+                seen.extend((a.text(), a.isChecked()) for a in fade)
+                return next(a for a in fade if a.text() == "70%")
+        with patch("widget.QMenu", Menu):
+            pet.contextMenuEvent(type("Event", (), {"globalPos": lambda self: QPoint(0, 0)})())
+        self.assertEqual(len(seen), 6)
+        self.assertIn(("100% · 불투명", True), seen)
+        self.assertEqual(self.window.bubble_opacity, 70)
+        self.assertEqual(self.window.bubble_opacity_slider.value(), 70)
+        self.assertEqual(self.settings.value("pet/bubble_opacity"), 70)
 
     def test_unknown_agents_never_raise_and_opencode_is_read(self):
         from widget import ActivityFetch, service_info, session_title
@@ -758,16 +841,16 @@ class WidgetTests(unittest.TestCase):
                  dict(id="o", agent="opencode", label="작업 중", status="waiting", started=now - 30, updated=now, target="/tmp/o")]
         with patch.object(pet, "underMouse", return_value=False), patch.object(Widget, "send_notification") as notify:
             self.window.received_activity(tasks)
-            self.assertIn("gemini", pet.bubble.text.text())
-            self.assertIn("opencode-white.svg", pet.bubble.text.text())
-            self.assertIn("서브에이전트 1 · agent", pet.bubble.text.text())
+            self.assertEqual([row['title'] for row in pet.bubble.rows], ["gemini", "opencode"])
+            self.assertEqual(logo_asset("opencode", True).name, "opencode-white.svg")
+            self.assertEqual(pet.bubble.rows[0]['chips'], ["agent"])
             self.window.received_activity([dict(task, status="done") for task in tasks])
         self.assertEqual([call.args[0] for call in notify.call_args_list],
                          ["gemini · 작업 완료", "opencode · 작업 완료"])
         self.window.agent_activity = tasks
         with patch("widget.QMenu") as menu:
             menu.return_value.exec.return_value = None
-            self.window.open_activity("more")
+            self.window.open_activity(None)
         self.assertIn("gemini · 작업 중", [call.args[0] for call in menu.return_value.addAction.call_args_list])
 
     def test_neon_turn_on_flicker_respects_reduced_motion(self):
@@ -848,10 +931,11 @@ class WidgetTests(unittest.TestCase):
         self.window.move(50, 50)
         self.window.toggle_collapsed()
         pet = self.window.restore_button
-        pet.bubble.present(pet, '<qt>작업 중</qt>')
+        task = dict(id='t', agent='codex', status='running', label='작업 중', elapsed=5)
+        pet.bubble.present(pet, [task])
         position = pet.bubble.pos()
         side = pet.bubble.on_right
-        pet.bubble.present(pet, '<qt>' + '<br>'.join(['작업 중'] * 6) + '</qt>')
+        pet.bubble.present(pet, [dict(task, id=str(i), todos=[{'text': 'x'}]) for i in range(6)])
         self.assertEqual(pet.bubble.pos(), position)
         pet.bubble.present(pet)
         self.assertEqual(pet.bubble.pos(), position)
