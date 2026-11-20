@@ -886,6 +886,24 @@ class WidgetTests(unittest.TestCase):
             self.window.received_activity([waiting])
             notify.assert_not_called()
 
+    def test_done_and_failed_notifications_respect_setting(self):
+        task = dict(id='d', agent='codex', status='running', label='작업 중', started=1, updated=2, target='x')
+        self.assertTrue(self.window.done_action.isChecked())
+        self.assertIn(self.window.done_action, self.window.alerts.actions())
+        self.window.done_action.setChecked(False)
+        self.assertFalse(self.settings.value("notify/agents/done", True, type=bool))
+        with patch.object(self.window, 'send_notification') as notify, \
+             patch.object(self.window.restore_button, 'set_status') as status:
+            for final in ('done', 'failed'):
+                self.window.received_activity([dict(task, id=final)])
+                self.window.received_activity([dict(task, id=final, status=final, updated=3)])
+            notify.assert_not_called()
+            self.assertEqual([c.args[0] for c in status.call_args_list], [8, 5])
+            self.window.done_action.setChecked(True)
+            self.window.received_activity([dict(task, id='again')])
+            self.window.received_activity([dict(task, id='again', status='failed', updated=3)])
+            notify.assert_called_once_with("GPT / Codex · 작업 실패", "작업 중")
+
     def test_smoke_render_does_not_store_notification_state(self):
         before = self.settings.value("notification_state")
         smoke = Widget(smoke=True)
