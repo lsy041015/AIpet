@@ -1,12 +1,26 @@
 """Persistent notification deduplication; delivery is supplied by the desktop widget."""
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 
 
+def same_window(previous, current):
+    # The Claude CLI rounds one reset differently between calls (13:59 vs 14:00).
+    if previous == current:
+        return True
+    try:
+        # A fixed leap year accepts 02/29; the wrap covers 12/31 vs 01/01.
+        first, second = (datetime.strptime("2000/" + text.partition(" 초기화")[0], "%Y/%m/%d %H:%M")
+                         for text in (previous, current))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    gap = abs(first - second)
+    return min(gap, timedelta(days=366) - gap) <= timedelta(minutes=10)
+
+
 class Notifications:
-    def __init__(self, settings, send):
-        self.settings, self.send = settings, send
+    def __init__(self, settings, send, persist=True):
+        self.settings, self.send, self.persist = settings, send, persist
         try:
             self.state = json.loads(settings.value("notification_state", "{}"))
             if not isinstance(self.state, dict):
@@ -15,7 +29,8 @@ class Notifications:
             self.state = {}
 
     def save(self):
-        self.settings.setValue("notification_state", json.dumps(self.state))
+        if self.persist:
+            self.settings.setValue("notification_state", json.dumps(self.state))
 
     def quota(self, service, title, rows):
         for row in rows:
@@ -27,7 +42,7 @@ class Notifications:
             previous = self.state.get(key, {})
             if not isinstance(previous, dict):
                 previous = {}
-            sent = previous.get("sent", []) if previous.get("reset") == reset else []
+            sent = previous.get("sent", []) if same_window(previous.get("reset"), reset) else []
             sent = [t for t in sent if remaining <= t]
             due = [t for t in (20, 10) if remaining <= t and t not in sent
                    and self.settings.value(f"notify/{service}/{t}", True, type=bool)]

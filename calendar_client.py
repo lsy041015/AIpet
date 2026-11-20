@@ -26,9 +26,10 @@ def day_bounds(day):
                  for d in (day, day + timedelta(days=1)))
 
 
-def event_body(title, start, end, all_day=False):
+def event_body(title, start, end, all_day=False, limit=300, required=True):
+    # Edits pass a larger limit / required=False to keep an existing long or empty title.
     title = title.strip()
-    if not title or len(title) > 300:
+    if (required and not title) or len(title) > limit:
         raise CalendarError("제목을 1–300자로 입력하세요.")
     if end <= start:
         raise CalendarError("종료는 시작보다 늦어야 합니다.")
@@ -121,6 +122,15 @@ class CalendarClient:
         if response.status_code == 409 and method == "POST":
             # A retry uses the same event ID even if the previous response was lost.
             return self.request("GET", EVENTS_URL + "/" + kwargs["json"]["id"])
+        if response.status_code == 403:
+            try:
+                reasons = {item.get("reason") for item in response.json()["error"]["errors"]}
+            except (ValueError, KeyError, TypeError, AttributeError):
+                reasons = set()
+            if reasons & {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"}:
+                raise CalendarError("Google Calendar 요청 한도 초과. 잠시 후 다시 시도하세요.")
+            if "forbiddenForNonOrganizer" in reasons:
+                raise CalendarError("주최자만 수정할 수 있는 일정입니다.")
         if response.status_code in (401, 403):
             raise CalendarError("Calendar API 활성화·테스트 사용자·일정 권한 확인 후 다시 연결하세요.")
         if response.status_code == 412:

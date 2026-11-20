@@ -2,7 +2,7 @@
 Type=Application
 Name=check AI
 Comment=Codex, Antigravity, GitHub Copilot 남은 사용한도
-Exec=/usr/bin/env python3 /home/wego/ai-quota-widget/widget.py
+Exec=/home/wego/ai-quota-widget/.venv/bin/python -E /home/wego/ai-quota-widget/widget.py
 Path=/home/wego/ai-quota-widget
 Icon=utilities-system-monitor
 Terminal=false
