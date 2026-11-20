@@ -30,7 +30,10 @@ What it does:
   ("meeting tomorrow 3 pm"). The parser is a small regex grammar, not an LLM, and always shows a preview before saving.
 - **Todos and notifications** — a local todo list; alerts 10 minutes before an event and at 20% / 10% quota left, never twice.
 - **The pet** — folds into an always-on-top Claude pixel mascot with 9 animations: idle, walking, waving, jumping, failing,
-  looking around (waiting), typing on a laptop (working) and a happy result hop. Neon or light theme, transparency and reduced motion.
+  looking around (waiting), typing on a laptop (working) and a happy result hop. At rest it mostly sits still, blinks and
+  glances, and every 15-60 s does a random fidget (look around, hop, stretch, arm wiggle, stroll, sit down...); left alone
+  long enough it dozes off until you hover it. Hovered, its eyes follow the cursor; while agents work it types with the
+  odd look-up or stretch. Neon or light theme, transparency and reduced motion.
 
 Hover over the folded pet for your next event, the last quota check and running sessions. Right-click for an animation preview
 and quick-add. `widget.py --desktop` opens a wide app window with a sidebar.
