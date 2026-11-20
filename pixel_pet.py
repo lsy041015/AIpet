@@ -31,10 +31,12 @@ WAVE_BODY = (WAVE_TOP, "...o##ooodo..", ".oooooooddo..", ".oooooooooo..", WAVE_T
 WAVE_STUB = ".........o..."
 LOOK = ((1, EYES), (1, "..o#dooo#d.."), (0, "..o#dooo#d.."), (0, "..#dooo#do.."), (2, "oo#dooo#dooo"),
         (2, "ooo#oooo#ooo"), (1, "..o#dooo#d.."), (1, EYES))  # (body row, eye row) each held 3 frames
-WORK_TOP, WORK_EYE = "...oooooooooo....", "...ooo#ooo#oo...."
-WORK_BODY = (WORK_TOP, WORK_EYE, WORK_EYE, ".oooooooooooo...d", ".oooooooooooo..dd",
-             "...oooooooooo.dd.")  # sitting 3/4 view, laptop lid rising front-right
-TYPE_DOWN, TYPE_UP, TOUCH = "..oooo.oooooodd..", "..oooo.oooo.ddd..", "...ooooooooooodd."
+# Sitting 3/4 view facing right (rows start at grid column 0): 8x5 body, back arm, laptop base + diagonal lid.
+WORK_HEAD = ("..oooooooo......", "..oo#dooo#....d.")
+WORK_BASE = "..oooooooodddd.."
+TYPING = ((".ooooooooo...d..", ".oooooooooood..."),   # hand rests on the laptop base
+          (".ooooooooooo.d..", ".ooooooooo..d..."),   # hand lifts one cell
+          (".ooooooooo...d..", ".oooooooooo.d..."))   # hand shifts one cell left
 
 
 def _look(row, line, bang):
@@ -55,7 +57,7 @@ POSES = (
     [F(BASE_POSE), F((TOP, FLAT) + BASE_POSE[2:], dim=True), F((TOP, FLAT, ARM, ARM, TOP, LEG), dim=True),
      F((TOP, FLAT, ARM, ARM), dim=True)],
     [_look(row, line, i % 2 == 0) for i, (row, line) in enumerate(LOOK)],
-    [F(WORK_BODY + (TYPE_DOWN,), x=-1), F(WORK_BODY[:-1] + (TOUCH, TYPE_UP), x=-1), F(WORK_BODY + (TYPE_UP,), x=-1)],
+    [F(WORK_HEAD + hand + (WORK_BASE,), x=0) for hand in TYPING],
     [F(BASE_POSE), F(SQUASH), F(CHEER + (LEG,), lift=2), F(CHEER + (LEG,), lift=3), F(CHEER + (LEG,), lift=2),
      F((TOP, "ooo##oo##ooo", ARM, TOP, LEG, LEG)), F(CHEER + (LEG, LEG)), F(BASE_POSE)],
 )
