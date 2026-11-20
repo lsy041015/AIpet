@@ -17,7 +17,8 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QMenu, QProgressBar
 
 from widget import THEMES, Card, Widget, activate_existing, listen_for_activation, risk_level, time_left
-from pixel_pet import DURATIONS, animation_row, display_row
+from pixel_pet import (DURATIONS, FIDGETS, GLANCE_L, GLANCE_R, HOP, HOVER_R, HOVER, WORK_BREAKS, WORK_LEAVE,
+                       animation_row, display_row)
 
 
 ROWS = {
@@ -558,17 +559,24 @@ class WidgetTests(unittest.TestCase):
         self.window.toggle_collapsed()
         self.window.reduce_motion.setChecked(False)
         pet = self.window.restore_button
+        pet.life.rng.seed(3)
         with patch.object(pet, "underMouse", return_value=False):
             for row in (3, 5, 6, 7, 8):
                 pet.set_status(row)
+                for _ in range(10):  # transition rows (standing up, opening the laptop) lead into the state
+                    if display_row(pet) == row:
+                        break
+                    pet.tick()
                 for _ in range(3 * len(DURATIONS[row])):
                     self.assertEqual(display_row(pet), row)
                     pet.tick()
-                self.assertEqual(display_row(pet), 0)
-                self.assertEqual(pet.idle.interval(), DURATIONS[0][0] * 12)
-                for _ in range(12):
+                for _ in range(10):  # then back to the base pose: standing up again, closing the laptop
+                    if display_row(pet) in (0, GLANCE_L, GLANCE_R):
+                        break
                     pet.tick()
-                    self.assertEqual(display_row(pet), 0)
+                self.assertIn(display_row(pet), (0, GLANCE_L, GLANCE_R))
+                self.assertEqual(pet.frame, 0)
+                self.assertTrue(2500 * .88 <= pet.idle.interval() <= 7000 * 1.12)  # a still hold, not a fast loop
             with patch.object(pet, "underMouse", return_value=True):
                 self.assertEqual(animation_row(pet), 4)
             self.window.reduce_motion.setChecked(True)
@@ -577,6 +585,44 @@ class WidgetTests(unittest.TestCase):
                 pet.tick()
             self.assertEqual(display_row(pet), 5)
             self.assertEqual(pet.frame, 0)
+
+    def test_pet_works_with_breaks_follows_cursor_and_sleeps_when_hidden(self):
+        from PySide6.QtGui import QMouseEvent
+        self.window.toggle_collapsed()
+        pet = self.window.restore_button
+        pet.life.rng.seed(5)
+        self.assertTrue(pet.idle.isSingleShot())
+        with patch.object(pet, "underMouse", return_value=False), patch.object(self.window.calendar, "job", object()):
+            pet.sync_animation()
+            seen = set()
+            while pet.life.clock < 120_000:
+                pet.tick()
+                seen.add(display_row(pet))
+            self.assertIn(7, seen)  # typing keeps going while work runs, with breaks but no idle fidgets
+            self.assertTrue(seen & set(WORK_BREAKS))
+            self.assertFalse(seen & set(FIDGETS))
+        with patch.object(pet, "underMouse", return_value=True):
+            pet.sync_animation()
+            rows = []
+            for _ in range(30):
+                rows.append(display_row(pet))
+                pet.tick()
+            self.assertEqual(rows[0], WORK_LEAVE)  # closes the laptop first
+            self.assertIn(HOP, rows)  # one small happy hop
+            self.assertEqual(rows[-1], HOVER[0])
+            pet.mouseMoveEvent(QMouseEvent(QEvent.MouseMove, QPointF(85, 40), pet.mapToGlobal(QPointF(85, 40)),
+                                           Qt.NoButton, Qt.NoButton, Qt.NoModifier))
+            self.assertEqual(display_row(pet), HOVER_R)  # eyes turn toward the cursor
+        self.assertTrue(pet.idle.isActive())
+        pet.hide()
+        self.assertFalse(pet.idle.isActive())
+        pet.show()
+        self.window.reduce_motion.setChecked(True)
+        self.assertFalse(pet.idle.isActive())
+        image = pet.grab().toImage()
+        for _ in range(5):
+            pet.tick()
+        self.assertEqual(image, pet.grab().toImage())
 
     def test_pet_mode_slows_hidden_clock_and_reduced_motion_stops_frames(self):
         self.window.toggle_collapsed()
