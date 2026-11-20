@@ -13,7 +13,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
                                QDialogButtonBox, QMessageBox, QCheckBox)
 
-from providers import KINDS, QuotaError, claude_max_dir, default_login, environment, executable, logged_in
+from providers import KINDS, QuotaError, active_login, claude_max_dir, default_login, environment, executable, logged_in
 
 
 PENDING = ".check-ai-pending"
@@ -174,6 +174,9 @@ class Login(QObject):
         self.account = {"id": new_id(), "kind": kind, "label": "", "profile_dir": "",
                         "use_default": KINDS[kind]["env"] is None}
         self.ok = False
+        # Agents with one PC-wide login (agy) are already logged in; wait for the account to change.
+        self.switch = bool(KINDS[kind].get("switch"))
+        self.before = active_login(kind) if self.switch else None
         self.check = None
         self.deadline = 0
         self.timer = QTimer(self)
@@ -216,7 +219,7 @@ class Login(QObject):
         self.check.start()
 
     def poll(self):
-        self.ok = logged_in(self.account)
+        self.ok = logged_in(self.account) and (not self.switch or active_login(self.account["kind"]) != self.before)
 
     def done(self, ok):
         self.timer.stop()
@@ -317,8 +320,15 @@ class AddAccountDialog(QDialog):
             return
         info = KINDS[kind]
         default_taken = any(a["kind"] == kind and a["use_default"] for a in self.accounts)
+        self.login_button.setText("새 계정 로그인")
         if not info["login"]:
             can_login, text = False, "이 에이전트는 별도 로그인을 지원하지 않습니다. 에이전트에서 로그인한 뒤 기존 로그인을 사용하세요."
+        elif info.get("switch"):
+            can_login = True
+            if default_taken:
+                self.login_button.setText(info["name"] + " 계정 바꾸기")
+            text = (f"터미널에서 {info['binary']}가 열리면 /login을 입력하세요. 계정을 분리할 수 없어 "
+                    "이 PC의 " + info["name"] + " 계정이 바뀝니다(추가가 아님).")
         elif info["env"] is None:
             can_login = not default_taken
             text = ("이 PC 기본 로그인이 이미 추가되어 있습니다." if default_taken else

@@ -82,7 +82,7 @@ class RegistryTests(Isolated):
             self.assertEqual(os.environ["CLAUDE_CONFIG_DIR"], "/other")
         # Without a profile variable only the default login exists.
         self.assertIsNone(providers.KINDS["antigravity"]["env"])
-        self.assertIsNone(providers.KINDS["antigravity"]["login"])
+        self.assertEqual(providers.KINDS["antigravity"]["login"], ["agy"])
 
     def test_fetchers_run_with_the_account_environment(self):
         account = record("copilot", "a", str(self.root / "gh-a"))
@@ -231,6 +231,38 @@ class LoginTests(Isolated):
             accounts.terminal_command("T", ["claude"])
 
 
+class AgySwitchTests(Isolated):
+    def accounts_file(self, active):
+        path = self.home / ".gemini/google_accounts.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"active": active, "old": []}))
+
+    def test_agy_login_waits_for_the_active_account_to_change(self):
+        self.accounts_file("first@example.test")
+        login = accounts.Login("antigravity")
+        self.assertTrue(login.account["use_default"])
+        self.assertEqual(providers.KINDS["antigravity"]["login"], ["agy"])
+        login.poll()
+        self.assertFalse(login.ok, "an existing login is not a new sign-in")
+        self.accounts_file("second@example.test")
+        login.poll()
+        self.assertTrue(login.ok)
+        self.accounts_file("")
+        self.assertFalse(providers.logged_in(record("antigravity")))
+
+    def test_dialog_offers_switch_when_agy_is_already_linked(self):
+        with patch("accounts.installed", return_value=True):
+            dialog = accounts.AddAccountDialog(None, [record("antigravity")])
+        self.addCleanup(dialog.deleteLater)
+        items = {dialog.kinds.item(i).data(Qt.UserRole): i for i in range(dialog.kinds.count())}
+        dialog.kinds.setCurrentRow(items["antigravity"])
+        self.assertTrue(dialog.login_button.isEnabled())
+        self.assertEqual(dialog.login_button.text(), "Antigravity 계정 바꾸기")
+        self.assertIn("추가가 아님", dialog.login_hint.text())
+        dialog.kinds.setCurrentRow(items["claude"])
+        self.assertEqual(dialog.login_button.text(), "새 계정 로그인")
+
+
 class BillingInfoTests(Isolated):
     def test_codex_plan_and_renewal_come_from_unverified_jwt_claims(self):
         home = self.root / "codex"
@@ -290,6 +322,17 @@ class WidgetAccountTests(Isolated):
         self.assertFalse(window.empty_state.isHidden())
         self.assertIsNone(self.settings.value("accounts"))
         self.assertIn("등록된 에이전트 없음", window.pet_summary())
+
+    def test_switched_agy_login_refreshes_the_existing_card(self):
+        self.settings.setValue("accounts", json.dumps([record("antigravity", "agy1")]))
+        window = self.window()
+        login = MagicMock()
+        window.logins.append(login)
+        with patch.object(Widget, "account_added") as added:
+            window.login_finished(login, {"id": "new1", "kind": "antigravity", "label": "",
+                                          "profile_dir": "", "use_default": True})
+        added.assert_called_once_with(window.accounts[0])
+        self.assertEqual([a["id"] for a in accounts.load(self.settings)], ["agy1"])
 
     def test_link_login_and_remove_update_cards(self):
         (self.home / ".claude").mkdir()
@@ -419,7 +462,9 @@ class DialogTests(Isolated):
         self.assertTrue(dialog.login_button.isEnabled())
         self.assertEqual([b.text() for b in dialog.link_buttons], ["이 PC 기존 로그인 사용"])
         dialog.kinds.setCurrentItem(items["antigravity"])
-        self.assertFalse(dialog.login_button.isEnabled())
+        self.assertTrue(dialog.login_button.isEnabled())
+        self.assertEqual(dialog.login_button.text(), "새 계정 로그인")
+        self.assertIn("/login", dialog.login_hint.text())
         self.assertEqual(dialog.link_buttons, [])
         dialog.kinds.setCurrentItem(items["claude"])
         dialog.link_buttons[0].click()
