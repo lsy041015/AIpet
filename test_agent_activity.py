@@ -473,3 +473,29 @@ class ActivityTests(unittest.TestCase):
             self.assertEqual([(item['status'], item['started']) for item in rows], [('running', timestamp('2026-09-28T00:00:00Z'))])
         self.assertEqual(timestamp('2026-10-02T10:00:28.21802+00:00'), timestamp('2026-10-02T10:00:28.218020+00:00'))
         self.assertEqual(timestamp('2026-10-02T10:00:28.2Z') % 1, timestamp('2026-10-02T10:00:28.200Z') % 1)
+
+    def test_malformed_records_do_not_hide_other_sessions(self):
+        start = {'type': 'user', 'message': {'content': 'start'}}
+        tool = lambda name, data: {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'id': 't', 'name': name, 'input': data}]}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row, = self.claude_rows(root, [start, tool('mcp__ccd_turn__update_plan', {'items': [{'content': 'A'}, {'content': 'B'}]}),
+                                           tool('mcp__ccd_turn__update_plan', {'done': 2})])
+            self.assertEqual([t['status'] for t in row['todos']], ['pending', 'completed'])
+            row, = self.claude_rows(root, [start, tool(None, {})])
+            self.assertEqual(row['label'], '도구 실행 중')
+            sessions = root / '.codex/sessions/2026/11/20'
+            sessions.mkdir(parents=True)
+            (sessions / 'rollout.jsonl').write_text('\n'.join(json.dumps(line) for line in (
+                {'type': 'session_meta', 'payload': {'id': 'abc'}}, {'type': 'event_msg', 'payload': {'type': 'task_started'}},
+                {'type': 'turn_context', 'payload': {'collaboration_mode': 'default', 'model': 'gpt-6'}})) + '\n')
+            rows = read_activity(root, detailed=True)
+            self.assertEqual(next(r for r in rows if r['agent'] == 'codex')['model'], 'gpt-6')
+            # Any other parser failure skips only that file.
+            real = session_state
+            def broken(path, agent):
+                if agent == 'codex':
+                    raise KeyError('boom')
+                return real(path, agent)
+            with patch('agent_activity.session_state', side_effect=broken), patch('sys.stderr'):
+                self.assertEqual([r['agent'] for r in read_activity(root, detailed=True)], ['claude'])

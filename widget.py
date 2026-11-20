@@ -1688,7 +1688,13 @@ class ActivityFetch(QThread):
     result = Signal(list)
 
     def run(self):
-        self.result.emit(read_activity(detailed=True, extra_agents=True))
+        try:
+            activity = read_activity(detailed=True, extra_agents=True)
+        except Exception as error:
+            # Keep the last result on screen; the next poll tries again.
+            print(f"agent activity scan failed: {type(error).__name__}: {error}", file=sys.stderr)
+            return
+        self.result.emit(activity)
 
 
 class Widget(QWidget):
