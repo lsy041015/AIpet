@@ -8,6 +8,8 @@
 
 바탕화면에 사는 작은 도트 마스코트가 AI 한도, 돌아가는 에이전트, 다음 일정을 알려 줘요.
 
+<p align="center"><img src="docs/media/intro.gif" alt="check AI 업데이트 소개 영상" width="720"><br><a href="docs/media/intro.mp4">소개 영상 (MP4)</a></p>
+
 <p align="center"><img src="docs/screenshots/mascot.gif" alt="Claude 도트 마스코트 애니메이션" width="144"></p>
 
 Claude Code, Codex, Antigravity, Copilot을 번갈아 쓰다 보니 한도가 얼마 남았는지, 에이전트가 아직 일하는 중인지, 다음 회의가 언제인지
@@ -30,7 +32,7 @@ Claude Code, Codex, Antigravity, Copilot을 번갈아 쓰다 보니 한도가 �
   노트북 타이핑(작업 중), 결과 확인 9가지 상태 동작을 해요. 쉴 때는 가만히 눈을 깜빡이고 가끔 흘끗 보다가, 15~60초마다
   두리번거리기, 콩 뛰기, 기지개, 팔 흔들기, 산책, 앉기 같은 잔동작을 무작위로 하고, 오래 두면 앉아서 졸아요(마우스를 올리면 깨요).
   마우스를 올리면 커서 쪽을 쳐다보고, 작업 중에도 가끔 고개를 들어 쳐다보거나 기지개를 켜요.
-  네온·라이트 테마, 투명도, 동작 줄이기를 고를 수 있어요.
+  네온·라이트 테마, 위젯·말풍선 투명도, 동작 줄이기를 고를 수 있어요. 에이전트 말풍선은 세션별 카드로 상태, 할 일 진행, 모델·추론강도를 보여 줘요.
 
 접힌 펫에 마우스를 올리면 다음 일정, 마지막 한도 조회 결과, 지금 돌아가는 세션이 말풍선으로 나와요. 우클릭하면 애니메이션
 미리보기와 빠른 일정 입력을 고를 수 있어요. `widget.py --desktop`으로 사이드바가 있는 넓은 앱 화면도 열 수 있어요.
@@ -52,9 +54,9 @@ Claude Code, Codex, Antigravity, Copilot을 번갈아 쓰다 보니 한도가 �
 | **에이전트 세션** | **구독·결제** |
 | ![에이전트](docs/screenshots/agents.png) | ![구독·결제](docs/screenshots/billing.png) |
 
-| 작은 위젯 | 펫 말풍선 | 에이전트 추가 |
+| 작은 위젯 | 에이전트 말풍선 | 에이전트 추가 |
 |---|---|---|
-| <img src="docs/screenshots/compact.png" width="260"> | <img src="docs/screenshots/pet-bubble.png" width="220"> | <img src="docs/screenshots/add-account.png" width="260"> |
+| <img src="docs/screenshots/compact.png" width="260"> | <img src="docs/screenshots/agent-bubble.png" width="220"> | <img src="docs/screenshots/add-account.png" width="260"> |
 
 라이트 테마: [docs/screenshots/light-dashboard.png](docs/screenshots/light-dashboard.png)
 
