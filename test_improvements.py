@@ -184,6 +184,17 @@ class ImprovementsTests(unittest.TestCase):
         self.assertEqual(send.call_count, 5)
 
 
+    def test_unchanged_notification_state_is_not_rewritten(self):
+        settings = Mock(wraps=self.settings)
+        alerts = Notifications(settings, Mock(return_value=True))
+        for _ in range(3):
+            alerts.calendar([self.event(30)], self.now)
+        settings.setValue.assert_not_called()
+        alerts.calendar([self.event()], self.now)
+        alerts.calendar([self.event()], self.now)
+        self.assertEqual(settings.setValue.call_count, 1)
+        self.assertEqual(len(json.loads(self.settings.value("notification_state"))), 1)
+
     def test_quota_alert_ignores_cli_rounding_of_same_reset(self):
         send = Mock(return_value=True)
         alerts = Notifications(self.settings, send)

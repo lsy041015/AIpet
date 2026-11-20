@@ -259,6 +259,31 @@ class WidgetTests(unittest.TestCase):
         self.settings_patch.stop()
         self.directory.cleanup()
 
+    def test_clock_tick_does_not_repaint_cards_and_window_keeps_its_shadow(self):
+        # A live graphics effect on the surface re-blurred and repainted every card on each clock tick.
+        painted = []
+
+        class Spy(QObject):
+            def eventFilter(self, item, event):
+                if event.type() == QEvent.Paint:
+                    painted.append(type(item))
+                return False
+        spy = Spy()
+        self.app.installEventFilter(spy)
+        self.addCleanup(self.app.removeEventFilter, spy)
+        self.app.processEvents()
+        painted.clear()
+        self.window.clock.setText("2000.01.01 00:00:00")
+        self.app.processEvents()
+        self.assertIn(QLabel, painted)
+        self.assertNotIn(Card, painted)
+        surface = self.window.surface.geometry()
+        for theme in ("dark", "light"):
+            self.window.set_theme(theme)
+            image = self.window.grab().toImage()
+            self.assertGreater(image.pixelColor(surface.center().x(), surface.bottom() + 3).alpha(), 0, theme)
+            self.assertEqual(image.pixelColor(1, 1).alpha(), 0, theme)
+
     def test_claude_usage_card_shows_cli_limits(self):
         self.assertIn('claude', self.window.cards)
         card = self.window.cards['claude']
