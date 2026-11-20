@@ -28,6 +28,8 @@ class PixelPetTest(unittest.TestCase):
                 for frame in poses:  # every cell stays inside the 16x16 grid
                     for x, y, _ in cells(frame):
                         self.assertTrue(0 <= x < COLS and 0 <= y < COLS, (row, x, y))
+                        if row == 7:  # working pose keeps a 1-cell margin
+                            self.assertTrue(1 <= x < COLS - 1 and 1 <= y < COLS - 1, (row, x, y))
         self.assertEqual(len(DURATIONS[1]), len(DURATIONS[2]))
 
     def test_every_frame_renders_orange_mascot(self):
