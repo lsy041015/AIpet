@@ -1183,7 +1183,7 @@ class Widget(QWidget):
             action.triggered.connect(lambda checked=False, size=QSize(width, height): self.set_feature_size(size))
         menu_button.setMenu(self.menu)
         self.collapse_button = CircleButton(self, compact=True)
-        self.collapse_button.setAccessibleName("미니 컴퓨터 캐릭터로 접기")
+        self.collapse_button.setAccessibleName("마스코트로 접기")
         self.collapse_button.setToolTip("마스코트로 접기 · 항상 위에 표시")
         self.collapse_button.clicked.connect(self.toggle_collapsed)
         title.addWidget(self.collapse_button)
