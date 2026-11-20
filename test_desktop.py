@@ -1,4 +1,5 @@
 """Desktop integration checks; all network and real settings stay mocked."""
+import os
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
@@ -10,6 +11,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from widget import Widget, THEMES
 from desktop import DesktopWindow
+from test_widget import seed_accounts
 
 
 class DesktopTests(unittest.TestCase):
@@ -20,7 +22,9 @@ class DesktopTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.settings = QSettings(str(Path(self.directory.name)/"settings.ini"), QSettings.IniFormat)
+        seed_accounts(self.settings)
         for item in (patch("widget.QSettings", return_value=self.settings),
+                     patch.dict(os.environ, {"XDG_CONFIG_HOME": self.directory.name}),
                      patch.object(Widget, "refresh"), patch.object(Widget, "refresh_activity"),
                      patch("calendar_panel.CalendarPanel.refresh")):
             item.start()

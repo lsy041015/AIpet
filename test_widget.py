@@ -1,4 +1,5 @@
 """Run with QT_QPA_PLATFORM=offscreen. No network or real settings are touched."""
+import json
 import os
 import subprocess
 import sys
@@ -15,7 +16,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QMenu, QProgressBar
 
-from widget import SERVICES, THEMES, Card, Widget, activate_existing, listen_for_activation, risk_level, time_left
+from widget import THEMES, Card, Widget, activate_existing, listen_for_activation, risk_level, time_left
 from pixel_pet import DURATIONS, animation_row, display_row
 
 
@@ -29,6 +30,19 @@ ROWS = {
     "claude": [{"label": "현재 세션", "remaining": 99, "reset": "Sep 28, 1pm (Asia/Seoul) 초기화"},
                {"label": "이번 주 · 전체 모델", "remaining": 67, "reset": "Sep 30, 3pm (Asia/Seoul) 초기화"}],
 }
+
+# Registered accounts named like the former fixed cards; claude_max is a second, isolated Claude login.
+ACCOUNTS = [
+    {"id": "codex", "kind": "codex", "label": "", "profile_dir": "", "use_default": True},
+    {"id": "claude", "kind": "claude", "label": "", "profile_dir": "", "use_default": True},
+    {"id": "claude_max", "kind": "claude", "label": "Claude · Max 5x", "profile_dir": "/nonexistent/max", "use_default": False},
+    {"id": "antigravity", "kind": "antigravity", "label": "", "profile_dir": "", "use_default": True},
+    {"id": "copilot", "kind": "copilot", "label": "", "profile_dir": "", "use_default": True},
+]
+
+
+def seed_accounts(settings, accounts=ACCOUNTS):
+    settings.setValue("accounts", json.dumps(accounts))
 
 
 class LifecycleTests(unittest.TestCase):
@@ -84,7 +98,7 @@ class LifecycleTests(unittest.TestCase):
             sys.exit(0 if state["closed"] and not state["timeout"] and not state["error"] and result == 0 else 1)
         """)
         with tempfile.TemporaryDirectory() as directory:
-            environment = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_RUNTIME_DIR=directory)
+            environment = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_RUNTIME_DIR=directory, XDG_CONFIG_HOME=directory)
             for desktop in (False, True):
                 for pet in (0, 1, 2):
                     with self.subTest(desktop=desktop, pet=pet):
@@ -104,6 +118,7 @@ INSTANCE = textwrap.dedent("""
     role, directory, mode, startup, work, close_on = sys.argv[1:]
     log = lambda *words: print(role, *words, flush=True)
     settings = QSettings(str(Path(directory) / (role + ".ini")), QSettings.IniFormat)
+    settings.setValue("accounts", '[{"id": "codex", "kind": "codex", "label": "", "profile_dir": "", "use_default": true}]')
     original_init, original_bring, original_wait = widget.Widget.__init__, widget.Widget.bring_to_front, widget.Fetch.wait
     activations = []
     def init(self, *args, **kwargs):
@@ -121,7 +136,7 @@ INSTANCE = textwrap.dedent("""
     def wait(self, *args):
         log("waiting", self.parent().isVisible())
         return original_wait(self, *args)
-    def fetch():
+    def fetch(account):
         time.sleep(float(work))
         return {"rows": [{"label": "주간", "remaining": 50, "reset": ""}], "plan": None}
     sys.argv = ["widget.py"] + (["--desktop"] if mode == "desktop" else [])
@@ -137,7 +152,7 @@ INSTANCE = textwrap.dedent("""
 
 class InstanceTests(unittest.TestCase):
     def launch(self, directory, role, mode="compact", startup=0, work=0, close_on="never"):
-        environment = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_RUNTIME_DIR=directory)
+        environment = dict(os.environ, QT_QPA_PLATFORM="offscreen", XDG_RUNTIME_DIR=directory, XDG_CONFIG_HOME=directory)
         return subprocess.Popen([sys.executable, "-E", "-c", INSTANCE, role, directory, mode, str(startup), str(work), close_on],
                                 cwd=Path(__file__).parent, env=environment, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True)
@@ -213,6 +228,10 @@ class WidgetTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.settings = QSettings(str(Path(self.directory.name) / "settings.ini"), QSettings.IniFormat)
+        seed_accounts(self.settings)
+        config_patch = patch.dict(os.environ, {"XDG_CONFIG_HOME": self.directory.name})
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
         self.settings_patch = patch("widget.QSettings", return_value=self.settings)
         self.refresh_patch = patch.object(Widget, "refresh")
         self.calendar_refresh_patch = patch("calendar_panel.CalendarPanel.refresh")
@@ -304,17 +323,11 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(personal.amount.text(), '25%')
         self.assertIn('work@example.test', business.plan.text())
         self.assertIn('personal@example.test', personal.plan.text())
-        with patch('widget.claude_max_dir', return_value=Path(self.directory.name) / 'max'), \
-             patch('widget.QProcess') as process:
-            process.return_value.startDetached.return_value = True
-            personal.open_claude_login()
-            process.return_value.startDetached.assert_called_once()
-            self.assertIn("브라우저에서 Max 계정", personal.status.text())
-            args = process.return_value.setArguments.call_args.args[0]
-            self.assertIn('--no-dbus', args)
-            self.assertEqual(args[-2:], ['auth', 'login'])
-            env = process.return_value.setProcessEnvironment.call_args.args[0]
-            self.assertEqual(env.value('CLAUDE_CONFIG_DIR'), str(Path(self.directory.name) / 'max'))
+        self.assertIn('Max', personal.plan.text())
+        self.assertEqual(personal.findChild(QLabel, 'serviceTitle').text(), 'Claude · Max 5x')
+        self.assertEqual(business.findChild(QLabel, 'serviceTitle').text(), 'Claude Code')
+        # Logins are started from "+ 추가" now; cards carry only a remove menu.
+        self.assertEqual([action.text() for action in personal.menu_button.menu().actions()], ['계정 제거…'])
 
     def test_wayland_uses_positionable_backend_without_overriding_explicit_choice(self):
         import os
@@ -941,7 +954,7 @@ class WidgetTests(unittest.TestCase):
             self.assertEqual(second.findChild(QProgressBar).property("risk"), "")
 
     def test_card_countdown_updates_each_minute(self):
-        card = Card("codex")
+        card = Card(ACCOUNTS[0])
         reset_at = time.time() + 2 * 3600
         card.update_result([{"label": "Codex · 주간", "remaining": 50, "detail": "한도 안내",
                              "reset": "10/04 02:11 초기화", "reset_at": reset_at},
@@ -983,7 +996,7 @@ class WidgetTests(unittest.TestCase):
         self.assertTrue(window.scroll.isHidden())
         self.assertTrue(window.quota_view_buttons["list"].isChecked())
         self.assertEqual(self.settings.value("quota_view"), "list")
-        self.assertEqual(list(window.quota_rows), list(SERVICES))
+        self.assertEqual(list(window.quota_rows), [account["id"] for account in ACCOUNTS])
         codex = window.quota_rows["codex"]
         self.assertEqual(codex.amount.text(), "43%")
         self.assertEqual(codex.amount.property("risk"), "")
@@ -1046,7 +1059,7 @@ class WidgetTests(unittest.TestCase):
 
     def test_list_fits_default_size(self):
         window = self.window
-        for key in SERVICES:
+        for key in window.cards:
             window.received(key, {"rows": [{"label": "이번 주 · 전체 모델 · 아주 긴 한도 이름", "remaining": 9, "detail": "자세한 한도 안내 문구",
                                              "reset": "Oct 7, 3pm (Asia/Seoul) 초기화", "reset_at": None}]}, "")
         window.resize(430, 780)
