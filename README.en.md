@@ -76,7 +76,7 @@ cd ~/ai-quota-widget
 python3 widget.py                      # run the widget
 python3 widget.py --desktop            # wide app window
 python3 widget.py --check              # read live quotas of registered accounts without a window
-QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 175 tests
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 190 tests
 QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme light   # render the UI to an image
 ```
 
