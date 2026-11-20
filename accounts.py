@@ -110,8 +110,9 @@ def cleanup_pending(accounts=()):
     used = {Path(a["profile_dir"]).resolve() for a in accounts if not a["use_default"]}
     for folder in folders:
         try:
-            if (folder / PENDING).is_file() or (
-                    folder.resolve() not in used and time.time() - folder.lstat().st_mtime > ORPHAN_AGE):
+            # No accounts may mean unreadable settings: never treat every profile as an orphan then.
+            if (folder / PENDING).is_file() or (accounts and folder.resolve() not in used
+                                                and time.time() - folder.lstat().st_mtime > ORPHAN_AGE):
                 remove_profile(folder)
         except OSError:
             pass
