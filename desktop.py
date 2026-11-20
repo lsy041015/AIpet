@@ -15,6 +15,7 @@ PAGES = {
     "home": ("대시보드", "오늘 한눈에", "AI 사용량부터 일정까지, 오늘 필요한 정보를 모았습니다."),
     "quota": ("AI 한도", "AI 사용량", "주간 한도를 먼저 표시합니다. 계정별 상세 한도도 확인하세요."),
     "calendar": ("캘린더", "나의 일정", "예정된 일을 확인하고 빠르게 새 일정을 추가하세요."),
+    "todo": ("할 일", "할 일 목록", "해야 할 일을 적고 완료 여부를 관리하세요."),
     "agents": ("에이전트", "진행 중인 작업", "승인 대기와 작업 상태를 확인하고 해당 창으로 이동하세요."),
     "billing": ("구독·결제", "구독 관리", "계정별 다음 결제 예정일을 한곳에서 관리하세요."),
 }
@@ -39,6 +40,11 @@ def navigation_icon(kind, color):
         painter.drawRoundedRect(QRectF(3, 5, 18, 16), 3, 3)
         for line in ((3, 10, 21, 10), (8, 3, 8, 7), (16, 3, 16, 7), (8, 15, 11, 15), (14, 15, 17, 15)):
             painter.drawLine(*line)
+    elif kind == "todo":
+        for y in (6, 12, 18):
+            painter.drawLine(3, y, 5, y + 2)
+            painter.drawLine(5, y + 2, 8, y - 2)
+            painter.drawLine(12, y, 21, y)
     elif kind == "agents":
         painter.drawRoundedRect(QRectF(3, 6, 18, 14), 4, 4)
         for line in ((12, 2, 12, 6), (7, 11, 7, 13), (17, 11, 17, 13), (9, 17, 15, 17)):
@@ -225,6 +231,7 @@ class DesktopWindow(Widget):
         self.build_billing()
         self.page_indices = {"quota": self.pages.indexOf(self.quota_page),
                              "calendar": self.pages.indexOf(self.calendar_scroll),
+                             "todo": self.pages.indexOf(self.todo_scroll),
                              "home": self.pages.indexOf(self.dashboard_page),
                              "agents": self.pages.indexOf(self.agents_page),
                              "billing": self.pages.indexOf(self.billing_page)}
@@ -409,6 +416,7 @@ class DesktopWindow(Widget):
         self.page_heading.setText(PAGES[page][1])
         self.page_heading.show()
         self.page_description.setText(PAGES[page][2])
+        self.quick_add.setVisible(page != "todo")
         self.home_button.hide()
         if changed:
             self.page_motion.stop()
