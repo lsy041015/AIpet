@@ -184,5 +184,19 @@ class ImprovementsTests(unittest.TestCase):
         self.assertEqual(send.call_count, 5)
 
 
+    def test_quota_alert_ignores_cli_rounding_of_same_reset(self):
+        send = Mock(return_value=True)
+        alerts = Notifications(self.settings, send)
+        row = {"label": "이번 주 · 전체 모델", "remaining": 15}
+        for reset in ("10/06 13:59 초기화", "10/06 14:00 초기화") * 2:
+            alerts.quota("claude", "Claude Code", [dict(row, reset=reset)])
+        self.assertEqual(send.call_count, 1)
+        alerts.quota("claude", "Claude Code", [dict(row, reset="10/13 14:00 초기화")])
+        self.assertEqual(send.call_count, 2)
+        for reset in ("12/31 23:59 초기화", "01/01 00:00 초기화"):
+            alerts.quota("claude", "Claude Code", [dict(row, reset=reset)])
+        self.assertEqual(send.call_count, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

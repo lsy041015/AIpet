@@ -3,6 +3,7 @@ import ctypes as C
 import ctypes.util
 import os
 from pathlib import Path
+from agent_activity import claude_project
 
 
 def agent_pids(agent, target):
@@ -18,8 +19,17 @@ def agent_pids(agent, target):
                 matches = name == 'agy' or name == 'antigravity'
             elif agent == 'copilot':
                 matches = 'copilot' in name or any(b'/copilot' in a for a in args[:2])
-            else:
+            elif agent == 'claude':
+                # Claude keeps no transcript open; match the CLI by its project working directory.
+                matches = ((name == 'claude' or any(a.rsplit(b'/', 1)[-1] == b'claude' for a in args[:2]))
+                           and claude_project(os.readlink(process / 'cwd')) == Path(target).parent.name)
+            elif agent == 'opencode':
+                matches = 'opencode' in name
+            elif agent == 'codex':
                 matches = name in ('codex', 'codex-desktop')
+            else:
+                # An agent without a rule must not focus another agent's window.
+                matches = False
             if not matches:
                 continue
             fallback.add(pid)
@@ -32,6 +42,14 @@ def agent_pids(agent, target):
                     pass
         except (OSError, ValueError, IndexError):
             continue
+    def own(pid):
+        # Quota checks such as `claude --print /usage` run as this widget's children.
+        for _ in range(32):
+            if pid == os.getpid():
+                return True
+            pid = parents.get(pid, 0)
+        return False
+    exact, fallback = {pid for pid in exact if not own(pid)}, {pid for pid in fallback if not own(pid)}
     chosen = exact or fallback
     ancestors = set(chosen)
     for pid in chosen:

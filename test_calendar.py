@@ -1,6 +1,7 @@
 """Offline regressions: dates, pagination, OAuth storage, retry and UI behavior."""
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -8,10 +9,12 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QCoreApplication, QDateTime, QEvent, QTime, QTimer
+from PySide6.QtWidgets import QApplication, QDialog
 from calendar_client import (CalendarClient, CalendarError, day_bounds, event_body,
                              event_text, TOKEN_URI, AUTH_URI, EVENTS_URL)
 from calendar_panel import CalendarPanel, EventDialog
+from quick_event import parse_quick_event
 
 
 class CalendarTests(unittest.TestCase):
@@ -87,11 +90,67 @@ class CalendarTests(unittest.TestCase):
                 self.assertEqual(flow.run_local_server.call_args.kwargs["timeout_seconds"], 180)
                 self.assertEqual(flow.fetch_token.keywords["timeout"], 30)
 
+    def test_forbidden_reason_selects_rate_limit_or_organizer_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = CalendarClient(directory)
+            credentials = MagicMock()
+            credentials.to_json.return_value = json.dumps({"token_uri": TOKEN_URI})
+            client.save_token(credentials)
+            response = MagicMock(status_code=403)
+            with patch("google.oauth2.credentials.Credentials.from_authorized_user_info", return_value=credentials), \
+                    patch("google.auth.transport.requests.AuthorizedSession") as session:
+                session.return_value.__enter__.return_value.request.return_value = response
+                for reason, message in (("rateLimitExceeded", "한도 초과"), ("userRateLimitExceeded", "한도 초과"),
+                                        ("quotaExceeded", "한도 초과"), ("forbiddenForNonOrganizer", "주최자만"),
+                                        ("insufficientPermissions", "다시 연결")):
+                    response.json.return_value = {"error": {"code": 403, "errors": [{"reason": reason}]}}
+                    with self.subTest(reason=reason), self.assertRaisesRegex(CalendarError, message):
+                        client.today(date(2026, 10, 2))
+                response.json.side_effect = ValueError("not JSON")
+                with self.assertRaisesRegex(CalendarError, "다시 연결"):
+                    client.today(date(2026, 10, 2))
+
+    def test_quick_event_hour_minute_duration_needs_title_and_rejects_overflow(self):
+        now = datetime(2026, 10, 2, 9, 0).astimezone()
+        body = parse_quick_event("오늘 15:00 2시간 30분 동안 회의", now)
+        self.assertEqual(body["summary"], "회의")
+        begin, end = (datetime.fromisoformat(body[key]["dateTime"]) for key in ("start", "end"))
+        self.assertEqual(end - begin, timedelta(hours=2, minutes=30))
+        for text, message in (("오늘 18:30 30분 동안", "제목"), ("오늘 15:00 2시간 30분 동안", "제목"),
+                              ("9999-12-31 종일 x", "날짜 또는 시간")):
+            with self.subTest(text=text), self.assertRaisesRegex(CalendarError, message):
+                parse_quick_event(text, now)
+
 
 class CalendarUITests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_closed_modal_dialogs_release_their_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            panel = CalendarPanel(client=CalendarClient(directory))
+            event = {"id": "test", "etag": "etag", "summary": "회의",
+                     "start": {"date": "2026-09-29"}, "end": {"date": "2026-09-30"}}
+            try:
+                for action in (panel.add_event, lambda: panel.edit_event(event),
+                               panel.quick_event, panel.connect_google):
+                    with self.subTest(action=action.__name__):
+                        for accepted in (False, True, False):
+                            panel.quick_input.setText("내일 오후 3시 회의")
+                            def finish():
+                                dialog = self.app.activeModalWidget()
+                                dialog.accept() if accepted else dialog.reject()
+                            QTimer.singleShot(0, finish)
+                            with patch.object(panel.client, "connected", return_value=action != panel.connect_google):
+                                action()
+                            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+                            self.assertEqual(panel.findChildren(QDialog), [])
+                            if action == panel.quick_event:
+                                self.assertEqual(panel.quick_input.text(), "" if accepted else "내일 오후 3시 회의")
+            finally:
+                panel.deleteLater()
+                QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
     def test_panel_errors_keep_snapshot_disconnect_clears_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -188,6 +247,89 @@ class CalendarUITests(unittest.TestCase):
                              dialog.start.date().toPython() + timedelta(days=1))
             self.assertTrue(dialog.submit.isEnabled())
             dialog.close()
+            panel.deleteLater()
+
+    def test_single_and_empty_keyword_lists_survive_restart(self):
+        for words in (["운동"], []):
+            with self.subTest(words=words), tempfile.TemporaryDirectory() as first, \
+                    tempfile.TemporaryDirectory() as second:
+                panel = CalendarPanel(client=CalendarClient(first))
+                EventDialog(panel).store_keywords(words)
+                # Qt caches INI files per path in-process; a copy reads like the next launch.
+                shutil.copy(Path(first) / "keywords.ini", second)
+                restarted = CalendarPanel(client=CalendarClient(second))
+                self.assertEqual(EventDialog(restarted).title_keywords, words)
+                for item in (panel, restarted):
+                    item.deleteLater()
+
+    def test_day_change_during_running_job_refreshes_after_it_ends(self):
+        with tempfile.TemporaryDirectory() as directory:
+            panel = CalendarPanel(client=CalendarClient(directory))
+            panel.checked_day -= timedelta(days=1)
+            with patch.object(panel, "refresh") as refresh:
+                panel.job = object()  # e.g. a refresh that started before midnight
+                panel.tick()
+                panel.job = None
+                refresh.reset_mock()
+                panel.tick()
+                panel.tick()
+                refresh.assert_called_once()
+            panel.deleteLater()
+
+    def test_saved_times_drop_seconds_hidden_by_the_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            panel = CalendarPanel(client=CalendarClient(directory))
+            dialog = EventDialog(panel)
+            self.assertEqual((dialog.start.time().second(), dialog.start.time().msec()), (0, 0))
+            dialog.title_input.setText("회의")
+            start = QDateTime(dialog.start.date(), QTime(15, 0, 14))
+            dialog.start.setDateTime(start)
+            dialog.end.setDateTime(start.addSecs(3600))
+            bodies = []
+            with patch.object(panel, "run", side_effect=lambda action, callback: (action(), callback(None, "x"))), \
+                    patch.object(panel.client, "add", side_effect=bodies.append):
+                dialog.save()
+            begin, end = (datetime.fromisoformat(bodies[0][key]["dateTime"]) for key in ("start", "end"))
+            self.assertEqual((begin.strftime("%H:%M:%S"), end.strftime("%H:%M:%S")), ("15:00:00", "16:00:00"))
+            dialog.close()
+            panel.deleteLater()
+
+    def test_save_and_delete_during_background_job_explain_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            panel = CalendarPanel(client=CalendarClient(directory))
+            dialog = EventDialog(panel, {"id": "e", "etag": "t", "summary": "회의",
+                                         "start": {"date": "2026-10-05"}, "end": {"date": "2026-10-06"}})
+            panel.job = object()
+            with patch.object(panel, "run") as run:
+                for action in (dialog.save, dialog.delete_event):
+                    dialog.status.clear()
+                    action()
+                    self.assertIn("다시 눌러", dialog.status.text())
+                run.assert_not_called()
+            panel.job = None
+            dialog.close()
+            panel.deleteLater()
+
+    def test_edit_keeps_long_title_and_existing_empty_title(self):
+        with tempfile.TemporaryDirectory() as directory:
+            panel = CalendarPanel(client=CalendarClient(directory))
+            times = {"id": "e", "etag": "t", "start": {"dateTime": "2026-10-05T10:00:00+09:00"},
+                     "end": {"dateTime": "2026-10-05T11:00:00+09:00"}}
+            bodies = []
+            with patch.object(panel, "run", side_effect=lambda action, callback: (action(), callback(None, "x"))), \
+                    patch.object(panel.client, "update", side_effect=lambda event, body: bodies.append(body)):
+                for event in (dict(times, summary="가" * 350), times):
+                    dialog = EventDialog(panel, event)
+                    dialog.end.setDateTime(dialog.end.dateTime().addSecs(1800))
+                    dialog.save()
+                    dialog.close()
+                titled = EventDialog(panel, dict(times, summary="회의"))
+                titled.title_input.clear()
+                titled.save()
+                self.assertIn("제목", titled.status.text())
+                titled.close()
+            self.assertEqual([body["summary"] for body in bodies], ["가" * 350, ""])
+            self.assertEqual(EventDialog(panel).title_input.maxLength(), 300)
             panel.deleteLater()
 
 
