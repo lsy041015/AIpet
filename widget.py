@@ -1164,10 +1164,17 @@ class ComputerPet(CircleButton):
                     lines += line(f'▸ {current or "할 일"}' + (f' · {done}/{total}' if total else ''),
                                   f'color:{colors["text"]}; font-size:10px;')
                 helpers = [agent for agent in task.get('subagents') or () if isinstance(agent, dict)]
-                if helpers:
-                    models = dict.fromkeys(str(agent.get('model') or agent.get('type') or 'agent') for agent in helpers)
-                    lines += line(f'서브에이전트 {len(helpers)} · ' + ', '.join(models), f'color:{colors["accent"]}; font-size:10px;')
-                lines += line(f'{elapsed} 경과' + (f' · {model_text(task)}' if model_text(task) else ''),
+                show_models = self.owner.settings.value("pet/show_models", True, type=bool)
+                if helpers and show_models:
+                    groups = {}
+                    for agent in helpers:
+                        text = " ".join(str(v) for v in (agent.get('model') or agent.get('type') or 'agent', agent.get('effort')) if v)
+                        groups[text] = groups.get(text, 0) + 1
+                    lines += line(f'서브에이전트 {len(helpers)} · ' + ', '.join(
+                        text + (f' ×{count}' if count > 1 else '') for text, count in groups.items()),
+                        f'color:{colors["accent"]}; font-size:10px;')
+                models = model_text(task) if show_models else ''
+                lines += line(f'{elapsed} 경과' + (f' · {models}' if models else ''),
                               f'color:{colors["muted"]}; font-size:9px;')
                 image = f'<a href="{index}"><img src="{asset.as_uri()}" width="20" height="20"></a>' if asset.exists() else ''
                 rows.append(f'<tr><td width="27" valign="top">{image}</td>'
@@ -1230,8 +1237,14 @@ class ComputerPet(CircleButton):
         action = menu.addAction("빠른 일정 입력")
         animations = menu.addMenu("애니메이션 미리보기")
         previews = {animations.addAction(ANIMATION_NAMES[row]): row for row in PREVIEW_ROWS}
+        show_models = menu.addAction("말풍선에 모델·추론강도 표시")
+        show_models.setCheckable(True)
+        show_models.setChecked(self.owner.settings.value("pet/show_models", True, type=bool))
         chosen = menu.exec(event.globalPos())
-        if chosen == action:
+        if chosen == show_models:
+            self.owner.settings.setValue("pet/show_models", show_models.isChecked())
+            self.show_activity()
+        elif chosen == action:
             if self.owner.collapsed:
                 self.owner.toggle_collapsed()
             self.owner.set_page("calendar")
