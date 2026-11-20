@@ -8,6 +8,8 @@
 
 A tiny pixel mascot on my desktop that tells me how much AI quota is left, what my agents are doing, and what's next on my calendar.
 
+<p align="center"><img src="docs/media/intro.gif" alt="check AI update intro" width="720"><br><a href="docs/media/intro.mp4">Intro video (MP4)</a></p>
+
 <p align="center"><img src="docs/screenshots/mascot.gif" alt="Claude pixel mascot animation" width="144"></p>
 
 I switch between Claude Code, Codex, Antigravity and Copilot, and I kept opening windows just to check quotas, see whether an
@@ -33,7 +35,7 @@ What it does:
   looking around (waiting), typing on a laptop (working) and a happy result hop. At rest it mostly sits still, blinks and
   glances, and every 15-60 s does a random fidget (look around, hop, stretch, arm wiggle, stroll, sit down...); left alone
   long enough it dozes off until you hover it. Hovered, its eyes follow the cursor; while agents work it types with the
-  odd look-up or stretch. Neon or light theme, transparency and reduced motion.
+  odd look-up or stretch. Neon or light theme, widget and bubble transparency, reduced motion. The agent bubble shows one card per session with status, todo progress and model/effort.
 
 Hover over the folded pet for your next event, the last quota check and running sessions. Right-click for an animation preview
 and quick-add. `widget.py --desktop` opens a wide app window with a sidebar.
@@ -55,9 +57,9 @@ Rendered with sample data.
 | **Agent sessions** | **Billing** |
 | ![Agents](docs/screenshots/agents.png) | ![Billing](docs/screenshots/billing.png) |
 
-| Compact widget | Pet bubble | Add an agent |
+| Compact widget | Agent bubble | Add an agent |
 |---|---|---|
-| <img src="docs/screenshots/compact.png" width="260"> | <img src="docs/screenshots/pet-bubble.png" width="220"> | <img src="docs/screenshots/add-account.png" width="260"> |
+| <img src="docs/screenshots/compact.png" width="260"> | <img src="docs/screenshots/agent-bubble.png" width="220"> | <img src="docs/screenshots/add-account.png" width="260"> |
 
 Light theme: [docs/screenshots/light-dashboard.png](docs/screenshots/light-dashboard.png)
 
