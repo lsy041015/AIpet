@@ -228,6 +228,8 @@ class LoginTests(Isolated):
         hour_ago = time.time() - 3600
         for folder in (registered, old, root / "link1"):
             os.utime(folder, (hour_ago, hour_ago), follow_symlinks=False)
+        accounts.cleanup_pending([])
+        self.assertTrue(old.is_dir(), "an empty or unreadable registry deletes no login")
         accounts.cleanup_pending([record("claude", "reg1", str(registered)), record("codex")])
         self.assertEqual(sorted(p.name for p in root.iterdir()), ["link1", "new1", "reg1"])
         self.assertTrue(outside.is_dir())
