@@ -303,7 +303,105 @@ def session_activity(path, agent):
     return state['label'] if state['status'] in ('running', 'waiting') else None
 
 
+AGENT_NAMES = ('agy', 'copilot', 'codex', 'claude', 'opencode')
+
+
+def agent_kind(name, cmdline):
+    """Windows: the agent a process runs, or None. npm-installed CLIs run as node.exe with the package in argv."""
+    name = (name or '').lower().removesuffix('.exe')
+    if name in AGENT_NAMES:
+        return name
+    if name == 'antigravity':
+        return 'agy'
+    if name == 'codex-desktop':
+        return 'codex'
+    if name in ('node', 'bun'):
+        script = ' '.join((cmdline or [])[1:3]).replace('\\', '/').lower()
+        for package, kind in (('@anthropic-ai/claude-code', 'claude'), ('@github/copilot', 'copilot'),
+                              ('@openai/codex', 'codex'), ('opencode', 'opencode')):
+            if package in script:
+                return kind
+    return None
+
+
+def session_file(target):
+    """An open file that is an agent's live session log or database."""
+    target = target.replace('\\', '/')
+    return (target.endswith('.jsonl') and '/sessions/' in target or target.endswith('/events.jsonl')
+            or target.endswith('.jsonl') and '/.claude/projects/' in target
+            or '/conversations/' in target and target.endswith('.db') or target.endswith('/opencode/opencode.db'))
+
+
+def process_snapshot():
+    """Windows: (pid, parent pid, exe name) of every process from one Toolhelp snapshot; psutil's per-process
+    queries take over a second for a full table."""
+    import ctypes as C
+    from ctypes import wintypes as W
+
+    class Entry(C.Structure):
+        _fields_ = [('size', W.DWORD), ('usage', W.DWORD), ('pid', W.DWORD), ('heap', C.c_size_t), ('module', W.DWORD),
+                    ('threads', W.DWORD), ('ppid', W.DWORD), ('priority', C.c_long), ('flags', W.DWORD),
+                    ('name', C.c_wchar * 260)]
+    kernel = C.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [W.DWORD, W.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = W.HANDLE
+    kernel.Process32FirstW.argtypes = kernel.Process32NextW.argtypes = [W.HANDLE, C.POINTER(Entry)]
+    kernel.CloseHandle.argtypes = [W.HANDLE]
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot in (None, W.HANDLE(-1).value):
+        raise OSError('process snapshot failed')
+    found = []
+    try:
+        entry = Entry(size=C.sizeof(Entry))
+        more = kernel.Process32FirstW(snapshot, C.byref(entry))
+        while more:
+            found.append((entry.pid, entry.ppid, entry.name))
+            more = kernel.Process32NextW(snapshot, C.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    return found
+
+
+def windows_agents():
+    """Windows: (pid, parent pid, exe name, agent or None); only node/bun processes need their command line read."""
+    import psutil
+    result = []
+    for pid, ppid, name in process_snapshot():
+        kind = agent_kind(name, None)
+        if kind is None and name.lower() in ('node.exe', 'bun.exe'):
+            try:
+                kind = agent_kind(name, psutil.Process(pid).cmdline())
+            except psutil.Error:
+                pass
+        result.append((pid, ppid, name, kind))
+    return result
+
+
+def live_agent_files_windows(claude=None):
+    import psutil
+    found = set()
+    try:
+        agents = [(pid, kind) for pid, _, _, kind in windows_agents() if kind]
+    except OSError:
+        return found
+    for pid, kind in agents:
+        try:
+            process = psutil.Process(pid)
+            if kind == 'claude':
+                # Claude keeps no transcript open; claude_sessions matches it by working directory instead.
+                if claude is not None:
+                    claude.append(process)
+                continue
+            for item in process.open_files():
+                if session_file(item.path):
+                    found.add(os.path.normpath(item.path))
+        except (psutil.Error, OSError):
+            continue
+    return found
+
 def live_agent_files(claude=None):
+    if os.name == 'nt':
+        return live_agent_files_windows(claude)
     found = set()
     try:
         processes = os.scandir('/proc')
@@ -321,7 +419,7 @@ def live_agent_files(claude=None):
                 finally:
                     os.close(handle)
                 # cursor-agent (not installed here) would be matched here and read from its own store.
-                if name not in ('agy', 'copilot', 'codex', 'claude', 'opencode'):
+                if name not in AGENT_NAMES:
                     continue
                 if name == 'claude' and claude is not None:
                     claude.append(process.path)
@@ -329,8 +427,7 @@ def live_agent_files(claude=None):
                     for fd in descriptors:
                         try:
                             target = os.readlink(fd.path)
-                            if (target.endswith('.jsonl') and '/sessions/' in target or target.endswith('/events.jsonl') or target.endswith('.jsonl') and '/.claude/projects/' in target
-                                    or '/conversations/' in target and target.endswith('.db') or target.endswith('/opencode/opencode.db')):
+                            if session_file(target):
                                 found.add(target)
                         except OSError:
                             pass
@@ -340,7 +437,7 @@ def live_agent_files(claude=None):
 
 
 def claude_project(cwd):
-    # Claude names a project folder after its working directory: /home/a_b/.x -> -home-a-b--x
+    # Claude names a project folder after its working directory: /home/a_b/.x -> -home-a-b--x, C:\x -> C--x
     return re.sub(r'[^A-Za-z0-9]', '-', cwd)
 
 
@@ -353,8 +450,23 @@ def claude_roots(home):
     return home / '.claude/projects', profile
 
 
-def claude_sessions(processes, roots):
-    """Claude keeps no transcript open; a running CLI keeps its project's newest sessions visible."""
+def claude_projects_windows(processes):
+    import psutil
+    projects = {}
+    for process in processes:
+        try:
+            cwd, started = process.cwd(), process.create_time()
+        except (psutil.Error, OSError):
+            continue
+        count, first = projects.get(claude_project(cwd), (0, started))
+        projects[claude_project(cwd)] = count + 1, min(first, started)
+    return projects
+
+
+def claude_projects(processes):
+    """Project folder -> (running CLIs, earliest start); None when the process table is unreadable."""
+    if os.name == 'nt':
+        return claude_projects_windows(processes)
     projects = {}
     try:
         with open('/proc/stat') as stream:
@@ -369,6 +481,14 @@ def claude_sessions(processes, roots):
             count, first = projects.get(claude_project(cwd), (0, started))
             projects[claude_project(cwd)] = count + 1, min(first, started)
     except (OSError, ValueError, IndexError, StopIteration):
+        return None
+    return projects
+
+
+def claude_sessions(processes, roots):
+    """Claude keeps no transcript open; a running CLI keeps its project's newest sessions visible."""
+    projects = claude_projects(processes)
+    if projects is None:
         return set()
     found = set()
     for project, (count, started) in projects.items():

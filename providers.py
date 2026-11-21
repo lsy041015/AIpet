@@ -5,10 +5,11 @@ import math
 import os
 import re
 from pathlib import Path
-import selectors
+import queue
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -19,13 +20,9 @@ class QuotaError(Exception):
 
 
 def executable(name):
-    path = shutil.which(name)
-    if not path:
-        for folder in (".local/bin", ".npm-global/bin", ".opencode/bin"):
-            candidate = Path.home() / folder / name
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                path = str(candidate)
-                break
+    # which() also adds .exe/.cmd on Windows (Claude's native installer uses ~/.local/bin there too).
+    path = shutil.which(name) or shutil.which(name, path=os.pathsep.join(
+        str(Path.home() / folder) for folder in (".local/bin", ".npm-global/bin", ".opencode/bin")))
     if not path:
         raise QuotaError(f"{name} 설치·로그인 필요")
     return path
@@ -40,15 +37,66 @@ def cli(args):
         return command
 
 
+WINDOWS = os.name == "nt"
+
+
 def start(args, env=None):
-    return subprocess.Popen(
+    # Windows: no console window flashes up for each quota check.
+    if WINDOWS:
+        options = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        options = {"start_new_session": True}
+    process = subprocess.Popen(
         cli(args),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        start_new_session=True, env=env,
+        env=env, **options,
     )
+    process.started = time.time()
+    return process
 
 
 def stop(process):
+    if WINDOWS:
+        kill_tree(process)
+    else:
+        kill_group(process)
+    for stream in (process.stdin, process.stdout):
+        if stream:
+            stream.close()
+
+
+def kill_tree(process):
+    # Windows has no process groups to signal; end the CLI and every helper it started.
+    import psutil
+    from agent_activity import process_snapshot
+    try:
+        parent = psutil.Process(process.pid)
+        family = parent.children(recursive=True) + [parent]
+    except psutil.NoSuchProcess:
+        # The CLI already exited; Windows keeps its orphans' parent pid, so find them by it.
+        # A newer process that reused the pid would have started after this CLI.
+        family = []
+        try:
+            for pid, ppid, _ in process_snapshot():
+                if ppid == process.pid:
+                    try:
+                        child = psutil.Process(pid)
+                        if child.create_time() >= getattr(process, "started", 0) - 1:
+                            family += child.children(recursive=True) + [child]
+                    except psutil.Error:
+                        pass
+        except OSError:
+            pass
+    for member in family:
+        try:
+            member.kill()
+        except psutil.Error:
+            pass
+    psutil.wait_procs(family, timeout=2)
+    process.wait()
+
+
+def kill_group(process):
     # Terminate the whole CLI group, including any helper process.
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -59,9 +107,6 @@ def stop(process):
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait()
-    for stream in (process.stdin, process.stdout):
-        if stream:
-            stream.close()
 
 
 def output(args, env=None, timeout=30, check=True):
@@ -176,8 +221,19 @@ def codex_subscription(home):
 def codex(account):
     subscription = codex_subscription(codex_home(account))
     process = start(["codex", "app-server"], env=environment(account))
-    poller = selectors.DefaultSelector()
-    poller.register(process.stdout, selectors.EVENT_READ)
+    # A reader thread instead of select(): Windows cannot poll pipes. It ends at EOF when stop() kills the CLI.
+    chunks = queue.Queue()
+
+    def read():
+        while True:
+            try:
+                chunk = os.read(process.stdout.fileno(), 65536)
+            except OSError:
+                chunk = b""
+            chunks.put(chunk)
+            if not chunk:
+                return
+    threading.Thread(target=read, daemon=True).start()
     buffer = b""
 
     def send(message):
@@ -189,9 +245,10 @@ def codex(account):
             "clientInfo": {"name": "ai_quota_widget", "version": "1.0.0"}}})
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            if not poller.select(min(1, max(0, deadline - time.monotonic()))):
+            try:
+                chunk = chunks.get(timeout=min(1, max(0.01, deadline - time.monotonic())))
+            except queue.Empty:
                 continue
-            chunk = os.read(process.stdout.fileno(), 65536)
             if not chunk:
                 break
             buffer += chunk
@@ -217,7 +274,6 @@ def codex(account):
                             "renews": subscription.get("renews")}
         raise QuotaError("Codex 응답 없음 · 잠시 후 재시도")
     finally:
-        poller.close()
         stop(process)
 
 

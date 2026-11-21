@@ -165,6 +165,9 @@ def terminal_command(title, args):
         command = cli(args)
     except QuotaError:
         raise QuotaError(f"{args[0]} 명령 없음 · CLI 설치 확인") from None
+    if os.name == "nt":
+        # `start` opens a new console window; its first argument is the window title.
+        return os.environ.get("COMSPEC", "cmd.exe"), ["/c", "start", title, *command]
     for name, options in (("terminator", ["--no-dbus", "--title", title, "-x"]),
                           ("x-terminal-emulator", ["-e"]),
                           ("gnome-terminal", ["--title", title, "--"])):

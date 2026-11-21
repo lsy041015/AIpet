@@ -43,7 +43,7 @@ class Isolated(unittest.TestCase):
         self.root = Path(directory.name)
         self.home = self.root / "home"
         self.home.mkdir()
-        environment = patch.dict(os.environ, {"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.root / "config"),
+        environment = patch.dict(os.environ, {"HOME": str(self.home), "USERPROFILE": str(self.home), "XDG_CONFIG_HOME": str(self.root / "config"),
                                               "XDG_DATA_HOME": str(self.root / "data")})
         environment.start()
         self.addCleanup(environment.stop)
@@ -172,7 +172,8 @@ class LoginTests(Isolated):
         login, process, command = self.start()
         profile = Path(login.account["profile_dir"])
         self.assertEqual(profile.parent, accounts.accounts_root())
-        self.assertEqual(stat.S_IMODE(profile.stat().st_mode), 0o700)
+        if os.name != "nt":  # Windows has no POSIX modes
+            self.assertEqual(stat.S_IMODE(profile.stat().st_mode), 0o700)
         self.assertTrue((profile / accounts.PENDING).is_file())
         self.assertEqual(command.call_args.args[1], ["claude", "auth", "login"])
         env = process.return_value.setProcessEnvironment.call_args.args[0]
@@ -217,6 +218,7 @@ class LoginTests(Isolated):
         self.assertFalse(pending.exists())
         self.assertTrue(kept.is_dir())
 
+    @unittest.skipIf(os.name == "nt", "symlinks need admin rights on Windows")
     def test_startup_cleanup_removes_old_unregistered_profiles_only(self):
         root = accounts.accounts_root()
         registered, old, fresh = (accounts.create_profile(name) for name in ("reg1", "old1", "new1"))
@@ -278,6 +280,13 @@ class LoginTests(Isolated):
         self.assertEqual(login.account["profile_dir"], "")
         self.assertFalse(accounts.accounts_root().exists())
 
+    def test_terminal_command_opens_a_new_console_on_windows(self):
+        with patch("accounts.os.name", "nt"), patch.dict(os.environ, {"COMSPEC": "cmd.exe"}), \
+                patch("accounts.cli", return_value=["claude.exe", "auth", "login"]):
+            self.assertEqual(accounts.terminal_command("T", ["claude", "auth", "login"]),
+                             ("cmd.exe", ["/c", "start", "T", "claude.exe", "auth", "login"]))
+
+    @unittest.skipIf(os.name == "nt", "Linux terminals")
     def test_terminal_command_prefers_terminator_and_falls_back(self):
         def found(*names):
             def executable(name):
