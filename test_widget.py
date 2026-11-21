@@ -1355,6 +1355,7 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(self.settings.value("geometry"), self.window.expanded_geometry)
         self.assertEqual(self.settings.value("feature_size"), QSize(500, 640))
 
+    @unittest.skipIf(os.name == "nt", "offscreen Qt on Windows has no fonts, so text widths are wrong")
     def test_small_window_and_expanded_details_remain_scrollable(self):
         self.window.resize(360, 580)
         for card in self.window.cards.values():

@@ -13,7 +13,7 @@ A tiny pixel mascot on my desktop that tells me how much AI quota is left, what 
 <p align="center"><img src="docs/screenshots/mascot.gif" alt="Claude pixel mascot animation" width="144"></p>
 
 I switch between Claude Code, Codex, Antigravity and Copilot, and I kept opening windows just to check quotas, see whether an
-agent was still working, or find my next meeting. So I put it all in one widget. It's a PySide6 app for Ubuntu GNOME (X11), it
+agent was still working, or find my next meeting. So I put it all in one widget. It's a PySide6 app for Ubuntu GNOME (X11) that also runs on Windows 10/11, it
 runs on my desktop every day, and it's styled like an orange neon sign on a dark wall.
 
 What it does:
@@ -67,8 +67,8 @@ A screen-by-screen guide (Korean) is in [docs/GUIDE.md](docs/GUIDE.md).
 
 ## Run
 
-Needs Ubuntu GNOME (X11), Python 3, PySide6 and the agent CLIs you want (`claude`, `codex`, `gh`, `agy`, `opencode`, ...).
-The Google OAuth helpers are vendored in `vendor/`. Login terminals need `terminator`, `x-terminal-emulator` or `gnome-terminal`.
+Needs Ubuntu GNOME (X11) or Windows 10/11, Python 3.10+, PySide6, psutil (Windows) and the agent CLIs you want (`claude`, `codex`, `gh`, `agy`, `opencode`, ...).
+The Google OAuth helpers are vendored in `vendor/`. Login terminals need `terminator`, `x-terminal-emulator` or `gnome-terminal` (Windows opens a new console window).
 `rtk` is optional: when installed, CLIs run through `rtk proxy`; otherwise they run directly.
 
 ```bash
@@ -78,16 +78,27 @@ cd ~/ai-quota-widget
 python3 widget.py                      # run the widget
 python3 widget.py --desktop            # wide app window
 python3 widget.py --check              # read live quotas of registered accounts without a window
-QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 194 tests
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 196 tests
 QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme light   # render the UI to an image
 ```
+
+On Windows (PowerShell), `pythonw` keeps a console window from staying open:
+
+```powershell
+python -m pip install -r requirements.txt
+pythonw widget.py
+$env:QT_QPA_PLATFORM="offscreen"; python -m unittest discover -v   # skips the 11 Linux-only tests
+```
+
+On Windows, notifications are tray toasts, autostart is a value under `HKCU\...\CurrentVersion\Run`, and jumping to an
+agent's window uses the Win32 window list.
 
 For the calendar, enable the Calendar API in a Google Cloud project, download a **Desktop app** OAuth client JSON, and pick it
 in the widget's **Google 연결** dialog. It only asks for the `calendar.events.owned` scope and keeps the token locally with mode `0600`.
 
 ## Rough edges
 
-X11 only, so no Wayland, Windows or macOS. The Copilot quota relies on an internal API the official extension uses, so it may
+No pure Wayland session and no macOS. The Copilot quota relies on an internal API the official extension uses, so it may
 break if the response changes. Antigravity (`agy`) has no login command (only the in-app `/login`) and keeps a single login in the system keyring, so **Antigravity 계정 바꾸기** opens `agy` in a terminal and your `/login` replaces this PC's Antigravity account instead of adding one; Cursor and opencode show
 no quota. Claude Team seat prices can't be told apart, so enter yours by hand, and an expired login is renewed with **다시 로그인** in the card menu, which keeps the same card.
 

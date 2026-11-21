@@ -255,6 +255,7 @@ class DesktopTests(unittest.TestCase):
         desktop.close()
         desktop.deleteLater()
 
+    @unittest.skipIf(os.name == "nt", "offscreen Qt on Windows has no fonts, so text widths are wrong")
     def test_quota_grid_and_themes_fit_small_and_large_windows(self):
         self.window.set_page("quota")
         for width, columns in ((1200, 2), (820, 1)):

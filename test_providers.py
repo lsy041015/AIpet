@@ -237,9 +237,8 @@ class QuotaTests(unittest.TestCase):
                 pass
         process = type("Process", (), {"stdin": Pipe(), "stdout": Pipe()})()
         chunks = [b"".join(json.dumps(r).encode() + b"\n" for r in replies), b""]
-        selector = type("Selector", (), {"register": lambda *a: None, "select": lambda *a: True, "close": lambda *a: None})
         with patch("providers.start", return_value=process), patch("providers.stop"), \
-             patch("providers.selectors.DefaultSelector", selector), patch("providers.os.read", side_effect=chunks):
+             patch("providers.os.read", side_effect=chunks):
             snapshot = providers.codex({"kind": "codex", "use_default": True, "profile_dir": ""})
         self.assertEqual((snapshot["plan"], snapshot["rows"][0]["remaining"]), ("plus", 90))
         self.assertEqual([m.get("method") for m in sent], ["initialize", "initialized", "account/rateLimits/read"])

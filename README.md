@@ -13,7 +13,7 @@
 <p align="center"><img src="docs/screenshots/mascot.gif" alt="Claude 도트 마스코트 애니메이션" width="144"></p>
 
 Claude Code, Codex, Antigravity, Copilot을 번갈아 쓰다 보니 한도가 얼마 남았는지, 에이전트가 아직 일하는 중인지, 다음 회의가 언제인지
-확인하려고 창을 계속 열게 되더라고요. 그래서 위젯 하나에 모았어요. Ubuntu GNOME(X11)에서 PySide6로 만들었고,
+확인하려고 창을 계속 열게 되더라고요. 그래서 위젯 하나에 모았어요. Ubuntu GNOME(X11)에서 PySide6로 만들었고 Windows 10/11에서도 돌아가요.
 제 데스크톱에서 매일 켜 두고 씁니다. 화면은 어두운 벽에 켜진 주황 네온사인 느낌으로 꾸몄어요.
 
 할 수 있는 것:
@@ -64,8 +64,8 @@ Claude Code, Codex, Antigravity, Copilot을 번갈아 쓰다 보니 한도가 �
 
 ## 실행
 
-필요한 것: Ubuntu GNOME(X11), Python 3, PySide6, 그리고 쓰려는 에이전트 CLI(`claude`, `codex`, `gh`, `agy`, `opencode` 등).
-Google OAuth 라이브러리는 `vendor/`에 넣어 뒀어요. 로그인 터미널을 띄우려면 `terminator`, `x-terminal-emulator`, `gnome-terminal` 중 하나가 필요해요.
+필요한 것: Ubuntu GNOME(X11) 또는 Windows 10/11, Python 3.10+, PySide6, psutil(Windows), 그리고 쓰려는 에이전트 CLI(`claude`, `codex`, `gh`, `agy`, `opencode` 등).
+Google OAuth 라이브러리는 `vendor/`에 넣어 뒀어요. 로그인 터미널을 띄우려면 `terminator`, `x-terminal-emulator`, `gnome-terminal` 중 하나가 필요해요(Windows는 새 콘솔 창을 열어요).
 `rtk`는 선택 사항이에요. 설치돼 있으면 CLI를 `rtk proxy`로 감싸 실행하고, 없으면 CLI를 바로 실행해요.
 
 ```bash
@@ -75,9 +75,19 @@ cd ~/ai-quota-widget
 python3 widget.py                      # 위젯 실행
 python3 widget.py --desktop            # 넓은 앱 화면
 python3 widget.py --check              # 창 없이 등록된 계정의 실제 한도만 조회
-QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 테스트 194개
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 테스트 196개
 QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme light   # 화면을 이미지로 렌더링
 ```
+
+Windows(PowerShell)에서는 이렇게 실행해요. `pythonw`로 띄우면 콘솔 창이 안 남아요.
+
+```powershell
+python -m pip install -r requirements.txt
+pythonw widget.py
+$env:QT_QPA_PLATFORM="offscreen"; python -m unittest discover -v   # Linux 전용 11개는 건너뜀
+```
+
+Windows에서는 알림이 트레이 알림으로 뜨고, 자동 시작은 `HKCU\...\CurrentVersion\Run`에 등록하며, 작업 창 이동은 Win32 창 목록을 써요.
 
 캘린더를 쓰려면 Google Cloud 프로젝트에서 Calendar API를 켜고 **데스크톱 앱** OAuth 클라이언트 JSON을 받은 다음,
 위젯의 **Google 연결** 창에서 그 파일을 고르면 돼요([설정 안내](https://developers.google.com/workspace/calendar/api/quickstart/python?hl=ko)).
@@ -85,7 +95,7 @@ QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme li
 
 ## 아쉬운 점
 
-X11 전용이라 Wayland, Windows, macOS에서는 안 돌아가요. Copilot 한도는 공식 확장이 쓰는 내부 API에 기대고 있어서
+Wayland 단독 세션과 macOS에서는 안 돌아가요. Copilot 한도는 공식 확장이 쓰는 내부 API에 기대고 있어서
 응답 형식이 바뀌면 고쳐야 할 수 있어요. Antigravity(`agy`)는 로그인 명령이 없고(앱 안의 `/login`만 있음) 로그인 정보를 시스템 키링에 하나만 저장해요. 그래서 **Antigravity 계정 바꾸기**를 누르면 터미널에 `agy`가 열리고, `/login`을 마치면 계정이 추가되는 게 아니라 이 PC의 Antigravity 계정이 바뀌어요. Cursor·opencode는 한도를
 못 읽어요. Claude Team 좌석 요금은 구분이 안 돼서 직접 입력해야 하고, 로그인이 만료된 계정은 카드 메뉴의 **다시 로그인**으로 같은 카드에 다시 로그인해요.
 
