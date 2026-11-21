@@ -1,4 +1,4 @@
-"""X11 window activation using PID ancestry; no shell or terminal input injection."""
+"""X11 / Win32 window activation using PID ancestry; no shell or terminal input injection."""
 import ctypes as C
 import ctypes.util
 import os
@@ -7,6 +7,53 @@ from agent_activity import claude_project
 
 
 def agent_pids(agent, target):
+    exact, fallback, parents = windows_scan(agent, target) if os.name == 'nt' else proc_scan(agent, target)
+    return ancestors(exact, fallback, parents)
+
+
+def windows_scan(agent, target):
+    import psutil
+    from agent_activity import windows_agents
+    exact, fallback, parents, shells = set(), set(), {}, set()
+    wanted = os.path.normcase(os.path.normpath(target))
+    for pid, ppid, name, kind in windows_agents():
+        parents[pid] = ppid
+        if name.lower() == 'explorer.exe':
+            shells.add(pid)
+        # agent_kind names Antigravity's CLI "agy"; the activity rows call it "antigravity".
+        if not (kind == agent or kind == 'agy' and agent == 'antigravity'):
+            continue
+        try:
+            process = psutil.Process(pid)
+            if agent == 'claude':
+                if claude_project(process.cwd()) != Path(target).parent.name:
+                    continue
+            elif any(os.path.normcase(item.path) == wanted for item in process.open_files()):
+                exact.add(pid)
+            fallback.add(pid)
+        except (psutil.Error, OSError):
+            continue
+
+    def created(pid):
+        try:
+            return psutil.Process(pid).create_time()
+        except psutil.Error:
+            return None
+    # Windows reuses the pid of an exited parent; a "parent" newer than its child is a stranger, so the chain ends.
+    for child in fallback:
+        for _ in range(32):
+            parent = parents.get(child, 0)
+            if parent <= 1:
+                break
+            older, newer = created(parent), created(child)
+            if older is None or newer is None or older > newer:
+                parents[child] = 0
+                break
+            child = parent
+    # The ancestry stops below the desktop shell, so File Explorer windows are never offered.
+    return exact, fallback, {pid: 0 if parent in shells else parent for pid, parent in parents.items()}
+
+def proc_scan(agent, target):
     exact, fallback, parents = set(), set(), {}
     for process in Path('/proc').glob('[0-9]*'):
         try:
@@ -42,6 +89,10 @@ def agent_pids(agent, target):
                     pass
         except (OSError, ValueError, IndexError):
             continue
+    return exact, fallback, parents
+
+
+def ancestors(exact, fallback, parents):
     def own(pid):
         # Quota checks such as `claude --print /usage` run as this widget's children.
         for _ in range(32):
@@ -51,14 +102,60 @@ def agent_pids(agent, target):
         return False
     exact, fallback = {pid for pid in exact if not own(pid)}, {pid for pid in fallback if not own(pid)}
     chosen = exact or fallback
-    ancestors = set(chosen)
+    found = set(chosen)
     for pid in chosen:
         for _ in range(32):
             pid = parents.get(pid, 0)
             if pid <= 1:
                 break
-            ancestors.add(pid)
-    return ancestors
+            found.add(pid)
+    return found
+
+
+class WinWindows:
+    """Windows: top-level windows owned by the agent or an ancestor (its terminal, e.g. Windows Terminal)."""
+
+    def __init__(self):
+        from ctypes import wintypes as W
+        self.user = C.WinDLL('user32', use_last_error=True)
+        self.enum_proc = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
+        self.user.EnumWindows.argtypes = [self.enum_proc, W.LPARAM]
+        self.user.GetWindowThreadProcessId.argtypes = [W.HWND, C.POINTER(W.DWORD)]
+        self.user.GetWindowTextLengthW.argtypes = [W.HWND]
+        self.user.GetWindowTextW.argtypes = [W.HWND, W.LPWSTR, C.c_int]
+        for name in ('IsWindowVisible', 'IsIconic', 'SetForegroundWindow'):
+            getattr(self.user, name).argtypes = [W.HWND]
+        self.user.GetWindow.argtypes = [W.HWND, C.c_uint]
+        self.user.GetWindow.restype = W.HWND
+        self.user.ShowWindow.argtypes = [W.HWND, C.c_int]
+        self.W = W
+
+    def candidates(self, agent, target):
+        pids = agent_pids(agent, target)
+        windows = []
+
+        def visit(hwnd, _):
+            # Visible, unowned (GW_OWNER = 4) windows with a title are what the taskbar shows.
+            if self.user.IsWindowVisible(hwnd) and not self.user.GetWindow(hwnd, 4):
+                owner = self.W.DWORD()
+                self.user.GetWindowThreadProcessId(hwnd, C.byref(owner))
+                length = self.user.GetWindowTextLengthW(hwnd)
+                if owner.value in pids and length:
+                    title = C.create_unicode_buffer(length + 1)
+                    self.user.GetWindowTextW(hwnd, title, length + 1)
+                    windows.append((hwnd, title.value or '작업 창'))
+            return True
+        self.user.EnumWindows(self.enum_proc(visit), 0)
+        return windows
+
+    def activate(self, wid):
+        if self.user.IsIconic(wid):
+            self.user.ShowWindow(wid, 9)  # SW_RESTORE
+        if not self.user.SetForegroundWindow(wid):
+            raise OSError('창 이동 요청을 보내지 못했습니다.')
+
+    def close(self):
+        pass
 
 
 class XWindows:
@@ -133,3 +230,8 @@ class XWindows:
     def close(self):
         self.x.XCloseDisplay(self.display)
         self.x.XSetErrorHandler(self.previous_handler)
+
+
+if os.name == 'nt':
+    # widget.py uses one name for the platform's window switcher.
+    XWindows = WinWindows

@@ -18,6 +18,7 @@ from quick_event import parse_quick_event
 
 
 class CalendarTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(time, "tzset"), "needs time.tzset")
     def test_local_day_bounds_include_dst_transition(self):
         try:
             with patch.dict(os.environ, TZ="America/New_York"):
@@ -58,7 +59,8 @@ class CalendarTests(unittest.TestCase):
             credentials = MagicMock()
             credentials.to_json.return_value = json.dumps({"token_uri": TOKEN_URI})
             client.save_token(credentials)
-            self.assertEqual(client.token_path.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":  # Windows has no POSIX modes
+                self.assertEqual(client.token_path.stat().st_mode & 0o777, 0o600)
             conflict = MagicMock(status_code=409)
             success = MagicMock(status_code=200, ok=True)
             success.json.return_value = {"id": "abc123"}

@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -7,7 +8,8 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 from datetime import datetime, timezone
-from agent_activity import read_activity, session_state, ActivityTracker, timestamp, live_agent_files, claude_project, short_model
+from agent_activity import (read_activity, session_state, ActivityTracker, timestamp, live_agent_files, claude_project,
+                            short_model, agent_kind, session_file)
 from agent_windows import agent_pids
 
 
@@ -44,11 +46,13 @@ class ActivityTests(unittest.TestCase):
                         rows = [item for item in read_activity(root, now=250, detailed=True) if item["agent"] == agent]
                     self.assertEqual({item["id"] for item in rows}, all_paths)
 
+    @unittest.skipIf(os.name == "nt", "reads /proc")
     def test_unavailable_process_list_does_not_interrupt_activity_scan(self):
         for error in (FileNotFoundError, PermissionError):
             with self.subTest(error=error), patch("agent_activity.os.scandir", side_effect=error):
                 self.assertEqual(live_agent_files(), set())
 
+    @unittest.skipIf(os.name == "nt", "fakes /proc with symlinks")
     def test_live_files_come_from_agent_processes_only(self):
         with tempfile.TemporaryDirectory() as directory:
             fake = Path(directory)
@@ -234,7 +238,7 @@ class ActivityTests(unittest.TestCase):
             database = root / ".gemini/antigravity-cli/conversation_summaries.db"
             database.parent.mkdir(parents=True)
             active = database.parent / "conversations/active.db"
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute("CREATE TABLE conversation_summaries(title,last_modified_time,not_fully_idle,killed,status,conversation_id,last_user_input_time)")
                 for index in range(21):
                     moment = datetime.fromtimestamp(100 + index, timezone.utc).isoformat()
@@ -250,26 +254,26 @@ class ActivityTests(unittest.TestCase):
             root = Path(directory)
             path = root / '.gemini/antigravity-cli/conversation_summaries.db'
             path.parent.mkdir(parents=True)
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute('CREATE TABLE conversation_summaries(title,last_modified_time,not_fully_idle,killed,status,conversation_id,last_user_input_time)')
                 timestamp = datetime.now(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', '391+00:00')
                 connection.execute('INSERT INTO conversation_summaries VALUES(?,?,?,?,?,?,?)', ('테스트 작업', timestamp, 1, 0, 'CASCADE_RUN_STATUS_RUNNING', 'test', timestamp))
             self.assertEqual(read_activity(root), [('antigravity', '작업 중 · 테스트 작업')])
             target = path.parent / 'conversations/test.db'
             target.parent.mkdir()
-            with sqlite3.connect(target) as connection:
+            with closing(sqlite3.connect(target)) as connection, connection:
                 connection.execute('CREATE TABLE steps(idx,status)')
                 connection.execute('INSERT INTO steps VALUES(1,9)')
             self.assertEqual(read_activity(root, detailed=True)[0]['status'], 'waiting')
-            with sqlite3.connect(target) as connection:
+            with closing(sqlite3.connect(target)) as connection, connection:
                 connection.execute('UPDATE steps SET status=7')
             self.assertEqual(read_activity(root, detailed=True)[0]['status'], 'running')
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute('UPDATE conversation_summaries SET not_fully_idle=0')
             self.assertEqual(read_activity(root, detailed=True)[0]['status'], 'failed')
-            with sqlite3.connect(target) as connection:
+            with closing(sqlite3.connect(target)) as connection, connection:
                 connection.execute('UPDATE steps SET status=3')
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 connection.execute("UPDATE conversation_summaries SET status='CASCADE_RUN_STATUS_IDLE'")
             self.assertEqual(read_activity(root), [])
 
@@ -321,6 +325,7 @@ class ActivityTests(unittest.TestCase):
         old = dict(id='old', agent='claude', status='done', label='완료', started=50, updated=101, target='x')
         self.assertEqual(tracker.update([old], 105)[1], [])
 
+    @unittest.skipIf(os.name == "nt", "fakes /proc with symlinks")
     def test_running_claude_cli_keeps_silent_pending_tool_visible(self):
         self.assertEqual(claude_project('/home/a_b/.config/x y'), '-home-a-b--config-x-y')
         with tempfile.TemporaryDirectory() as directory:
@@ -349,6 +354,18 @@ class ActivityTests(unittest.TestCase):
                 os.utime(path, (1000, 1000))
                 self.assertEqual(read_activity(root, now=now), [])
 
+    def test_windows_process_and_path_rules(self):
+        self.assertEqual([agent_kind(name, args) for name, args in (
+            ('claude.exe', []), ('Codex.EXE', None), ('antigravity.exe', []), ('bash.exe', []),
+            ('node.exe', ['node', r'C:\Users\u\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js']),
+            ('node.exe', ['node', r'C:\npm\node_modules\@github\copilot\index.js']), ('node.exe', ['node', 'server.js']))],
+            ['claude', 'codex', 'agy', None, 'claude', 'copilot', None])
+        self.assertTrue(session_file(r'C:\Users\u\.codex\sessions\2026\11\r.jsonl'))
+        self.assertTrue(session_file(r'C:\Users\u\.gemini\antigravity\conversations\a.db'))
+        self.assertFalse(session_file(r'C:\Users\u\notes.jsonl'))
+        self.assertEqual(claude_project(r'C:\Users\u\my_app'), 'C--Users-u-my-app')
+
+    @unittest.skipIf(os.name == "nt", "fakes /proc with symlinks")
     def test_window_fallback_matches_claude_cwd_and_skips_own_children(self):
         with tempfile.TemporaryDirectory() as directory:
             fake = Path(directory)
@@ -456,7 +473,7 @@ class ActivityTests(unittest.TestCase):
             database = root / '.local/share/opencode/opencode.db'
             database.parent.mkdir(parents=True)
             now = time.time()
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.executescript('CREATE TABLE session (id, parent_id, title, agent, model, time_updated, time_archived);'
                                          'CREATE TABLE message (session_id, time_created, time_updated, data);'
                                          'CREATE TABLE todo (session_id, content, status, position);')
@@ -475,6 +492,7 @@ class ActivityTests(unittest.TestCase):
             self.assertEqual((row['status'], row['title'], row['model'], row['effort'], row['current_task']), ('running', 'Build viewer', 'deepseek-v4.1', 'high', 'Scaffold'))
             self.assertEqual(row['subagents'], [dict(type='scout', description='Find f', model='gemini-3-flash', effort=None, status='running')])
 
+    @unittest.skipIf(os.name == "nt", "the temp folder is inside home on Windows")
     def test_max_profile_huge_newest_line_and_short_timestamp_fraction(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

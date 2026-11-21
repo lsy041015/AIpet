@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compact desktop quota widget for the existing local CLI accounts."""
 import argparse
-import fcntl
+import getpass
+import zlib
 import json
 import math
 import os
@@ -10,6 +11,13 @@ import sys
 import time
 from datetime import datetime
 from functools import lru_cache
+
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+    import winreg
+else:
+    import fcntl
 
 # This widget does no parallel numerical work; avoid NumPy/BLAS helper pools.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -26,7 +34,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                                QLabel, QPushButton, QProgressBar, QScrollArea,
                                QFrame, QButtonGroup, QToolButton, QMenu, QSizeGrip,
                                QGraphicsDropShadowEffect, QGraphicsScene, QSlider, QWidgetAction,
-                               QInputDialog, QMessageBox, QStackedWidget, QSizePolicy, QGridLayout)
+                               QInputDialog, QMessageBox, QStackedWidget, QSizePolicy, QGridLayout, QSystemTrayIcon)
 
 from providers import KINDS, PROVIDERS, QuotaError
 from accounts import (AddAccountDialog, Login, confirm_remove, cleanup_pending, link as link_account,
@@ -42,6 +50,8 @@ from html import escape
 
 
 APP_NAME = "check AI"
+APP_ID = "ai-quota-widget"
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 WEB_APPS = {
     "github": ("GitHub", "https://github.com/"),
@@ -73,7 +83,7 @@ THEMES = {
               "cursor": "#55555f", "opencode": "#55555f"},
 }
 # Thin geometric monoline letters for neon signs and numbers; Hangul falls back to Noto Sans CJK.
-DISPLAY_FONTS = ["URW Gothic", "Ubuntu", "Noto Sans CJK KR"]
+DISPLAY_FONTS = ["URW Gothic", "Ubuntu", "Noto Sans CJK KR", "Segoe UI", "Malgun Gothic"]
 DISPLAY_CSS = ", ".join(f"'{name}'" for name in DISPLAY_FONTS)
 
 PLAN_NAMES = {
@@ -139,7 +149,8 @@ def session_title(task):
     if isinstance(title, str) and title.strip():
         return title.strip()
     folder = Path(str(task.get("target") or "")).parent.name
-    if task.get("agent") == "claude" and folder.startswith("-"):
+    # Linux folders start with "-" (/home/u), Windows ones with the drive (C:\Users -> C--Users).
+    if task.get("agent") == "claude" and (folder.startswith("-") or folder[1:3] == "--"):
         # Claude names the folder after the working directory (/home/u/app -> -home-u-app).
         home = claude_project(str(Path.home()))
         name = (folder[len(home):] if folder.startswith(home) else folder).strip("-")
@@ -2017,7 +2028,7 @@ class Widget(QWidget):
         self.menu = QMenu(menu_button)
         self.auto = self.menu.addAction("로그인 시 자동 시작")
         self.auto.setCheckable(True)
-        self.auto.setChecked(self.autostart_path().exists())
+        self.auto.setChecked(self.autostart_enabled())
         self.auto.toggled.connect(self.set_autostart)
         self.reduce_motion = self.menu.addAction("동작 줄이기")
         self.reduce_motion.setCheckable(True)
@@ -2604,6 +2615,18 @@ class Widget(QWidget):
     def send_notification(self, title, body):
         if self.smoke:
             return False
+        if WINDOWS:
+            # No notify-send on Windows; a tray icon shows a native toast (plain text, no markup).
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                return False
+            if getattr(self, "tray", None) is None:
+                icon = self.windowIcon()
+                self.tray = QSystemTrayIcon(icon if not icon.isNull() else QIcon(self.restore_button.grab()), self)
+                self.tray.setToolTip(APP_NAME)
+                self.tray.activated.connect(lambda _reason: self.bring_to_front())
+                self.tray.show()
+            self.tray.showMessage(title, body, QSystemTrayIcon.Information, 10_000)
+            return True
         # Desktop notifications interpret markup; calendar titles are untrusted text.
         started, _ = QProcess.startDetached("notify-send", ["--app-name=check AI", "--icon=utilities-system-monitor",
                                                             "--", escape(title), escape(body)])
@@ -2998,10 +3021,32 @@ class Widget(QWidget):
     def autostart_path():
         return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autostart/ai-quota-widget.desktop"
 
+    def autostart_enabled(self):
+        if not WINDOWS:
+            return self.autostart_path().exists()
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+                winreg.QueryValueEx(key, APP_ID)
+            return True
+        except OSError:
+            return False
+
     def set_autostart(self, enabled):
         try:
             path = self.autostart_path()
-            if enabled:
+            if WINDOWS:
+                # The per-user Run key; pythonw keeps a console window from opening at login.
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+                    if enabled:
+                        pythonw = Path(sys.executable).with_name("pythonw.exe")
+                        command = f'"{pythonw if pythonw.is_file() else sys.executable}" "{Path(__file__).resolve()}"'
+                        winreg.SetValueEx(key, APP_ID, 0, winreg.REG_SZ, command)
+                    else:
+                        try:
+                            winreg.DeleteValue(key, APP_ID)
+                        except FileNotFoundError:
+                            pass
+            elif enabled:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text((Path(__file__).parent / "ai-quota-widget.desktop").read_text())
             else:
@@ -3239,20 +3284,29 @@ def main():
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
-    app.setFont(QFont("Noto Sans CJK KR", 10))
+    font = QFont()
+    font.setFamilies(["Noto Sans CJK KR", "Malgun Gothic"])
+    font.setPointSize(10)
+    app.setFont(font)
     # Keep one desktop instance. No quota data or credentials written here.
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", Path.home() / ".cache"))
     runtime.mkdir(parents=True, exist_ok=True)
-    socket_path = runtime / "ai-quota-widget.sock"
+    # Windows local sockets are named pipes: a plain, machine-wide name, so it carries the lock folder's hash
+    # to pair each pipe with its lock.
+    pipe = f"ai-quota-widget-{getpass.getuser()}-{zlib.crc32(str(runtime.resolve()).encode()):08x}"
+    socket_path = pipe if WINDOWS else runtime / "ai-quota-widget.sock"
     mode = "desktop" if args.desktop else "compact"
     with (runtime / ("ai-quota-widget-smoke.lock" if args.smoke else "ai-quota-widget.lock")).open("w") as lock:
         # A starting, closing or mode-switching instance holds the lock without answering "ok".
         deadline = time.monotonic() + 35
         while True:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if WINDOWS:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except BlockingIOError:
+            except (BlockingIOError, PermissionError):
                 if args.smoke or activate_existing(socket_path, mode) == "ok":
                     return 0
                 if time.monotonic() > deadline:
