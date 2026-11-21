@@ -519,11 +519,40 @@ def claude_profile_ok(auth, account):
     return isinstance(actual, str) and Path(actual).resolve() == Path(account["profile_dir"]).resolve()
 
 
+AGY_CREDENTIAL = "gemini:antigravity"
+
+
+def keyring_stamp(target):
+    """Windows: when the generic credential `target` was last written, or None if it is missing.
+    Only the metadata is read; the secret is never decoded."""
+    import ctypes as C
+    from ctypes import wintypes as W
+
+    class Credential(C.Structure):
+        _fields_ = [("flags", W.DWORD), ("type", W.DWORD), ("target", W.LPWSTR), ("comment", W.LPWSTR),
+                    ("written", W.FILETIME), ("size", W.DWORD), ("blob", C.c_void_p), ("persist", W.DWORD),
+                    ("count", W.DWORD), ("attributes", C.c_void_p), ("alias", W.LPWSTR), ("user", W.LPWSTR)]
+    advapi = C.WinDLL("advapi32", use_last_error=True)
+    advapi.CredReadW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, C.POINTER(C.POINTER(Credential))]
+    advapi.CredFree.argtypes = [C.c_void_p]
+    found = C.POINTER(Credential)()
+    if not advapi.CredReadW(target, 1, 0, C.byref(found)):  # CRED_TYPE_GENERIC
+        return None
+    try:
+        written = found.contents.written
+        return written.dwHighDateTime << 32 | written.dwLowDateTime
+    finally:
+        advapi.CredFree(found)
+
+
 def active_login(kind):
     """The signed-in account marker for agents whose login replaces the PC's account, or None."""
     switch = KINDS[kind].get("switch")
     if not switch:
         return None
+    if WINDOWS and kind == "antigravity":
+        # agy on Windows writes no accounts file; its token sits in Credential Manager.
+        return "keyring" if keyring_stamp(AGY_CREDENTIAL) else None
     try:
         active = json.loads((Path.home() / switch).read_text()).get("active")
     except (OSError, ValueError, AttributeError):

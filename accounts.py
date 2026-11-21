@@ -13,7 +13,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
                                QDialogButtonBox, QMessageBox, QCheckBox)
 
-from providers import (KINDS, QuotaError, claude_max_dir, cli, codex_home, default_login, environment, executable,
+from providers import (AGY_CREDENTIAL, KINDS, WINDOWS, QuotaError, keyring_stamp, claude_max_dir, cli, codex_home, default_login, environment, executable,
                        logged_in, opencode_data)
 
 
@@ -217,7 +217,7 @@ class Login(QObject):
         # A PC-wide login (agy) or a re-login is already logged in: wait until the login file is rewritten.
         self.switch = bool(KINDS[kind].get("switch"))
         self.watch = login_file(self.account) if self.switch or self.existing else None
-        self.before = file_stamp(self.watch) if self.watch else None
+        self.before = self.stamp()
         self.check = None
         self.deadline = 0
         self.timer = QTimer(self)
@@ -260,7 +260,15 @@ class Login(QObject):
         self.check.start()
 
     def poll(self):
-        self.ok = logged_in(self.account) and (self.watch is None or file_stamp(self.watch) != self.before)
+        self.ok = logged_in(self.account) and (self.watch is None or self.stamp() != self.before)
+
+    def stamp(self):
+        if not self.watch:
+            return None
+        if WINDOWS and self.account["kind"] == "antigravity":
+            # agy on Windows keeps its login in Credential Manager, not in the accounts file.
+            return keyring_stamp(AGY_CREDENTIAL)
+        return file_stamp(self.watch)
 
     def done(self, ok):
         self.timer.stop()

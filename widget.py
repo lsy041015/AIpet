@@ -2,6 +2,7 @@
 """Compact desktop quota widget for the existing local CLI accounts."""
 import argparse
 import getpass
+import zlib
 import json
 import math
 import os
@@ -3290,8 +3291,10 @@ def main():
     # Keep one desktop instance. No quota data or credentials written here.
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", Path.home() / ".cache"))
     runtime.mkdir(parents=True, exist_ok=True)
-    # Windows local sockets are named pipes: a plain name, no folder path.
-    socket_path = f"ai-quota-widget-{getpass.getuser()}" if WINDOWS else runtime / "ai-quota-widget.sock"
+    # Windows local sockets are named pipes: a plain, machine-wide name, so it carries the lock folder's hash
+    # to pair each pipe with its lock.
+    pipe = f"ai-quota-widget-{getpass.getuser()}-{zlib.crc32(str(runtime.resolve()).encode()):08x}"
+    socket_path = pipe if WINDOWS else runtime / "ai-quota-widget.sock"
     mode = "desktop" if args.desktop else "compact"
     with (runtime / ("ai-quota-widget-smoke.lock" if args.smoke else "ai-quota-widget.lock")).open("w") as lock:
         # A starting, closing or mode-switching instance holds the lock without answering "ok".

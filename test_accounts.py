@@ -280,6 +280,19 @@ class LoginTests(Isolated):
         self.assertEqual(login.account["profile_dir"], "")
         self.assertFalse(accounts.accounts_root().exists())
 
+    def test_windows_agy_login_is_read_from_credential_manager(self):
+        stamps = iter([None, 5, 5, 9])
+        with patch("providers.WINDOWS", True), patch("accounts.WINDOWS", True), \
+                patch("providers.keyring_stamp", side_effect=lambda _: next(stamps)), \
+                patch("accounts.keyring_stamp", side_effect=lambda _: next(stamps)):
+            self.assertIsNone(providers.active_login("antigravity"))
+            self.assertEqual(providers.active_login("antigravity"), "keyring")
+            login = accounts.Login("antigravity")
+            self.assertEqual(login.before, 5)
+            with patch("accounts.logged_in", return_value=True):
+                login.poll()
+            self.assertTrue(login.ok)
+
     def test_terminal_command_opens_a_new_console_on_windows(self):
         with patch("accounts.os.name", "nt"), patch.dict(os.environ, {"COMSPEC": "cmd.exe"}), \
                 patch("accounts.cli", return_value=["claude.exe", "auth", "login"]):
@@ -320,6 +333,14 @@ class LoginTests(Isolated):
 
 
 class AgySwitchTests(Isolated):
+    def setUp(self):
+        super().setUp()
+        # The accounts-file login (Linux); Windows reads Credential Manager instead.
+        for name in ("providers.WINDOWS", "accounts.WINDOWS"):
+            flag = patch(name, False)
+            flag.start()
+            self.addCleanup(flag.stop)
+
     def accounts_file(self, active):
         path = self.home / ".gemini/google_accounts.json"
         path.parent.mkdir(exist_ok=True)
