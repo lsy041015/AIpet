@@ -35,6 +35,13 @@ class DesktopTests(unittest.TestCase):
         self.window.received("codex", {"rows": [{"label": "Codex · 5시간", "remaining": 25, "reset": "오늘 초기화"},
                                                  {"label": "Codex · 주간", "remaining": 80, "reset": "주간 초기화"}], "plan": "pro"}, "")
 
+    def test_antigravity_card_leads_with_gemini_weekly(self):
+        rows = [{"label": "Gemini · 5시간", "remaining": 40, "reset": ""},
+                {"label": "Claude and GPT · 주간", "remaining": 20, "reset": ""},
+                {"label": "Gemini · 주간", "remaining": 90, "reset": ""}]
+        self.window.received("antigravity", {"rows": rows, "plan": None}, "")
+        self.assertEqual(self.window.cards["antigravity"].data[0]["label"], "Gemini · 주간")
+
     def tearDown(self):
         self.window.close()
         self.window.deleteLater()

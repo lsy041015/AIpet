@@ -1820,7 +1820,8 @@ class Card(GlowFrame):
             return
         def priority(row):
             weekly = "주간" in row["label"] or row["label"].startswith("이번 주")
-            overall = "전체 모델" in row["label"] or row["label"] == "Codex · 주간"
+            # The main weekly bucket of each service leads its card (agy: Gemini before Claude and GPT).
+            overall = "전체 모델" in row["label"] or row["label"] in ("Codex · 주간", "Gemini · 주간")
             remaining = row["remaining"]
             return (not weekly, not (weekly and overall),
                     remaining if remaining is not None else float("inf"))
