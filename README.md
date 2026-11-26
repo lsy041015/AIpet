@@ -75,7 +75,7 @@ cd ~/ai-quota-widget
 python3 widget.py                      # 위젯 실행
 python3 widget.py --desktop            # 넓은 앱 화면
 python3 widget.py --check              # 창 없이 등록된 계정의 실제 한도만 조회
-QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 테스트 198개
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -v                        # 테스트 199개
 QT_QPA_PLATFORM=offscreen python3 widget.py --smoke /tmp/check-ai.png --theme light   # 화면을 이미지로 렌더링
 ```
 
