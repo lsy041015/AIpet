@@ -109,7 +109,7 @@ def claude_detail(detail, event):
             if name in ('Agent', 'Task'):
                 detail['agents'][str(block.get('id'))] = dict(
                     type=data.get('subagent_type') or 'general-purpose', description=data.get('description'),
-                    model=short_model(data.get('model')), effort=data.get('effort'))
+                    model=short_model(data.get('model')), effort=data.get('effort'), started=timestamp(event.get('timestamp')))
             elif name == 'TodoWrite':
                 detail['todos'] = plan_items(data.get('todos'), 'content')
             elif name.endswith('update_plan'):
@@ -436,8 +436,11 @@ def live_agent_files(claude=None):
                 # cursor-agent (not installed here) would be matched here and read from its own store.
                 if name not in AGENT_NAMES:
                     continue
-                if name == 'claude' and claude is not None:
-                    claude.append(process.path)
+                if name == 'claude':
+                    # Claude keeps no transcript open (claude_sessions finds its log), and its ~130 fds cost the most here.
+                    if claude is not None:
+                        claude.append(process.path)
+                    continue
                 with os.scandir(process.path + '/fd') as descriptors:
                     for fd in descriptors:
                         try:
@@ -465,24 +468,36 @@ def claude_roots(home):
     return home / '.claude/projects', profile
 
 
+SESSION_ID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
+
+
+def claude_session_id(args):
+    """Session a claude command line resumes or names: --resume=<id>, --resume <id> or --session-id <id>."""
+    for index, arg in enumerate(args):
+        flag, equals, value = arg.partition('=')
+        if flag in ('--resume', '-r', '--session-id'):
+            value = value if equals else args[index + 1] if index + 1 < len(args) else ''
+            if SESSION_ID.fullmatch(value):
+                return value
+    return None
+
+
 def claude_projects_windows(processes):
     import psutil
-    projects = {}
+    found = []
     for process in processes:
         try:
-            cwd, started = process.cwd(), process.create_time()
+            found.append((claude_project(process.cwd()), None, process.create_time()))
         except (psutil.Error, OSError):
             continue
-        count, first = projects.get(claude_project(cwd), (0, started))
-        projects[claude_project(cwd)] = count + 1, min(first, started)
-    return projects
+    return found
 
 
 def claude_projects(processes):
-    """Project folder -> (running CLIs, earliest start); None when the process table is unreadable."""
+    """(project folder, session id or None, start time) of each running CLI; None when the process table is unreadable."""
     if os.name == 'nt':
         return claude_projects_windows(processes)
-    projects = {}
+    found = []
     try:
         with open('/proc/stat') as stream:
             boot = next(int(line.split()[1]) for line in stream if line.startswith('btime '))
@@ -493,29 +508,49 @@ def claude_projects(processes):
                     started = boot + int(stream.read().rsplit(')', 1)[1].split()[19]) / os.sysconf('SC_CLK_TCK')
             except (OSError, ValueError, IndexError):
                 continue
-            count, first = projects.get(claude_project(cwd), (0, started))
-            projects[claude_project(cwd)] = count + 1, min(first, started)
+            try:
+                with open(process + '/cmdline', 'rb') as stream:
+                    session = claude_session_id(stream.read().decode('utf-8', 'replace').split('\0'))
+            except OSError:
+                session = None
+            found.append((claude_project(cwd), session, started))
     except (OSError, ValueError, IndexError, StopIteration):
         return None
-    return projects
+    return found
 
 
 def claude_sessions(processes, roots):
-    """Claude keeps no transcript open; a running CLI keeps its project's newest sessions visible."""
-    projects = claude_projects(processes)
-    if projects is None:
-        return set()
-    found = set()
-    for project, (count, started) in projects.items():
+    """Claude keeps no transcript open. Returns (live logs, log -> start of the CLI running it, projects whose CLI
+    names no session). A CLI that names its session marks that log; one that does not keeps its project's newest
+    logs visible. The projects are None when unknown (Windows, unreadable process table): any log may then have a CLI."""
+    processes = claude_projects(processes)
+    if processes is None:
+        return set(), {}, None
+    found, owners, unnamed = set(), {}, {}
+    for project, session, started in processes:
+        path = next((path for path in (os.path.join(root, project, f'{session}.jsonl') for root in roots)
+                     if os.path.isfile(path)), None) if session else None
+        if path is None:
+            count, first = unnamed.get(project, (0, started))
+            unnamed[project] = count + 1, min(first, started)
+            continue
+        owners[path] = max(owners.get(path, 0), started)
+        try:
+            # Older logs belong to earlier runs, so a crashed turn is not revived.
+            if os.stat(path).st_mtime >= started:
+                found.add(path)
+        except OSError:
+            pass
+    for project, (count, started) in unnamed.items():
         for root in roots:
             try:
                 with os.scandir(root / project) as entries:
-                    files = sorted(((entry.stat().st_mtime, entry.path) for entry in entries if entry.name.endswith('.jsonl')), reverse=True)
+                    files = sorted(((entry.stat().st_mtime, entry.path) for entry in entries
+                                    if entry.name.endswith('.jsonl') and entry.path not in owners), reverse=True)
             except OSError:
                 continue
-            # Older logs belong to earlier runs, so a crashed turn is not revived.
             found.update(path for modified, path in files[:count] if modified >= started)
-    return found
+    return found, owners, None if os.name == 'nt' else set(unnamed)
 
 
 def subagent_activity(path):
@@ -585,9 +620,12 @@ def file_version(path):
     return stat.st_size, stat.st_mtime_ns
 
 
-def claude_subagents(path, state, agents_dir, now):
-    """Running subagents with model/effort from the call, then the subagent log, then agents/<type>.md."""
+def claude_subagents(path, state, agents_dir, now, process_start=None):
+    """Running subagents with model/effort from the call, then the subagent log, then agents/<type>.md.
+    Subagents run inside the session's CLI, so with process_start (when it started; inf when none runs) one counts
+    only if its call or last record is that recent; None means the CLI is unknown."""
     known = state.pop('_known', frozenset())
+    floor = -1 if process_start is None else process_start
     folder = path[:-len('.jsonl')] + '/subagents'
     metas = {}
     try:
@@ -598,7 +636,8 @@ def claude_subagents(path, state, agents_dir, now):
                     metas[meta.get('toolUseId')] = entry.name[:-len('.meta.json')], meta
     except OSError:
         pass
-    running = [(agent, metas.get(agent['id'], (agent.get('agent_id') and 'agent-' + agent['agent_id'], {}))) for agent in state['subagents']]
+    running = [(agent, metas.get(agent['id'], (agent.get('agent_id') and 'agent-' + agent['agent_id'], {})))
+               for agent in state['subagents'] if agent.get('started', 0) >= floor]
     for key, (name, meta) in metas.items():
         # Background agents outlive the parsed tail. Unfinished metadata with a log written in the last
         # 15 min (longer than one 10 min tool call) counts as running; killed agents never set `finished`.
@@ -606,7 +645,7 @@ def claude_subagents(path, state, agents_dir, now):
             try:
                 log = f'{folder}/{name}.jsonl'
                 # mtime alone is not enough: the desktop app re-touches old subagent logs without writing.
-                if now - os.stat(log).st_mtime <= 900 and now - last_record_time(log) <= 900:
+                if now - os.stat(log).st_mtime <= 900 and now - (last := last_record_time(log)) <= 900 and last >= floor:
                     running.append((dict(type=meta.get('agentType'), description=meta.get('description'), model=None, effort=meta.get('effort')), (name, meta)))
             except OSError:
                 pass
@@ -704,10 +743,38 @@ def opencode_activity(database, now):
     return result
 
 
+_listings = {}
+
+
+def folder_listing(path):
+    """(subfolders, other names) of a folder, listed again only when its mtime changes (an entry was added,
+    removed or renamed). Each poll walks a few hundred session folders, so this saves most of the walk."""
+    modified = os.stat(path).st_mtime_ns
+    cached = _listings.get(path)
+    if cached and cached[0] == modified:
+        return cached[1]
+    folders, names = [], []
+    with os.scandir(path) as entries:
+        for entry in entries:
+            (folders if entry.is_dir(follow_symlinks=False) else names).append(entry.name)
+    # A change within the same mtime tick could hide behind a fresh listing, so only settled folders are kept.
+    if time.time() - modified / 1e9 > 2:
+        if len(_listings) > 4096:
+            _listings.clear()
+        _listings[path] = modified, (folders, names)
+    return folders, names
+
+
 def recent_sessions(directory, pattern):
-    for root, folders, names in os.walk(directory):
+    stack = [str(directory)]
+    while stack:
+        root = stack.pop()
+        try:
+            folders, names = folder_listing(root)
+        except OSError:
+            continue
         # Claude subagent transcripts belong to the parent session, which represents the work.
-        folders[:] = [name for name in folders if name != 'subagents']
+        stack.extend(os.path.join(root, name) for name in folders if name != 'subagents')
         for name in names:
             if not (name.endswith('.jsonl') if pattern == '*.jsonl' else name == pattern):
                 continue
@@ -740,7 +807,8 @@ def read_activity(home=None, now=None, detailed=False, extra_agents=False):
     claude = []
     live = live_agent_files(claude)
     roots = claude_roots(home)
-    live = live | claude_sessions(claude, roots)
+    claude_live, owners, unnamed = claude_sessions(claude, roots)
+    live = live | claude_live
     for agent, folder, pattern in (('codex', '.codex/sessions', '*.jsonl'),
                                     ('copilot', '.copilot/session-state', 'events.jsonl'),
                                     ('claude', roots[0], '*.jsonl'), ('claude', roots[1], '*.jsonl')):
@@ -765,7 +833,10 @@ def read_activity(home=None, now=None, detailed=False, extra_agents=False):
                             # Claude logs no permission prompt; a silent pending tool may be waiting for approval.
                             state.update(status='waiting', label='승인 대기 또는 실행 중')
                         if agent == 'claude':
-                            state['subagents'] = claude_subagents(path, state, home / '.claude/agents', now)
+                            start = owners.get(path)
+                            if start is None and unnamed is not None and os.path.basename(os.path.dirname(path)) not in unnamed:
+                                start = float('inf')  # no CLI runs this session, so neither do its subagents
+                            state['subagents'] = claude_subagents(path, state, home / '.claude/agents', now, start)
                         result.append(state)
                 except OSError:
                     continue

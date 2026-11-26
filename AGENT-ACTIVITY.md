@@ -23,7 +23,7 @@
 
 각 기록에 `title`, `model`, `effort`, `todos`(`{text, status}` 목록), `current_task`(진행 중 항목), `subagents`(`{type, description, model, effort, status}` 목록)를 함께 담습니다. 알 수 없으면 `None`(서브에이전트는 빈 목록)입니다. 모델 ID는 `opus 5.5`처럼 줄여 표시하고, 다른 회사 모델은 기록된 이름 그대로 둡니다.
 
-- Claude Code: 이름은 `custom-title`·`agent-name`(사용자 지정)이 `ai-title`보다 우선하고, 기록 끝부분에 없으면 세션 폴더의 `custom-title.json`을 읽습니다. 모델은 assistant `message.model`, effort는 같은 기록의 `effort`입니다. 할 일은 `TodoWrite`와 데스크톱 앱의 `update_plan`(items·advance·done·start)을 따릅니다. 서브에이전트는 결과가 없는 `Agent`/`Task` 호출, 또는 백그라운드 실행 후 완료 알림(`task-notification`)·`TaskStop`이 없는 호출입니다. 모델·effort는 호출 입력 → `subagents/agent-*.jsonl` 첫 응답 → `~/.claude/agents/<type>.md` 순으로 찾습니다. 오래 실행되어 호출 기록이 끝부분(256 KB)을 벗어난 백그라운드 에이전트는 `finished`가 없는 `*.meta.json`과 15분 안에 갱신된 로그로 찾습니다. 강제 종료된 에이전트는 `finished`를 남기지 않아 로그가 15분간 갱신되지 않아야 사라집니다.
+- Claude Code: 이름은 `custom-title`·`agent-name`(사용자 지정)이 `ai-title`보다 우선하고, 기록 끝부분에 없으면 세션 폴더의 `custom-title.json`을 읽습니다. 모델은 assistant `message.model`, effort는 같은 기록의 `effort`입니다. 할 일은 `TodoWrite`와 데스크톱 앱의 `update_plan`(items·advance·done·start)을 따릅니다. 서브에이전트는 결과가 없는 `Agent`/`Task` 호출, 또는 백그라운드 실행 후 완료 알림(`task-notification`)·`TaskStop`이 없는 호출입니다. 모델·effort는 호출 입력 → `subagents/agent-*.jsonl` 첫 응답 → `~/.claude/agents/<type>.md` 순으로 찾습니다. 오래 실행되어 호출 기록이 끝부분(256 KB)을 벗어난 백그라운드 에이전트는 `finished`가 없는 `*.meta.json`과 15분 안에 갱신된 로그로 찾습니다. 서브에이전트는 부모 세션의 `claude` 프로세스 안에서 돌므로, 그 프로세스가 없거나 호출·마지막 기록이 프로세스 시작 전이면(재시작으로 종료됨) 바로 뺍니다. 세션을 특정할 수 없는 프로세스(아래)나 Windows에서는 15분 기준만 씁니다.
 - Codex: 이름은 `~/.codex/session_index.jsonl`의 `thread_name`, 모델·effort는 `turn_context`, 할 일은 `update_plan` 호출입니다. 하위 에이전트 rollout(`thread_spawn`)은 `parent_thread_id`로 부모 세션의 `subagents`에 붙고, 자체 `turn_context`의 모델·effort와 진행 상태를 씁니다. guardian 검토는 계속 제외합니다.
 - Copilot: 모델은 `assistant.message`, effort는 `session.model_change`의 `reasoningEffort`입니다. 세션 이름·할 일은 로그에 없어 표시하지 않습니다.
 - Antigravity: 대화 제목만 `title`로 넣습니다. 모델은 바이너리 기록이라 읽지 않습니다.
@@ -31,6 +31,6 @@
 - Gemini CLI·Cursor(cursor-agent)는 설치되어 있지 않아 지원하지 않습니다.
 
 파일 수정·자료 확인·명령 실행·응답 준비·승인 대기 또는 실행 중으로 구분합니다. 명령 실행이 실제 테스트인지 임의로 판단하지 않습니다.
-완료 이벤트가 오거나 기록이 2분간 갱신되지 않으면 숨깁니다. Antigravity CLI는 실행 중인 프로세스가 해당 대화 DB를 열고 있고 DB 상태도 작업 중이면 2분 제한을 적용하지 않습니다. Claude Code는 같은 프로젝트 폴더에서 `claude` 프로세스가 실행 중이면, 프로세스 시작 후 기록된 최근 세션에 2분 제한을 적용하지 않습니다. 다른 기록 없는 장시간 작업은 표시가 사라질 수 있습니다.
+완료 이벤트가 오거나 기록이 2분간 갱신되지 않으면 숨깁니다. Antigravity CLI는 실행 중인 프로세스가 해당 대화 DB를 열고 있고 DB 상태도 작업 중이면 2분 제한을 적용하지 않습니다. Claude Code는 `claude` 프로세스 명령줄의 `--resume`/`--session-id` 세션, 그런 인자가 없으면 같은 프로젝트 폴더의 최근 세션 중 프로세스 시작 후 기록된 것에 2분 제한을 적용하지 않습니다. 다른 기록 없는 장시간 작업은 표시가 사라질 수 있습니다.
 로컬 형식이 바뀌면 감지가 제한될 수 있습니다. 프로세스가 켜졌다는 이유만으로 작업 중으로 표시하지 않습니다.
 자격 증명은 읽지 않고, 작업 기록을 외부로 전송하지 않습니다.

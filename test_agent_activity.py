@@ -9,7 +9,7 @@ from unittest.mock import patch
 from pathlib import Path
 from datetime import datetime, timezone
 from agent_activity import (read_activity, session_state, ActivityTracker, timestamp, live_agent_files, claude_project,
-                            short_model, agent_kind, session_file)
+                            short_model, agent_kind, session_file, claude_session_id)
 from agent_windows import agent_pids
 
 
@@ -64,7 +64,8 @@ class ActivityTests(unittest.TestCase):
             real = os.scandir
             with patch('agent_activity.os.scandir', side_effect=lambda path: real(fake if path == '/proc' else path)):
                 claude = []
-                self.assertEqual(live_agent_files(claude), {'/h/.codex/sessions/10.jsonl', '/h/.codex/sessions/12.jsonl'})
+                # Claude keeps no transcript open, so its descriptors are not read.
+                self.assertEqual(live_agent_files(claude), {'/h/.codex/sessions/10.jsonl'})
                 self.assertEqual(claude, [str(fake / '12')])
 
     def test_unchanged_logs_are_cached_but_append_and_replace_are_detected(self):
@@ -354,6 +355,48 @@ class ActivityTests(unittest.TestCase):
                 os.utime(path, (1000, 1000))
                 self.assertEqual(read_activity(root, now=now), [])
 
+    @unittest.skipIf(os.name == "nt", "fakes /proc with symlinks")
+    def test_subagents_need_their_session_cli(self):
+        sid = 'c1e35db4-8b08-483f-a2bb-9b08b5f3f75e'
+        self.assertEqual([claude_session_id(args) for args in (
+            ['claude', f'--resume={sid}'], ['claude', '--resume', sid, '--model', 'x'], ['claude', '--session-id', sid],
+            ['claude', '--resume'], ['claude', '--resume', '--model'], ['claude'])], [sid, sid, sid, None, None, None])
+        now = time.time()
+        iso = lambda moment: datetime.fromtimestamp(moment, timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        agent = lambda tool_id, moment: {'type': 'assistant', 'timestamp': iso(moment), 'message': {'content': [
+            {'type': 'tool_use', 'id': tool_id, 'name': 'Agent', 'input': {'subagent_type': 'scout', 'description': tool_id, 'model': 'haiku', 'effort': 'low'}}]}}
+        with open('/proc/stat') as stream:
+            boot = next(int(line.split()[1]) for line in stream if line.startswith('btime '))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = root / 'proc/42'
+            process.mkdir(parents=True)
+            (process / 'cwd').symlink_to('/work/p')
+            # The CLI started 100 s ago; field 22 of stat is its start in clock ticks after boot.
+            ticks = int((now - 100 - boot) * os.sysconf('SC_CLK_TCK'))
+            (process / 'stat').write_text('42 (claude) ' + ' '.join(['S', '1'] + ['0'] * 17 + [str(ticks)]))
+            folder = root / '.claude/projects/-work-p'
+            self.write_claude(folder / f'{sid}.jsonl', [{'type': 'user', 'timestamp': iso(now - 300), 'message': {'content': 'start'}},
+                                                         agent('before-restart', now - 250), agent('after-restart', now - 50)])
+            for name, moment in (('old', now - 150), ('new', now - 10)):
+                self.write_claude(folder / sid / f'subagents/agent-{name}.jsonl', [{'type': 'user', 'timestamp': iso(moment), 'message': {'content': 'go'}}])
+                (folder / sid / f'subagents/agent-{name}.meta.json').write_text(json.dumps({'agentType': 'scout', 'description': 'meta-' + name, 'toolUseId': name}))
+            def rows(cmdline, processes=(str(process),)):
+                (process / 'cmdline').write_bytes(cmdline)
+                def live(claude=None):
+                    claude.extend(processes)
+                    return set()
+                with patch('agent_activity.live_agent_files', side_effect=live):
+                    return [(row['id'], sorted(s['description'] for s in row['subagents'])) for row in read_activity(root, detailed=True, now=now)]
+            log = str(folder / f'{sid}.jsonl')
+            # Named session: only subagents started (or still writing) since this CLI started.
+            self.assertEqual(rows(f'claude\0--resume={sid}\0'.encode()), [(log, ['after-restart', 'meta-new'])])
+            self.assertEqual(rows(f'claude\0--session-id\0{sid}\0'.encode()), [(log, ['after-restart', 'meta-new'])])
+            # No CLI runs the session: its subagents died with it.
+            self.assertEqual(rows(b'claude\0', processes=()), [(log, [])])
+            # A CLI that names no session is matched by folder only, so the age limits alone decide.
+            self.assertEqual(rows(b'claude\0'), [(log, ['after-restart', 'before-restart', 'meta-new', 'meta-old'])])
+
     def test_windows_process_and_path_rules(self):
         self.assertEqual([agent_kind(name, args) for name, args in (
             ('claude.exe', []), ('Codex.EXE', None), ('antigravity.exe', []), ('bash.exe', []),
@@ -388,7 +431,9 @@ class ActivityTests(unittest.TestCase):
             target = root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
-        return [row for row in read_activity(root, detailed=True) if row['agent'] == 'claude']
+        # The CLI is unknown here, as on Windows; test_subagents_need_their_session_cli covers known ones.
+        with patch('agent_activity.claude_sessions', return_value=(set(), {}, None)):
+            return [row for row in read_activity(root, detailed=True) if row['agent'] == 'claude']
 
     def test_claude_title_model_and_todos(self):
         self.assertEqual([short_model(m) for m in ('claude-opus-5-5', 'claude-haiku-5-5[1m]', 'claude-sonnet-4-20250514', 'opus', 'inherit', 'gpt-6.2-sol')],
