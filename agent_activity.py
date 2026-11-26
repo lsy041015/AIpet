@@ -23,6 +23,21 @@ def timestamp(value):
         return 0
 
 
+def last_record_time(path, size=65536):
+    """Timestamp of the last JSONL record that has one, from the file tail; 0 when none."""
+    with open(path, 'rb') as f:
+        f.seek(max(0, os.fstat(f.fileno()).st_size - size))
+        lines = f.read().decode('utf-8', 'ignore').splitlines()
+    for line in reversed(lines):
+        try:
+            value = json.loads(line).get('timestamp')
+        except (ValueError, AttributeError):
+            continue
+        if value:
+            return timestamp(value)
+    return 0
+
+
 def tool_label(name):
     name = name.lower() if isinstance(name, str) else ''
     for words, label in ((('patch', 'edit', 'write_file'), '파일 수정 중'),
@@ -589,7 +604,9 @@ def claude_subagents(path, state, agents_dir, now):
         # 15 min (longer than one 10 min tool call) counts as running; killed agents never set `finished`.
         if key not in known and name[len('agent-'):] not in known and not meta.get('finished'):
             try:
-                if now - os.stat(f'{folder}/{name}.jsonl').st_mtime <= 900:
+                log = f'{folder}/{name}.jsonl'
+                # mtime alone is not enough: the desktop app re-touches old subagent logs without writing.
+                if now - os.stat(log).st_mtime <= 900 and now - last_record_time(log) <= 900:
                     running.append((dict(type=meta.get('agentType'), description=meta.get('description'), model=None, effort=meta.get('effort')), (name, meta)))
             except OSError:
                 pass

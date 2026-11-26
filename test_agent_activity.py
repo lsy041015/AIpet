@@ -435,14 +435,18 @@ class ActivityTests(unittest.TestCase):
                 dict(type='general-purpose', description='From log', model='sonnet 5.5', effort='medium', status='running'),
                 dict(type='reviewer', description='From md', model='opus', effort='high', status='running')])
             # A background agent launched before the parsed tail is found by its unfinished metadata and fresh log.
+            now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
             files = {'.claude/projects/-tmp/s/subagents/agent-old.meta.json': json.dumps({'agentType': 'scout', 'description': 'Old', 'toolUseId': 'gone', 'effort': 'low'}),
-                     '.claude/projects/-tmp/s/subagents/agent-old.jsonl': json.dumps({'type': 'assistant', 'message': {'model': 'claude-haiku-5-5'}}) + '\n',
+                     '.claude/projects/-tmp/s/subagents/agent-old.jsonl': json.dumps({'type': 'assistant', 'timestamp': now_iso, 'message': {'model': 'claude-haiku-5-5'}}) + '\n',
                      '.claude/projects/-tmp/s/subagents/agent-l1.meta.json': json.dumps({'toolUseId': 'logged', 'finished': True})}
             row, = self.claude_rows(Path(directory), events[:3] + events[4:], **files)
             self.assertEqual([(s['description'], s['model'], s['effort']) for s in row['subagents']],
                              [('Find files', 'haiku', 'low'), ('From md', 'opus', 'high'), ('Old', 'haiku 5.5', 'low')])
             stale = Path(directory) / '.claude/projects/-tmp/s/subagents/agent-old.jsonl'
             os.utime(stale, (time.time() - 1000,) * 2)
+            self.assertEqual(len(self.claude_rows(Path(directory), events[:3] + events[4:])[0]['subagents']), 2)
+            # A finished agent's log touched just now without a new record (the desktop app does this) stays finished.
+            stale.write_text(json.dumps({'type': 'assistant', 'timestamp': '2026-09-28T07:51:00.687Z', 'message': {}}) + '\n')
             self.assertEqual(len(self.claude_rows(Path(directory), events[:3] + events[4:])[0]['subagents']), 2)
 
     def test_codex_detail_and_linked_subagents(self):
